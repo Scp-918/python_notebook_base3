@@ -1,20 +1,21 @@
 """Signed PPG-to-reference HR delay alignment for the protocol.
 
 This module aligns the multichannel sensor time axis with the 1 Hz reference
-heart-rate series. Alignment uses only rest-segment green PPG. For each TW, it
-scans signed Tdelay over [-min(5, TW/2), 5] seconds at a 0.1 s step. When
-delay_s > 0, the sensor side is shifted left by trimming head samples. When
-delay_s < 0, the sensor side is shifted right by padding each channel head with
-that channel's first sample arr[0] and trimming the tail. For each candidate
-delay, Hamming + FFT extracts windowed PPG HR, compares it with reference HR by
-the difference STD, and selects the Tdelay with the smallest STD. Reference HR
-comes from the 1 Hz heart-rate band; it is not shifted at 0.1 s resolution and
-keeps only the TW/2 half-window compensation.
+heart-rate series. Alignment uses rest-segment green PPG starting at 5 s after
+rest begins. For each TW, it scans signed Tdelay over [-min(5, TW/2), 5]
+seconds at a 0.1 s step. When delay_s > 0, the sensor side is shifted left by
+trimming head samples. When delay_s < 0, the sensor side is shifted right by
+padding each channel head with that channel's first sample arr[0] and trimming
+the tail. For each candidate delay, Hamming + FFT extracts windowed PPG HR,
+compares it with reference HR by the difference STD, and selects the Tdelay with
+the smallest STD. Reference HR comes from the 1 Hz heart-rate band; it is not
+shifted at 0.1 s resolution and keeps only the TW/2 half-window compensation.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from threading import Lock
 from typing import Any
 
 import numpy as np
@@ -24,6 +25,10 @@ from .preprocess_protocol import ProtocolDataset
 from .segmentation import SegmentInfo
 
 __all__ = ["AlignedDataset", "AlignmentInfo", "align_ppg_to_ref_hr"]
+
+_PRINTED_ALIGNMENT_SAMPLE_STEMS: set[str] = set()
+_PRINTED_ALIGNMENT_LOCK = Lock()
+_REST_ALIGNMENT_SCORE_START_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -101,9 +106,17 @@ def align_ppg_to_ref_hr(
     best_std = float("inf")
     best_common_windows = 0
 
-    ref_seq = _reference_sequence_after_half_window(dataset, TW)
+    score_start_s = _REST_ALIGNMENT_SCORE_START_S
+    ref_seq = _reference_sequence_after_half_window(dataset, TW, score_start_s)
     for delay_s in delay_grid:
-        ppg_hr = _rest_ppg_hr_for_delay(dataset.ppg_green, fs, TW, float(delay_s), segment_info.motion_start_s)
+        ppg_hr = _rest_ppg_hr_for_delay(
+            dataset.ppg_green,
+            fs,
+            TW,
+            float(delay_s),
+            segment_info.motion_start_s,
+            score_start_s,
+        )
         common = min(ppg_hr.size, ref_seq.size)
         best_common_windows = max(best_common_windows, int(common))
         if common < 2:
@@ -122,7 +135,7 @@ def align_ppg_to_ref_hr(
             f"(max_common_windows={best_common_windows})"
         )
 
-    print(f"[alignment] {dataset.sample_stem}: best_tdelay_s={best_delay:.1f}, rest_windows={best_common_windows}")
+    _print_alignment_once(dataset.sample_stem, best_delay, best_common_windows)
 
     shifted_dataset = _shift_dataset_by_delay(dataset, best_delay, fs)
     shifted_start = max(0.0, float(segment_info.motion_start_s) - best_delay)
@@ -183,10 +196,25 @@ def align_ppg_to_ref_hr(
     )
 
 
-def _reference_sequence_after_half_window(dataset: ProtocolDataset, TW: float) -> np.ndarray:
+def _print_alignment_once(sample_stem: str, best_delay: float, rest_windows: int) -> None:
+    """Print one Tdelay summary per sample in the current Python process."""
+
+    key = str(sample_stem)
+    with _PRINTED_ALIGNMENT_LOCK:
+        if key in _PRINTED_ALIGNMENT_SAMPLE_STEMS:
+            return
+        _PRINTED_ALIGNMENT_SAMPLE_STEMS.add(key)
+    print(f"[alignment] {key}: best_tdelay_s={best_delay:.1f}, rest_windows={int(rest_windows)}")
+
+
+def _reference_sequence_after_half_window(
+    dataset: ProtocolDataset,
+    TW: float,
+    score_start_s: float = 0.0,
+) -> np.ndarray:
     """Return finite reference HR values after the half-window shift."""
 
-    mask = np.asarray(dataset.ref_time_s, dtype=float) >= TW / 2.0
+    mask = np.asarray(dataset.ref_time_s, dtype=float) >= float(score_start_s) + TW / 2.0
     seq = np.asarray(dataset.ref_hr_bpm, dtype=float)[mask]
     return seq[np.isfinite(seq)]
 
@@ -245,6 +273,7 @@ def _rest_ppg_hr_for_delay(
     TW: float,
     delay_s: float,
     motion_start_s: float,
+    score_start_s: float = 0.0,
 ) -> np.ndarray:
     """Estimate rest-window PPG HR for one candidate delay."""
 
@@ -255,9 +284,10 @@ def _rest_ppg_hr_for_delay(
     usable_rest_s = max(0.0, float(motion_start_s) - delay_s)
     win_len = int(round(TW * fs))
     max_start = min(len(shifted) - win_len, int(round((usable_rest_s - TW) * fs)))
-    if max_start < 0:
+    min_start = max(0, int(round(float(score_start_s) * fs)))
+    if max_start < min_start:
         return np.asarray([], dtype=float)
-    starts = np.arange(0, max_start + 1, fs, dtype=int)
+    starts = np.arange(min_start, max_start + 1, fs, dtype=int)
     hrs = [_window_fft_hr(shifted[s : s + win_len], fs, 0.5, 2.0) for s in starts]
     return np.asarray([h for h in hrs if np.isfinite(h)], dtype=float)
 
