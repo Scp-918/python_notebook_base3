@@ -1,0 +1,4 @@
+﻿split,group_id,motion_type,data_file,ref_file
+train,tiaosheng3,tiaosheng,D:\python_notebook_base\testdata\multi_tiaosheng3.csv,D:\python_notebook_base\testdata\multi_tiaosheng3_ref.csv
+val,tiaosheng2,tiaosheng,D:\python_notebook_base\testdata\multi_tiaosheng2.csv,D:\python_notebook_base\testdata\multi_tiaosheng2_ref.csv
+test,tiaosheng1,tiaosheng,D:\python_notebook_base\testdata\multi_tiaosheng1.csv,D:\python_notebook_base\testdata\multi_tiaosheng1_ref.csv

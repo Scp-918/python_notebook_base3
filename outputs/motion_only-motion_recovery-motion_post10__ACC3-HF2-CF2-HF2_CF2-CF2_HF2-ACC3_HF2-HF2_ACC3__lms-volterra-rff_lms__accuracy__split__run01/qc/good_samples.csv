@@ -1,0 +1,4 @@
+﻿group_id,motion_type,data_file,ref_file,file_name,status,reason,std_ut1,std_ut2,outlier_count_ut1,outlier_count_ut2,outlier_ratio_ut1,outlier_ratio_ut2,is_good
+tiaosheng1,tiaosheng,D:\python_notebook_base\testdata\multi_tiaosheng1.csv,D:\python_notebook_base\testdata\multi_tiaosheng1_ref.csv,multi_tiaosheng1.csv,good,ok,0.3706723457815974,0.3710817433031835,6,27,0.006,0.027,True
+tiaosheng2,tiaosheng,D:\python_notebook_base\testdata\multi_tiaosheng2.csv,D:\python_notebook_base\testdata\multi_tiaosheng2_ref.csv,multi_tiaosheng2.csv,good,ok,0.17136044118824031,0.3022546245030366,6,10,0.006,0.01,True
+tiaosheng3,tiaosheng,D:\python_notebook_base\testdata\multi_tiaosheng3.csv,D:\python_notebook_base\testdata\multi_tiaosheng3_ref.csv,multi_tiaosheng3.csv,good,ok,0.20028709775240155,0.16203946524322588,2,2,0.002,0.002,True
