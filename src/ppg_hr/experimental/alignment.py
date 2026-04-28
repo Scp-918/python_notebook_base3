@@ -1,8 +1,15 @@
-"""PPG-to-reference HR delay alignment for the protocol.
+"""Signed PPG-to-reference HR delay alignment for the protocol.
 
-中文说明：本模块把多通道传感器时间轴与 1 Hz 参考心率对齐。对齐只使用静息段
-绿光 PPG：扫描 0 到 5 秒延迟、步长 0.1 秒，逐窗用 Hamming + FFT 提取 PPG HR，
-再与参考 HR 比较差值 STD，取 STD 最小的 Tdelay。
+This module aligns the multichannel sensor time axis with the 1 Hz reference
+heart-rate series. Alignment uses only rest-segment green PPG. For each TW, it
+scans signed Tdelay over [-min(5, TW/2), 5] seconds at a 0.1 s step. When
+delay_s > 0, the sensor side is shifted left by trimming head samples. When
+delay_s < 0, the sensor side is shifted right by padding each channel head with
+that channel's first sample arr[0] and trimming the tail. For each candidate
+delay, Hamming + FFT extracts windowed PPG HR, compares it with reference HR by
+the difference STD, and selects the Tdelay with the smallest STD. Reference HR
+comes from the 1 Hz heart-rate band; it is not shifted at 0.1 s resolution and
+keeps only the TW/2 half-window compensation.
 """
 
 from __future__ import annotations
@@ -76,7 +83,7 @@ def align_ppg_to_ref_hr(
     TW: int | float,
     fs_target: int,
 ) -> AlignedDataset:
-    """Find the best 0--5 s PPG delay and build aligned window metadata.
+    """Find the best signed PPG delay and build aligned window metadata.
 
     中文说明：如果静息段太短导致任一候选延迟下可比较窗口少于 2 个，会抛出
     带明确 reason 的 ``ValueError``；批处理入口会捕获并写入 batch_summary。
@@ -87,7 +94,8 @@ def align_ppg_to_ref_hr(
 
     fs = int(fs_target)
     TW = float(TW)
-    delay_grid = np.round(np.arange(0.0, 5.0 + 1e-9, 0.1), 10)
+    neg_limit = min(5.0, TW / 2.0)
+    delay_grid = np.round(np.arange(-neg_limit, 5.0 + 1e-9, 0.1), 10)
     std_by_delay: dict[float, float] = {}
     best_delay = 0.0
     best_std = float("inf")
@@ -116,7 +124,7 @@ def align_ppg_to_ref_hr(
 
     print(f"[alignment] {dataset.sample_stem}: best_tdelay_s={best_delay:.1f}, rest_windows={best_common_windows}")
 
-    shifted_dataset = _left_shift_dataset(dataset, best_delay, fs)
+    shifted_dataset = _shift_dataset_by_delay(dataset, best_delay, fs)
     shifted_start = max(0.0, float(segment_info.motion_start_s) - best_delay)
     shifted_end = max(shifted_start, float(segment_info.motion_end_s) - best_delay)
 
@@ -183,6 +191,54 @@ def _reference_sequence_after_half_window(dataset: ProtocolDataset, TW: float) -
     return seq[np.isfinite(seq)]
 
 
+def _shift_channel_for_delay(values: np.ndarray, delay_s: float, fs: int) -> np.ndarray:
+    """Shift one channel according to signed global Tdelay.
+
+    Convention:
+    - delay_s > 0: sensor lags reference HR; shift sensor left by trimming the head.
+    - delay_s == 0: unchanged.
+    - delay_s < 0: sensor leads reference HR; shift sensor right by padding the head
+      with the first sample arr[0] and trimming the tail.
+
+    For delay_s < 0, padding uses arr[0], not literal zero.
+    """
+    arr = np.asarray(values, dtype=float)
+
+    if arr.size == 0:
+        return arr.copy()
+
+    samples = int(round(float(delay_s) * float(fs)))
+
+    if samples == 0:
+        return arr.copy()
+
+    if samples > 0:
+        if samples >= arr.size:
+            return arr[:0].copy()
+        return arr[samples:].copy()
+
+    pad = -samples
+
+    if pad >= arr.size:
+        return np.full(arr.shape, arr[0], dtype=float)
+
+    prefix = np.full(pad, arr[0], dtype=float)
+    return np.concatenate([prefix, arr[:-pad]]).astype(float, copy=False)
+
+
+def _shift_dataset_by_delay(dataset: ProtocolDataset, delay_s: float, fs: int) -> ProtocolDataset:
+    """Apply signed global Tdelay to every protocol sensor channel.
+
+    All channels returned by dataset.channels() must be shifted by the same delay_s.
+    This keeps PPG, ACC, GYRO, HF, CF and other channels synchronized.
+    """
+    channels = {
+        name: _shift_channel_for_delay(values, delay_s, fs)
+        for name, values in dataset.channels().items()
+    }
+    return dataset.replace_channels(channels, fs)
+
+
 def _rest_ppg_hr_for_delay(
     ppg_green: np.ndarray,
     fs: int,
@@ -192,8 +248,10 @@ def _rest_ppg_hr_for_delay(
 ) -> np.ndarray:
     """Estimate rest-window PPG HR for one candidate delay."""
 
-    delay_samples = int(round(delay_s * fs))
-    shifted = np.asarray(ppg_green, dtype=float)[delay_samples:]
+    shifted = _shift_channel_for_delay(ppg_green, delay_s, fs)
+    # Keep this as motion_start_s - delay_s for both signs: positive delay shifts
+    # the sensor left and advances the motion boundary on the shifted axis, while
+    # negative delay shifts the sensor right and delays it by abs(delay_s).
     usable_rest_s = max(0.0, float(motion_start_s) - delay_s)
     win_len = int(round(TW * fs))
     max_start = min(len(shifted) - win_len, int(round((usable_rest_s - TW) * fs)))
@@ -223,10 +281,6 @@ def _window_fft_hr(x: np.ndarray, fs: int, low_hz: float, high_hz: float) -> flo
 
 
 def _left_shift_dataset(dataset: ProtocolDataset, delay_s: float, fs: int) -> ProtocolDataset:
-    """Shift all sensor channels left by the chosen delay."""
+    """Compatibility wrapper for signed global Tdelay shifting."""
 
-    samples = int(round(float(delay_s) * fs))
-    if samples <= 0:
-        return dataset
-    channels = {name: values[samples:] for name, values in dataset.channels().items()}
-    return dataset.replace_channels(channels, fs)
+    return _shift_dataset_by_delay(dataset, delay_s, fs)

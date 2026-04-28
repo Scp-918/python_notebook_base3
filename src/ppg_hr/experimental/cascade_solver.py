@@ -192,7 +192,7 @@ def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _T
 
     fs_target = int(params.Fs_Target)
     tw = float(params.TW)
-    key = (fs_target, tw)
+    key = (fs_target, tw, "signed_tdelay_edgepad_v1")
     cache = getattr(dataset, "_trial_base_cache", None)
     if cache is None:
         cache = {}
