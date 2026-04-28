@@ -1,4 +1,8 @@
-"""Default parameter set for :func:`ppg_hr.core.heart_rate_solver.solve`."""
+"""Default parameter set for :func:`ppg_hr.core.heart_rate_solver.solve`.
+
+中文说明：本模块只保存协议级枚举和默认参数，不直接读写数据。实验入口会
+根据这些 dataclass 生成 Optuna 搜索空间，并保持旧 solver 参数的向后兼容。
+"""
 
 from __future__ import annotations
 
@@ -33,6 +37,7 @@ class TargetScope(str, Enum):
 
     MOTION_ONLY = "motion_only"
     MOTION_AND_RECOVERY = "motion_recovery"
+    MOTION_POST10 = "motion_post10"
 
 
 @dataclass
@@ -55,27 +60,67 @@ class ProtocolParams:
 
 @dataclass
 class ProtocolSearchParams:
-    """Discrete search grid for the batch adaptive protocol."""
+    """Discrete search grid for the batch adaptive protocol.
 
-    Fs_Target: list[int] = field(default_factory=lambda: [25, 50])
+    中文说明：公共项对 LMS/Volterra/RFF-LMS 三类滤波器都生效；滤波器专属项
+    由 ``names_for_filter`` 动态选择，避免 LMS 误采样 RFF 或 Volterra 参数。
+    """
+
+    Fs_Target: list[int] = field(default_factory=lambda: [25, 50, 100])
     TW: list[int] = field(default_factory=lambda: [6, 8, 10])
     Kstop: list[float] = field(default_factory=lambda: [0.2, 0.3, 0.5])
     max_order: list[int] = field(default_factory=lambda: [8, 12, 16, 20])
     M_base: list[int] = field(default_factory=lambda: [1, 2])
-    C_scale: list[float] = field(default_factory=lambda: [1, 1.2, 1.5])
-    K_max: list[int] = field(default_factory=lambda: [8, 12, 16, 20])
+    C_scale: list[float] = field(default_factory=lambda: [0.6, 0.9, 1.2, 1.5])
+    K_max: list[int] = field(default_factory=lambda: [8, 12, 16, 20, 30])
     Spec_Penalty_Width: list[float] = field(default_factory=lambda: [0.1, 0.2, 0.3])
     Spec_Penalty_Weight: list[float] = field(default_factory=lambda: [0.1, 0.2, 0.4])
-    smooth_win_len: list[int] = field(default_factory=lambda: [3, 5, 7])
+    smooth_win_len: list[int] = field(default_factory=lambda: [3, 5, 7, 9])
     hr_range_hz: list[float] = field(
         default_factory=lambda: [x / 60.0 for x in (15, 20, 25, 30, 35, 40)]
     )
     slew_limit_bpm: list[int] = field(default_factory=lambda: list(range(8, 16)))
     slew_step_bpm: list[int] = field(default_factory=lambda: [5, 7, 9])
+    LMS_Mu_Base: list[float] = field(default_factory=lambda: [0.008, 0.01, 0.012])
+    RFF_LMS_Mu_Base: list[float] = field(default_factory=lambda: [0.006, 0.008, 0.01])
+    alpha_u: list[float] = field(default_factory=lambda: [0.01, 0.05, 0.1, 0.2])
+    M2: list[int] = field(default_factory=lambda: [2, 3, 4, 5])
+    rff_D: list[int] = field(default_factory=lambda: [50, 100, 200, 300])
+    rff_sigma: list[float] = field(default_factory=lambda: [0.1, 0.5, 1.0, 2.0, 5.0])
 
     def names(self) -> list[str]:
         """Return active parameter names in stable dataclass order."""
         return [f.name for f in fields(self)]
+
+    def names_for_filter(self, adaptive_filter: str) -> list[str]:
+        """Return parameter names that should be sampled for one filter.
+
+        中文说明：RFF-LMS 的 ``LMS_Mu_Base`` 使用独立候选列表，但解码后仍写回同名
+        字段，便于级联求解器统一读取步长基准。
+        """
+
+        common = [
+            "Fs_Target",
+            "TW",
+            "Kstop",
+            "max_order",
+            "M_base",
+            "C_scale",
+            "K_max",
+            "Spec_Penalty_Width",
+            "Spec_Penalty_Weight",
+            "smooth_win_len",
+            "hr_range_hz",
+            "slew_limit_bpm",
+            "slew_step_bpm",
+        ]
+        if adaptive_filter == "lms":
+            return [*common, "LMS_Mu_Base"]
+        if adaptive_filter == "volterra":
+            return [*common, "LMS_Mu_Base", "alpha_u", "M2"]
+        if adaptive_filter == "rff_lms":
+            return [*common, "RFF_LMS_Mu_Base", "rff_D", "rff_sigma"]
+        raise ValueError(f"Unsupported adaptive_filter: {adaptive_filter}")
 
     def options(self, name: str) -> list[Any]:
         """Return the candidate list for ``name``."""
@@ -129,7 +174,7 @@ class SolverParams:
     bp_order: int = 4
 
     # Adaptive filter selection (new in 2026-04)
-    adaptive_filter: str = "lms"  # one of: "lms", "klms", "volterra"
+    adaptive_filter: str = "lms"  # one of: "lms", "volterra", "rff_lms"
     ppg_mode: str = "green"  # one of: "green", "red", "ir"
 
     # Delay-search prefit controls. ``adaptive`` narrows the PPG-vs-motion
@@ -141,13 +186,17 @@ class SolverParams:
     delay_prefit_margin_samples: int = 2
     delay_prefit_min_span_samples: int = 2
 
-    # KLMS-specific parameters (only used when adaptive_filter == "klms")
-    klms_step_size: float = 0.1
-    klms_sigma: float = 1.0
-    klms_epsilon: float = 0.1
+    # Adaptive-filter shared lower bound. LMS/Volterra/RFF-LMS all clamp mu with it.
+    lms_mu_min: float = 1e-6
 
     # Volterra-specific parameters (only used when adaptive_filter == "volterra")
-    volterra_max_order_vol: int = 3
+    volterra_alpha_u: float = 0.1
+    volterra_M2: int = 3
+
+    # RFF-LMS-specific parameters (only used when adaptive_filter == "rff_lms")
+    rff_D: int = 100
+    rff_sigma: float = 1.0
+    rff_seed: int = 42
 
     extras: dict[str, Any] = field(default_factory=dict)
 

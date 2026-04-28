@@ -1,9 +1,8 @@
 """Protocol-specific loading, cleaning, filtering, and resampling.
 
-中文说明：
-本模块把一组原始运动 CSV + 参考心率 CSV 转换成协议统一使用的
-``ProtocolDataset``。这里完成时间轴重建、缺失值插值、PPG 去异常、
-冷膜 CF 计算、分通道带通滤波与多相重采样。
+中文说明：本模块把一组原始运动 CSV 和参考心率 CSV 转换成协议统一使用的
+``ProtocolDataset``。处理流程包括时间轴重建、缺失值插值、PPG 毛刺修复、冷膜
+CF 计算、分类型带通滤波和 ``resample_poly`` 重采样。
 """
 
 from __future__ import annotations
@@ -28,6 +27,7 @@ __all__ = [
     "PROTOCOL_CHANNELS",
     "ProtocolDataset",
     "load_and_preprocess_protocol",
+    "load_protocol_raw_clean_frames",
     "resample_protocol_dataset",
 ]
 
@@ -100,7 +100,11 @@ class ProtocolDataset:
         return pd.DataFrame(data)
 
     def replace_channels(self, channels: dict[str, np.ndarray], fs: int) -> "ProtocolDataset":
-        """Return a copy with new channel arrays and a rebuilt time base."""
+        """Return a copy with new channel arrays and a rebuilt time base.
+
+        中文说明：重采样后所有通道长度可能因多相滤波略有差异，因此统一裁剪到
+        最短长度，再按目标采样率从 0 重建时间轴。
+        """
 
         n = min(len(v) for v in channels.values())
         trimmed = {k: np.asarray(v, dtype=float)[:n] for k, v in channels.items()}
@@ -119,68 +123,34 @@ def load_and_preprocess_protocol(
 ) -> ProtocolDataset:
     """Load one sensor/reference pair for the batch adaptive protocol.
 
-    Sensor time is always rebuilt as ``np.arange(n) / fs_origin``. Missing
-    samples are linearly interpolated with nearest-end filling, PPG spikes are
-    repaired with the existing preprocessing utilities, cold-film ratios are
-    guarded against zero denominators, and channel groups are Butterworth
-    band-pass filtered with zero-phase ``filtfilt``.
+    中文说明：传感器时间轴始终按 ``np.arange(n) / fs_origin`` 从 0 重建；缺失值
+    先线性插值再近邻补边；PPG 使用既有毛刺修复工具；CF 按
+    ``Uc / (Ut - Uc)`` 计算并防止零分母；最后按信号类型做零相位带通滤波。
     """
 
     sensor_path = Path(sensor_csv)
-    raw = pd.read_csv(sensor_path)
-    if raw.empty:
-        raise ValueError(f"Sensor CSV is empty: {sensor_path}")
-
-    missing = [col for col in _RAW_COLUMN_BY_FIELD.values() if col not in raw.columns]
-    if missing:
-        raise KeyError(f"Missing required sensor columns: {', '.join(sorted(set(missing)))}")
-
-    n = len(raw)
+    clean_frame = _build_clean_frame(sensor_path, int(fs_origin))
     fs = int(fs_origin)
-    # 中文注释：原始 Time(s) 记录不可靠，协议要求按采样率从 0 重建。
-    time_s = np.arange(n, dtype=float) / float(fs)
 
-    # 中文注释：先清理热膜和冷膜原始电压，再计算 CF，避免分母接近 0 产生 inf。
-    hf1_raw = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["hf1"]])
-    hf2_raw = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["hf2"]])
-    uc1_raw = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["uc1"]])
-    uc2_raw = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["uc2"]])
-
-    cf1 = _safe_ratio(uc1_raw, hf1_raw - uc1_raw)
-    cf2 = _safe_ratio(uc2_raw, hf2_raw - uc2_raw)
-
-    # 中文注释：PPG 先插值，再用滑动中值/均值前值策略修复突变毛刺。
-    ppg_green = _clean_ppg(raw[_RAW_COLUMN_BY_FIELD["ppg_green"]], fs)
-    ppg_red = _clean_ppg(raw[_RAW_COLUMN_BY_FIELD["ppg_red"]], fs)
-    ppg_ir = _clean_ppg(raw[_RAW_COLUMN_BY_FIELD["ppg_ir"]], fs)
-
-    accx = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["accx"]])
-    accy = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["accy"]])
-    accz = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["accz"]])
-    gyrox = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["gyrox"]])
-    gyroy = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["gyroy"]])
-    gyroz = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["gyroz"]])
-
-    # 中文注释：不同传感器按协议使用不同通带，均采用 filtfilt 零相移滤波。
-    ppg_green = _safe_bandpass(ppg_green, fs, 0.5, 5.0)
-    ppg_red = _safe_bandpass(ppg_red, fs, 0.5, 5.0)
-    ppg_ir = _safe_bandpass(ppg_ir, fs, 0.5, 5.0)
-    hf1 = _safe_bandpass(hf1_raw, fs, 0.1, 5.0)
-    hf2 = _safe_bandpass(hf2_raw, fs, 0.1, 5.0)
-    cf1 = _safe_bandpass(cf1, fs, 0.1, 5.0)
-    cf2 = _safe_bandpass(cf2, fs, 0.1, 5.0)
-    accx = _safe_bandpass(accx, fs, 0.5, 10.0)
-    accy = _safe_bandpass(accy, fs, 0.5, 10.0)
-    accz = _safe_bandpass(accz, fs, 0.5, 10.0)
-    gyrox = _safe_bandpass(gyrox, fs, 0.5, 10.0)
-    gyroy = _safe_bandpass(gyroy, fs, 0.5, 10.0)
-    gyroz = _safe_bandpass(gyroz, fs, 0.5, 10.0)
+    ppg_green = _safe_bandpass(clean_frame["ppg_green"].to_numpy(dtype=float), fs, 0.5, 5.0)
+    ppg_red = _safe_bandpass(clean_frame["ppg_red"].to_numpy(dtype=float), fs, 0.5, 5.0)
+    ppg_ir = _safe_bandpass(clean_frame["ppg_ir"].to_numpy(dtype=float), fs, 0.5, 5.0)
+    hf1 = _safe_bandpass(clean_frame["hf1"].to_numpy(dtype=float), fs, 0.1, 5.0)
+    hf2 = _safe_bandpass(clean_frame["hf2"].to_numpy(dtype=float), fs, 0.1, 5.0)
+    cf1 = _safe_bandpass(clean_frame["cf1"].to_numpy(dtype=float), fs, 0.1, 5.0)
+    cf2 = _safe_bandpass(clean_frame["cf2"].to_numpy(dtype=float), fs, 0.1, 5.0)
+    accx = _safe_bandpass(clean_frame["accx"].to_numpy(dtype=float), fs, 0.5, 10.0)
+    accy = _safe_bandpass(clean_frame["accy"].to_numpy(dtype=float), fs, 0.5, 10.0)
+    accz = _safe_bandpass(clean_frame["accz"].to_numpy(dtype=float), fs, 0.5, 10.0)
+    gyrox = _safe_bandpass(clean_frame["gyrox"].to_numpy(dtype=float), fs, 0.5, 10.0)
+    gyroy = _safe_bandpass(clean_frame["gyroy"].to_numpy(dtype=float), fs, 0.5, 10.0)
+    gyroz = _safe_bandpass(clean_frame["gyroz"].to_numpy(dtype=float), fs, 0.5, 10.0)
 
     ref_time_s, ref_hr_bpm = _parse_reference_csv_protocol(Path(ref_csv))
     return ProtocolDataset(
         sample_stem=sensor_path.stem,
         fs=fs,
-        time_s=time_s,
+        time_s=clean_frame["time_s"].to_numpy(dtype=float),
         ppg_green=ppg_green,
         ppg_red=ppg_red,
         ppg_ir=ppg_ir,
@@ -199,12 +169,44 @@ def load_and_preprocess_protocol(
     )
 
 
+def load_protocol_raw_clean_frames(
+    sensor_csv: str | Path,
+    fs_origin: int = 100,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return raw and cleaned 13-channel protocol frames for plotting.
+
+    中文说明：raw 表直接来自原始 CSV 并按协议字段重命名；clean 表完成缺失值、PPG
+    毛刺和 CF 安全计算，但尚未做带通滤波，便于对比原始/清洗后信号。
+    """
+
+    path = Path(sensor_csv)
+    raw = pd.read_csv(path)
+    _validate_sensor_columns(raw)
+    fs = int(fs_origin)
+    time_s = np.arange(len(raw), dtype=float) / float(fs)
+    raw_frame = pd.DataFrame({"time_s": time_s})
+    for field in PROTOCOL_CHANNELS:
+        if field == "cf1":
+            raw_frame[field] = _raw_ratio(raw, "uc1", "hf1")
+        elif field == "cf2":
+            raw_frame[field] = _raw_ratio(raw, "uc2", "hf2")
+        elif field in {"hf1", "hf2"}:
+            raw_frame[field] = pd.to_numeric(raw[_RAW_COLUMN_BY_FIELD[field]], errors="coerce")
+        else:
+            raw_frame[field] = pd.to_numeric(raw[_RAW_COLUMN_BY_FIELD[field]], errors="coerce")
+    clean_frame = _build_clean_frame(path, fs)
+    return raw_frame, clean_frame
+
+
 def resample_protocol_dataset(dataset: ProtocolDataset, fs_target: int) -> ProtocolDataset:
-    """Resample all sensor channels with ``scipy.signal.resample_poly``."""
+    """Resample all sensor channels with ``scipy.signal.resample_poly``.
+
+    中文说明：重采样只依赖原始样本、Fs_Target 和通道值，批处理会缓存这个结果，
+    避免每个级联模式重复做多相滤波。
+    """
 
     fs_target = int(fs_target)
     if fs_target == int(dataset.fs):
-        # 中文注释：目标采样率等于原采样率时直接返回，避免不必要滤波/重采样。
         return dataset
     gcd = math.gcd(int(dataset.fs), fs_target)
     up = fs_target // gcd
@@ -216,7 +218,56 @@ def resample_protocol_dataset(dataset: ProtocolDataset, fs_target: int) -> Proto
     return dataset.replace_channels(channels, fs_target)
 
 
+def _build_clean_frame(sensor_path: Path, fs: int) -> pd.DataFrame:
+    """Load raw CSV and build the cleaned, unfiltered 13-channel frame."""
+
+    raw = pd.read_csv(sensor_path)
+    if raw.empty:
+        raise ValueError(f"Sensor CSV is empty: {sensor_path}")
+    _validate_sensor_columns(raw)
+
+    n = len(raw)
+    time_s = np.arange(n, dtype=float) / float(fs)
+    hf1_raw = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["hf1"]])
+    hf2_raw = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["hf2"]])
+    uc1_raw = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["uc1"]])
+    uc2_raw = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["uc2"]])
+
+    return pd.DataFrame(
+        {
+            "time_s": time_s,
+            "ppg_green": _clean_ppg(raw[_RAW_COLUMN_BY_FIELD["ppg_green"]], fs),
+            "ppg_red": _clean_ppg(raw[_RAW_COLUMN_BY_FIELD["ppg_red"]], fs),
+            "ppg_ir": _clean_ppg(raw[_RAW_COLUMN_BY_FIELD["ppg_ir"]], fs),
+            "hf1": hf1_raw,
+            "hf2": hf2_raw,
+            "cf1": _safe_ratio(uc1_raw, hf1_raw - uc1_raw),
+            "cf2": _safe_ratio(uc2_raw, hf2_raw - uc2_raw),
+            "accx": _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["accx"]]),
+            "accy": _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["accy"]]),
+            "accz": _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["accz"]]),
+            "gyrox": _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["gyrox"]]),
+            "gyroy": _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["gyroy"]]),
+            "gyroz": _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["gyroz"]]),
+        }
+    )
+
+
+def _validate_sensor_columns(raw: pd.DataFrame) -> None:
+    missing = [col for col in _RAW_COLUMN_BY_FIELD.values() if col not in raw.columns]
+    if missing:
+        raise KeyError(f"Missing required sensor columns: {', '.join(sorted(set(missing)))}")
+
+
+def _raw_ratio(raw: pd.DataFrame, numerator_field: str, hf_field: str) -> np.ndarray:
+    numerator = pd.to_numeric(raw[_RAW_COLUMN_BY_FIELD[numerator_field]], errors="coerce").to_numpy(dtype=float)
+    hf = pd.to_numeric(raw[_RAW_COLUMN_BY_FIELD[hf_field]], errors="coerce").to_numpy(dtype=float)
+    return numerator / (hf - numerator)
+
+
 def _clean_numeric(values: pd.Series | np.ndarray) -> np.ndarray:
+    """Convert one raw column to finite numeric values by interpolation."""
+
     arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
     arr[~np.isfinite(arr)] = np.nan
     arr = fillmissing_linear(arr)
@@ -225,6 +276,8 @@ def _clean_numeric(values: pd.Series | np.ndarray) -> np.ndarray:
 
 
 def _clean_ppg(values: pd.Series | np.ndarray, fs: int) -> np.ndarray:
+    """Clean PPG missing values and short spikes with existing utilities."""
+
     arr = _clean_numeric(values)
     window = max(3, int(fs))
     try:
@@ -234,7 +287,8 @@ def _clean_ppg(values: pd.Series | np.ndarray, fs: int) -> np.ndarray:
 
 
 def _safe_ratio(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
-    # 中文注释：分母接近 0 的点先置 NaN，再统一插值，最终不允许 inf 进入下游。
+    """Compute CF ratio while preventing zero denominator and infinities."""
+
     den = np.asarray(denominator, dtype=float).copy()
     den[np.abs(den) < 1e-9] = np.nan
     out = np.asarray(numerator, dtype=float) / den
@@ -246,6 +300,8 @@ def _safe_ratio(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
 
 
 def _safe_bandpass(x: np.ndarray, fs: int, low_hz: float, high_hz: float) -> np.ndarray:
+    """Apply a fourth-order Butterworth bandpass with safe fallbacks."""
+
     arr = np.asarray(x, dtype=float)
     if arr.size < 8:
         return arr - np.nanmean(arr)
@@ -265,6 +321,8 @@ def _safe_bandpass(x: np.ndarray, fs: int, low_hz: float, high_hz: float) -> np.
 
 
 def _parse_reference_csv_protocol(ref_csv: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Parse reference HR CSVs used by the copied testdata and common exports."""
+
     ref_csv = Path(ref_csv)
     candidates: list[pd.DataFrame] = []
     try:
@@ -284,6 +342,8 @@ def _parse_reference_csv_protocol(ref_csv: Path) -> tuple[np.ndarray, np.ndarray
 
 
 def _try_parse_reference_frame(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray] | None:
+    """Try several common reference CSV layouts and return time/HR arrays."""
+
     if df.empty:
         return None
     lower_cols = [str(c).strip().lower() for c in df.columns]
@@ -317,6 +377,8 @@ def _first_matching(names: list[str], needles: tuple[str, ...]) -> int | None:
 
 
 def _parse_time_series(values: pd.Series) -> np.ndarray:
+    """Parse numeric seconds or ``HH:MM:SS``-style strings into seconds."""
+
     raw = values.astype(str).str.strip()
     numeric = pd.to_numeric(raw, errors="coerce").to_numpy(dtype=float)
     if np.isfinite(numeric).sum() >= max(1, len(numeric) // 2):
@@ -332,6 +394,8 @@ def _parse_time_series(values: pd.Series) -> np.ndarray:
 
 
 def _valid_ref(time: np.ndarray, hr: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return sorted unique finite reference samples or ``None`` if invalid."""
+
     mask = np.isfinite(time) & np.isfinite(hr)
     if mask.sum() < 2:
         return None

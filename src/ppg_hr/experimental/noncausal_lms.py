@@ -1,9 +1,8 @@
 """Causal/non-causal NLMS primitives for protocol cascade filtering.
 
-中文说明：
-本模块把包络时延 D 映射为 LMS 阶数 M 与前向抽头 K，并实现输出长度不变的
-因果/非因果 NLMS。D>0 表示补偿信号超前，K=0；D<0 表示补偿信号滞后，
-允许使用未来 K 个样本。
+中文说明：本模块把包络时延 D 映射为 LMS 阶数 M 与前向抽头 K，并实现输出长度
+不变的非因果 NLMS。D > 0 表示补偿信号超前 PPG；D < 0 表示补偿信号滞后，
+允许使用未来 K 个样本补偿。
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from .envelope_delay import ChannelDelay
 __all__ = ["LmsDesign", "map_delay_to_lms_params", "noncausal_lms_filter"]
 
 LMS_MU_BASE = 0.01
-LMS_MU_MIN = 1e-5
+LMS_MU_MIN = 1e-6
 
 
 @dataclass(frozen=True)
@@ -44,9 +43,13 @@ def map_delay_to_lms_params(
     search_params: Any,
     fs: int,
 ) -> LmsDesign:
-    """Map an envelope delay in samples to LMS ``M``/``K`` parameters."""
+    """Map an envelope delay in samples to LMS ``M``/``K`` parameters.
 
-    del fs  # Delay is already in samples; keep ``fs`` for the public signature.
+    中文说明：相关性越强，说明参考信号可能包含更强运动伪影，因此按
+    ``mu = max(mu_min, LMS_Mu_Base - abs_corr / 100)`` 收缩步长。
+    """
+
+    del fs
     if isinstance(delay, ChannelDelay):
         D = int(delay.D_opt_samples)
         curr_corr = abs(float(delay.R_max))
@@ -60,12 +63,10 @@ def map_delay_to_lms_params(
     K_max = int(_get_param(search_params, "K_max"))
 
     if D > 0:
-        # 中文注释：补偿信号超前 PPG，使用因果抽头，阶数随样本时延放大。
         M = min(max(1, int(np.floor(abs(D) * C_scale))), max_order)
         K = 0
         mode = "causal"
     elif D < 0:
-        # 中文注释：补偿信号滞后 PPG，用 K 个未来样本补偿非因果前向信息。
         M = max(1, M_base)
         K = min(K_max, int(np.floor(abs(D) * C_scale)))
         mode = "noncausal"
@@ -95,10 +96,8 @@ def noncausal_lms_filter(
 ) -> np.ndarray:
     """Filter ``d`` using reference ``u`` with ``K`` future taps.
 
-    ``K=0`` uses only current/past reference samples. For ``K>0`` the feature
-    vector spans ``u[n+K]`` down to ``u[n-M+1]``. Positions where that vector
-    cannot be formed retain the normalised input ``d`` value, keeping output
-    length identical to the input window.
+    中文说明：输入向量从 ``u[n+K]`` 取到 ``u[n-M+1]``。边界处无法构造完整向量的
+    样本保留归一化后的 ``d`` 值，保证输出长度与窗口完全一致。
     """
 
     u_arr = _zscore(np.asarray(u, dtype=float).ravel())
@@ -120,7 +119,6 @@ def noncausal_lms_filter(
     mu = float(mu)
     eps = 1e-9
     for idx in range(M - 1, n - K):
-        # 中文注释：uvec 从未来 K 点一路取到过去 M-1 点；K=0 时自然退化为因果 LMS。
         uvec = u_arr[idx - M + 1 : idx + K + 1][::-1]
         y = float(np.dot(w, uvec))
         err = float(d_arr[idx] - y)
@@ -137,6 +135,8 @@ def _get_param(params: Any, name: str, default: Any = None) -> Any:
 
 
 def _zscore(x: np.ndarray) -> np.ndarray:
+    """Return a finite z-scored copy of ``x``."""
+
     arr = np.asarray(x, dtype=float)
     arr = arr.copy()
     arr[~np.isfinite(arr)] = 0.0

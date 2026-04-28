@@ -1,9 +1,8 @@
 """PPG-to-reference HR delay alignment for the protocol.
 
-中文说明：
-本模块负责把多通道传感器时间轴与 1 Hz 参考心率对齐。对齐只使用静息段
-绿光 PPG：扫描 0 到 3 秒延迟，逐窗 FFT 提取 PPG HR，与参考 HR 比较
-差值 STD，取 STD 最小的 Tdelay。
+中文说明：本模块把多通道传感器时间轴与 1 Hz 参考心率对齐。对齐只使用静息段
+绿光 PPG：扫描 0 到 5 秒延迟、步长 0.1 秒，逐窗用 Hamming + FFT 提取 PPG HR，
+再与参考 HR 比较差值 STD，取 STD 最小的 Tdelay。
 """
 
 from __future__ import annotations
@@ -28,6 +27,8 @@ class AlignmentInfo:
     std_by_delay: dict[float, float]
     ref_shift_s: float
     num_windows: int
+    status: str = "ok"
+    reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly representation."""
@@ -37,6 +38,8 @@ class AlignmentInfo:
             "std_by_delay": {str(k): float(v) for k, v in self.std_by_delay.items()},
             "ref_shift_s": float(self.ref_shift_s),
             "num_windows": int(self.num_windows),
+            "status": self.status,
+            "reason": self.reason,
         }
 
 
@@ -73,35 +76,46 @@ def align_ppg_to_ref_hr(
     TW: int | float,
     fs_target: int,
 ) -> AlignedDataset:
-    """Find the best 0--3 s PPG delay and build aligned window metadata."""
+    """Find the best 0--5 s PPG delay and build aligned window metadata.
+
+    中文说明：如果静息段太短导致任一候选延迟下可比较窗口少于 2 个，会抛出
+    带明确 reason 的 ``ValueError``；批处理入口会捕获并写入 batch_summary。
+    """
 
     if not segment_info.is_valid:
         raise ValueError(f"Cannot align invalid segment info: {segment_info.reason}")
 
     fs = int(fs_target)
     TW = float(TW)
-    delay_grid = np.arange(0.0, 3.0 + 1e-9, 0.5)
+    delay_grid = np.round(np.arange(0.0, 5.0 + 1e-9, 0.1), 10)
     std_by_delay: dict[float, float] = {}
     best_delay = 0.0
     best_std = float("inf")
+    best_common_windows = 0
 
-    # 中文注释：参考心率按协议左移 TW/2，相当于和窗口中心对齐。
     ref_seq = _reference_sequence_after_half_window(dataset, TW)
     for delay_s in delay_grid:
-        # 中文注释：候选延迟下截断 PPG 前 Tdelay 秒，只用静息段窗口估计 HR。
-        ppg_hr = _rest_ppg_hr_for_delay(dataset.ppg_green, fs, TW, delay_s, segment_info.motion_start_s)
-        L = min(ppg_hr.size, ref_seq.size)
-        if L < 2:
+        ppg_hr = _rest_ppg_hr_for_delay(dataset.ppg_green, fs, TW, float(delay_s), segment_info.motion_start_s)
+        common = min(ppg_hr.size, ref_seq.size)
+        best_common_windows = max(best_common_windows, int(common))
+        if common < 2:
             std = float("inf")
         else:
-            diff = ppg_hr[:L] - ref_seq[:L]
+            diff = ppg_hr[:common] - ref_seq[:common]
             std = float(np.nanstd(diff))
         std_by_delay[float(delay_s)] = std
         if std < best_std:
             best_std = std
             best_delay = float(delay_s)
 
-    # 中文注释：找到最佳 Tdelay 后，所有传感器通道统一左移相同样本数。
+    if best_common_windows < 2 or not np.isfinite(best_std):
+        raise ValueError(
+            "alignment failed: fewer than 2 comparable rest windows "
+            f"(max_common_windows={best_common_windows})"
+        )
+
+    print(f"[alignment] {dataset.sample_stem}: best_tdelay_s={best_delay:.1f}, rest_windows={best_common_windows}")
+
     shifted_dataset = _left_shift_dataset(dataset, best_delay, fs)
     shifted_start = max(0.0, float(segment_info.motion_start_s) - best_delay)
     shifted_end = max(shifted_start, float(segment_info.motion_end_s) - best_delay)
@@ -162,6 +176,8 @@ def align_ppg_to_ref_hr(
 
 
 def _reference_sequence_after_half_window(dataset: ProtocolDataset, TW: float) -> np.ndarray:
+    """Return finite reference HR values after the half-window shift."""
+
     mask = np.asarray(dataset.ref_time_s, dtype=float) >= TW / 2.0
     seq = np.asarray(dataset.ref_hr_bpm, dtype=float)[mask]
     return seq[np.isfinite(seq)]
@@ -174,6 +190,8 @@ def _rest_ppg_hr_for_delay(
     delay_s: float,
     motion_start_s: float,
 ) -> np.ndarray:
+    """Estimate rest-window PPG HR for one candidate delay."""
+
     delay_samples = int(round(delay_s * fs))
     shifted = np.asarray(ppg_green, dtype=float)[delay_samples:]
     usable_rest_s = max(0.0, float(motion_start_s) - delay_s)
@@ -187,6 +205,8 @@ def _rest_ppg_hr_for_delay(
 
 
 def _window_fft_hr(x: np.ndarray, fs: int, low_hz: float, high_hz: float) -> float:
+    """Extract the dominant frequency in one Hamming-windowed segment."""
+
     sig = np.asarray(x, dtype=float)
     if sig.size < 4 or not np.isfinite(sig).any():
         return float("nan")
@@ -203,6 +223,8 @@ def _window_fft_hr(x: np.ndarray, fs: int, low_hz: float, high_hz: float) -> flo
 
 
 def _left_shift_dataset(dataset: ProtocolDataset, delay_s: float, fs: int) -> ProtocolDataset:
+    """Shift all sensor channels left by the chosen delay."""
+
     samples = int(round(float(delay_s) * fs))
     if samples <= 0:
         return dataset

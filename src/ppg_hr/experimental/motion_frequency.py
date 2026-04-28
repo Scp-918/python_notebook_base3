@@ -1,9 +1,8 @@
 """Motion dominant-frequency estimation.
 
-中文说明：
-本模块在检测出的运动段内，从三轴 ACC 中选能量最大的一路，用
-Hamming + FFT 估计运动干扰主频 Fmove。若运动段无效或谱峰不可用，
-会给出 warning 并返回默认值，保证优化流程不中断。
+中文说明：本模块在检测出的运动段内，从三轴 ACC 中选择能量最大的一路，用
+Hamming + FFT 估计运动干扰主频 Fmove。若运动段无效或谱峰不可用，会给出
+warning 并返回默认值，保证优化流程不中断。
 """
 
 from __future__ import annotations
@@ -29,7 +28,11 @@ def estimate_motion_frequency(
     min_hz: float = 0.2,
     max_hz: float = 5.0,
 ) -> float:
-    """Return the dominant ACC frequency within the detected motion segment."""
+    """Return the dominant ACC frequency within the detected motion segment.
+
+    中文说明：输入是三轴 ACC、运动分段和采样率；输出是供频谱惩罚使用的运动
+    主频。如果运动段太短，返回 ``default_hz``。
+    """
 
     if not motion_segment.is_valid:
         warnings.warn(
@@ -51,7 +54,6 @@ def estimate_motion_frequency(
         np.asarray(accy, dtype=float)[start:end],
         np.asarray(accz, dtype=float)[start:end],
     ]
-    # 中文注释：运动伪影通常在能量最大的一轴最明显，因此只用该轴估计主频。
     energies = [float(np.nansum((axis - np.nanmean(axis)) ** 2)) for axis in axes]
     sig = axes[int(np.argmax(energies))]
     sig = sig - np.nanmean(sig)

@@ -1,10 +1,7 @@
-"""CSV, JSON, and PNG outputs for the batch adaptive protocol.
+"""CSV, JSON, and signal-figure outputs for the batch adaptive protocol.
 
-中文说明：
-本模块集中管理协议输出文件，避免 Notebook 里散落保存逻辑。输出分三类：
-1. QC/summary CSV；
-2. 每个样本的最优参数 JSON 与长表 CSV；
-3. 每个样本的运动段信号图、贝叶斯收敛图、自适应滤波结果图。
+中文说明：主训练流程只写 QC 表、训练曲线数据、汇总表和 13 路信号图；HR 对比图
+只由 Notebook 末尾的“手动重画最佳参数”函数输出。
 """
 
 from __future__ import annotations
@@ -12,7 +9,6 @@ from __future__ import annotations
 import csv
 import json
 import os
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,12 +18,18 @@ import pandas as pd
 
 from ..params import CascadeScheme, TargetScope
 from .batch_pairing import UnpairedSample
-from .preprocess_protocol import ProtocolDataset
+from .preprocess_protocol import (
+    PROTOCOL_CHANNELS,
+    ProtocolDataset,
+    load_protocol_raw_clean_frames,
+)
 from .protocol_optimizer import ProtocolModeResult
 from .qc import QcResult
+from .segmentation import SegmentInfo
 
 __all__ = [
     "SampleOutputPaths",
+    "plot_signal_figures",
     "write_batch_summary",
     "write_metric_matrix_tables",
     "write_qc_tables",
@@ -36,6 +38,7 @@ __all__ = [
 
 QC_TABLE_COLUMNS = [
     "group_id",
+    "motion_type",
     "data_file",
     "ref_file",
     "file_name",
@@ -55,12 +58,15 @@ UNPAIRED_TABLE_COLUMNS = ["file_name", "file_path", "reason"]
 
 @dataclass(frozen=True)
 class SampleOutputPaths:
-    """Paths written for one sample."""
+    """Paths written for one sample.
+
+    中文说明：保留旧字段以兼容旧 Notebook；新主流程不会自动生成 HR compare 图。
+    """
 
     result_csv: Path
     report_json: Path
-    motion_png: Path
-    motion_recovery_png: Path
+    motion_png: Path | None = None
+    motion_recovery_png: Path | None = None
     signal_png: Path | None = None
     bayes_motion_png: Path | None = None
     bayes_motion_recovery_png: Path | None = None
@@ -83,8 +89,6 @@ def write_qc_tables(
         "unpaired": out / "unpaired_samples.csv",
         "summary": out / "qc_summary.csv",
     }
-
-    # 中文注释：好采样/坏采样名单单独保存，Notebook 会直接 display 这两张表。
     pd.DataFrame([r.to_dict() for r in good], columns=QC_TABLE_COLUMNS).to_csv(
         paths["good"], index=False, encoding="utf-8-sig"
     )
@@ -97,12 +101,41 @@ def write_qc_tables(
     ).to_csv(paths["unpaired"], index=False, encoding="utf-8-sig")
     pd.DataFrame(
         [
+            {"metric": "paired_samples", "value": len(good) + len(bad)},
             {"metric": "good_samples", "value": len(good)},
             {"metric": "bad_samples", "value": len(bad)},
             {"metric": "unpaired_samples", "value": len(unpaired)},
         ]
     ).to_csv(paths["summary"], index=False, encoding="utf-8-sig")
     return paths
+
+
+def plot_signal_figures(
+    *,
+    sensor_csv: str | Path,
+    dataset: ProtocolDataset,
+    segment_info: SegmentInfo | None,
+    output_dir: str | Path,
+    group_id: str,
+    motion_type: str,
+    fs_origin: int = 100,
+) -> dict[str, Path]:
+    """Plot full raw/cleaned signals and motion-segment bandpassed signals.
+
+    中文说明：两张图都使用 5 个子图：HF、CF、PPG、ACC、Gyro。每个子图都有
+    title、xlabel、ylabel、legend 和 grid，文件名包含 group_id 与 motion_type。
+    """
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    plt = _prepare_matplotlib(out)
+    raw_frame, clean_frame = load_protocol_raw_clean_frames(sensor_csv, fs_origin=fs_origin)
+    full_path = out / f"raw_clean_13ch_{group_id}_{motion_type}.png"
+    motion_path = out / f"motion_bandpass_13ch_{group_id}_{motion_type}.png"
+
+    _plot_full_raw_clean(plt, raw_frame, clean_frame, full_path, group_id, motion_type)
+    _plot_motion_bandpass(plt, dataset, segment_info, motion_path, group_id, motion_type)
+    return {"raw_clean": full_path, "motion_bandpass": motion_path}
 
 
 def write_sample_outputs(
@@ -114,16 +147,17 @@ def write_sample_outputs(
     fig_out_dir: str | Path | None = None,
     dataset: ProtocolDataset | None = None,
 ) -> SampleOutputPaths:
-    """Write the long result CSV, JSON report, and all protocol PNG figures."""
+    """Compatibility writer for old per-sample workflows.
 
+    中文说明：只保存长表和 JSON，不再从主流程输出 HR 对比图。``dataset`` 参数保留
+    以兼容旧调用。
+    """
+
+    del fig_out_dir, dataset
     csv_dir = Path(csv_out_dir)
     report_dir = Path(report_out_dir)
-    fig_dir = Path(fig_out_dir) if fig_out_dir is not None else report_dir
     csv_dir.mkdir(parents=True, exist_ok=True)
     report_dir.mkdir(parents=True, exist_ok=True)
-    fig_dir.mkdir(parents=True, exist_ok=True)
-
-    # 中文注释：长表 CSV 合并 14 个模式的逐窗 HR、误差和标签。
     group_id = _group_id(sample_stem)
     result_csv = csv_dir / f"adaptive_results_{group_id}.csv"
     frames = [
@@ -136,77 +170,25 @@ def write_sample_outputs(
     else:
         _empty_result_frame().to_csv(result_csv, index=False, encoding="utf-8-sig")
 
-    # 中文注释：JSON 保存每个模式的 best params、AAE、accuracy、trial history 和重要性。
     report_json = report_dir / f"Best_Params_Result_{group_id}.json"
     payload = {r.mode_key: _mode_payload(r) for r in results}
-    with report_json.open("w", encoding="utf-8") as f:
-        json.dump(_jsonify(payload), f, ensure_ascii=False, indent=2)
-
-    signal_png = fig_dir / "filtered_motion_signals" / f"filtered_motion_13ch_{group_id}.png"
-    bayes_motion_png = fig_dir / "bayes_training_curves" / f"bayes_curve_motion_only_{group_id}.png"
-    bayes_motion_recovery_png = (
-        fig_dir / "bayes_training_curves" / f"bayes_curve_motion_recovery_{group_id}.png"
-    )
-    motion_png = fig_dir / "hr_compare" / f"hr_compare_motion_only_{group_id}.png"
-    motion_recovery_png = fig_dir / "hr_compare" / f"hr_compare_motion_recovery_{group_id}.png"
-
-    if dataset is not None:
-        _safe_plot(_plot_motion_segment_signals, dataset, results, signal_png)
-    _safe_plot(
-        _plot_bayes_convergence,
-        results,
-        TargetScope.MOTION_ONLY,
-        bayes_motion_png,
-        title=f"{sample_stem} 运动段贝叶斯优化 AAE 收敛曲线",
-    )
-    _safe_plot(
-        _plot_bayes_convergence,
-        results,
-        TargetScope.MOTION_AND_RECOVERY,
-        bayes_motion_recovery_png,
-        title=f"{sample_stem} 运动加恢复段贝叶斯优化 AAE 收敛曲线",
-    )
-    _safe_plot(
-        _plot_scope,
-        results,
-        TargetScope.MOTION_ONLY,
-        motion_png,
-        title=f"{sample_stem} 运动段自适应滤波信号段选择",
-    )
-    _safe_plot(
-        _plot_scope,
-        results,
-        TargetScope.MOTION_AND_RECOVERY,
-        motion_recovery_png,
-        title=f"{sample_stem} 运动加恢复段自适应滤波信号段选择",
-    )
-    return SampleOutputPaths(
-        result_csv=result_csv,
-        report_json=report_json,
-        motion_png=motion_png,
-        motion_recovery_png=motion_recovery_png,
-        signal_png=signal_png,
-        bayes_motion_png=bayes_motion_png,
-        bayes_motion_recovery_png=bayes_motion_recovery_png,
-    )
+    report_json.write_text(json.dumps(_jsonify(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+    return SampleOutputPaths(result_csv=result_csv, report_json=report_json)
 
 
 def write_batch_summary(path: str | Path, rows: list[dict[str, Any]]) -> Path:
-    """Write one row per sample summarising batch-level status."""
+    """Write one row per sample/motion-type summarising batch-level status."""
 
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
+        "motion_type",
         "sample",
         "status",
         "reason",
+        "split",
         "result_csv",
         "report_json",
-        "signal_png",
-        "bayes_motion_png",
-        "bayes_motion_recovery_png",
-        "motion_png",
-        "motion_recovery_png",
     ]
     with out.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -220,25 +202,13 @@ def write_metric_matrix_tables(
     out_dir: str | Path,
     results_by_sample: dict[str, list[ProtocolModeResult]],
 ) -> dict[str, Path]:
-    """Write four cross-sample metric matrices for filtered segments only.
-
-    输出 4 张 7 行 x n 列的表：行是级联滤波方案，列是好采样运动 group_id。
-    AAE/accuracy 取每个样本、每个目标段、每个方案最终最优 repeat 的结果。
-    """
+    """Compatibility matrix writer for old per-sample workflows."""
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     specs = {
-        "motion_only_aae": (
-            TargetScope.MOTION_ONLY,
-            "adaptive_aae_bpm",
-            "filtered_motion_aae_bpm.csv",
-        ),
-        "motion_only_accuracy": (
-            TargetScope.MOTION_ONLY,
-            "adaptive_acc_pct",
-            "filtered_motion_accuracy_pct.csv",
-        ),
+        "motion_only_aae": (TargetScope.MOTION_ONLY, "adaptive_aae_bpm", "filtered_motion_aae_bpm.csv"),
+        "motion_only_accuracy": (TargetScope.MOTION_ONLY, "adaptive_acc_pct", "filtered_motion_accuracy_pct.csv"),
         "motion_recovery_aae": (
             TargetScope.MOTION_AND_RECOVERY,
             "adaptive_aae_bpm",
@@ -250,7 +220,6 @@ def write_metric_matrix_tables(
             "filtered_motion_recovery_accuracy_pct.csv",
         ),
     }
-
     sample_names = list(results_by_sample.keys())
     group_ids = [_group_id(name) for name in sample_names]
     paths: dict[str, Path] = {}
@@ -268,16 +237,91 @@ def write_metric_matrix_tables(
     return paths
 
 
+def _plot_full_raw_clean(
+    plt: Any,
+    raw_frame: pd.DataFrame,
+    clean_frame: pd.DataFrame,
+    out_path: Path,
+    group_id: str,
+    motion_type: str,
+) -> None:
+    groups = _plot_groups()
+    fig, axes = plt.subplots(5, 1, figsize=(14, 15), sharex=True)
+    x = clean_frame["time_s"].to_numpy(dtype=float)
+    for ax, (title, ylabel, names) in zip(axes, groups, strict=True):
+        for name in names:
+            ax.plot(x, raw_frame[name].to_numpy(dtype=float), linewidth=0.7, linestyle="--", alpha=0.45, label=f"{name} raw")
+            ax.plot(x, clean_frame[name].to_numpy(dtype=float), linewidth=0.9, label=f"{name} clean")
+        ax.set_title(title)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(ylabel)
+        ax.legend(loc="upper right", ncol=min(3, len(names)), fontsize=7)
+        ax.grid(True, alpha=0.25)
+    fig.suptitle(f"{group_id} / {motion_type} full raw and cleaned 13-channel signals", fontsize=14)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def _plot_motion_bandpass(
+    plt: Any,
+    dataset: ProtocolDataset,
+    segment_info: SegmentInfo | None,
+    out_path: Path,
+    group_id: str,
+    motion_type: str,
+) -> None:
+    frame = dataset.to_frame()
+    if segment_info is not None and segment_info.is_valid:
+        start_s = float(segment_info.motion_start_s)
+        end_s = float(segment_info.motion_end_s)
+    else:
+        start_s = float(frame["time_s"].iloc[0])
+        end_s = float(frame["time_s"].iloc[-1])
+    mask = (frame["time_s"] >= start_s) & (frame["time_s"] <= end_s)
+    if mask.sum() < 2:
+        mask = np.ones(len(frame), dtype=bool)
+    x = frame.loc[mask, "time_s"].to_numpy(dtype=float)
+    if x.size:
+        x = x - x[0]
+
+    groups = _plot_groups()
+    fig, axes = plt.subplots(5, 1, figsize=(14, 15), sharex=True)
+    for ax, (title, ylabel, names) in zip(axes, groups, strict=True):
+        for name in names:
+            ax.plot(x, frame.loc[mask, name].to_numpy(dtype=float), linewidth=1.0, label=name)
+        ax.set_title(title)
+        ax.set_xlabel("Motion relative time (s)")
+        ax.set_ylabel(ylabel)
+        ax.legend(loc="upper right", ncol=min(3, len(names)), fontsize=8)
+        ax.grid(True, alpha=0.25)
+    fig.suptitle(f"{group_id} / {motion_type} motion-segment bandpassed 13-channel signals", fontsize=14)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def _plot_groups() -> list[tuple[str, str, list[str]]]:
+    return [
+        ("HF channels", "Amplitude (mV)", ["hf1", "hf2"]),
+        ("CF channels", "Ratio", ["cf1", "cf2"]),
+        ("PPG channels", "Amplitude (a.u.)", ["ppg_green", "ppg_red", "ppg_ir"]),
+        ("ACC channels", "Amplitude (g)", ["accx", "accy", "accz"]),
+        ("Gyro channels", "Amplitude (dps)", ["gyrox", "gyroy", "gyroz"]),
+    ]
+
+
 def _mode_payload(result: ProtocolModeResult) -> dict[str, Any]:
     run = result.best_run
     return {
         "target_scope": result.target_scope.value,
         "cascade_scheme": result.cascade_scheme.value,
+        "adaptive_filter": result.adaptive_filter,
         "runtime_config": {
-            "DEBUG_MODE": bool(result.debug_mode),
             "n_trials": int(result.n_trials),
             "n_repeats": int(result.n_repeats),
             "best_repeat_idx": int(result.best_repeat_idx),
+            "DEBUG_MODE": bool(result.debug_mode),
         },
         "best_params": result.best_params.to_dict(),
         "best_aae_bpm": result.best_aae_bpm,
@@ -287,7 +331,8 @@ def _mode_payload(result: ProtocolModeResult) -> dict[str, Any]:
         "adaptive_acc_pct": result.adaptive_acc_pct,
         "param_importance": result.param_importance,
         "trial_history": result.trial_history,
-        "lms_stage_summary": _lms_stage_summary(run.frame),
+        "adaptive_stage_summary": _adaptive_stage_summary(run.frame),
+        "lms_stage_summary": _adaptive_stage_summary(run.frame),
         "segment_info": run.segment_info.to_dict() if run.segment_info is not None else None,
         "alignment_info": run.alignment_info.to_dict() if run.alignment_info is not None else None,
         "motion_frequency": run.motion_frequency,
@@ -307,214 +352,28 @@ def _find_mode_result(
     return None
 
 
-def _safe_plot(func: Any, *args: Any, **kwargs: Any) -> None:
-    try:
-        func(*args, **kwargs)
-    except ModuleNotFoundError as exc:
-        warnings.warn(f"skip plot because dependency is missing: {exc}", RuntimeWarning, stacklevel=2)
-    except Exception as exc:
-        warnings.warn(f"skip plot because plotting failed: {exc}", RuntimeWarning, stacklevel=2)
-
-
-def _plot_motion_segment_signals(
-    dataset: ProtocolDataset,
-    results: list[ProtocolModeResult],
-    out_path: Path,
-) -> None:
-    """Plot 13 band-pass-filtered channels inside the detected motion segment."""
-
-    plt = _prepare_matplotlib(out_path)
-    segment = _first_valid_segment(results)
-    if segment is None:
-        start_s = float(dataset.time_s[0])
-        end_s = float(dataset.time_s[-1])
-        title_suffix = "未检测到运动段，显示全段"
-    else:
-        start_s = float(segment.motion_start_s)
-        end_s = float(segment.motion_end_s)
-        title_suffix = f"运动段 {start_s:.1f}-{end_s:.1f}s"
-
-    mask = (dataset.time_s >= start_s) & (dataset.time_s <= end_s)
-    if mask.sum() < 2:
-        mask = np.ones_like(dataset.time_s, dtype=bool)
-    x = dataset.time_s[mask]
-    x = x - x[0]
-
-    groups = [
-        ("两路 HF 热膜信号", "幅值/mV", [("HF1", dataset.hf1), ("HF2", dataset.hf2)]),
-        ("两路 CF 冷膜信号", "幅值/ratio", [("CF1", dataset.cf1), ("CF2", dataset.cf2)]),
-        (
-            "三路 PPG 信号",
-            "幅值/a.u.",
-            [("Green", dataset.ppg_green), ("Red", dataset.ppg_red), ("IR", dataset.ppg_ir)],
-        ),
-        (
-            "三轴加速度计信号",
-            "幅值/g",
-            [("AccX", dataset.accx), ("AccY", dataset.accy), ("AccZ", dataset.accz)],
-        ),
-        (
-            "三轴陀螺仪信号",
-            "幅值/dps",
-            [("GyroX", dataset.gyrox), ("GyroY", dataset.gyroy), ("GyroZ", dataset.gyroz)],
-        ),
-    ]
-
-    fig, axes = plt.subplots(5, 1, figsize=(13, 14), sharex=True)
-    for ax, (subtitle, ylabel, series) in zip(axes, groups, strict=True):
-        for label, values in series:
-            ax.plot(x, np.asarray(values, dtype=float)[mask], linewidth=1.0, label=label)
-        ax.set_title(subtitle)
-        ax.set_ylabel(ylabel)
-        ax.grid(True, alpha=0.25)
-        ax.legend(loc="upper right", ncol=min(3, len(series)), fontsize=8)
-    axes[-1].set_xlabel("运动段相对时间/s")
-    fig.suptitle(f"{dataset.sample_stem} 带通滤波后 13 路运动段信号（{title_suffix}）", fontsize=14)
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-def _plot_bayes_convergence(
-    results: list[ProtocolModeResult],
-    target_scope: TargetScope,
-    out_path: Path,
-    *,
-    title: str,
-) -> None:
-    """Plot AAE versus Optuna trial index for seven cascade schemes."""
-
-    plt = _prepare_matplotlib(out_path)
-    by_scheme = {r.cascade_scheme: r for r in results if r.target_scope == target_scope}
-    fig, axes = plt.subplots(7, 1, figsize=(12, 18), sharex=True)
-    if not isinstance(axes, np.ndarray):
-        axes = np.asarray([axes])
-
-    for ax, scheme in zip(axes, list(CascadeScheme), strict=True):
-        result = by_scheme.get(scheme)
-        ax.set_ylabel("AAE/bpm")
-        ax.grid(True, alpha=0.25)
-        if result is None or not result.trial_history:
-            ax.set_title(f"{scheme.value} 无 trial 记录")
-            ax.text(0.5, 0.5, "无 trial 记录", ha="center", va="center", transform=ax.transAxes)
-            continue
-        history = sorted(
-            (
-                item
-                for item in result.trial_history
-                if int(item.get("repeat_idx", 0)) == int(result.best_repeat_idx)
-            ),
-            key=lambda item: int(item.get("trial_idx", 0)),
-        )
-        if not history:
-            history = sorted(result.trial_history, key=lambda item: int(item.get("trial_idx", 0)))
-        x = np.asarray([int(item.get("trial_idx", 0)) + 1 for item in history], dtype=float)
-        y = np.asarray([float(item.get("value", np.nan)) for item in history], dtype=float)
-        y[~np.isfinite(y)] = np.nan
-        best = np.minimum.accumulate(np.nan_to_num(y, nan=np.inf))
-        best[~np.isfinite(best)] = np.nan
-        ax.set_title(
-            f"{scheme.value} best AAE={result.best_aae_bpm:.2f}, "
-            f"best repeat={result.best_repeat_idx}"
-        )
-        ax.plot(x, y, color="0.55", marker="o", markersize=3, linewidth=1.0, label="当前 trial AAE")
-        ax.plot(x, best, color="#1f77b4", linewidth=1.6, label="当前最优 AAE")
-        ax.legend(loc="upper right", fontsize=8)
-    axes[-1].set_xlabel("训练轮次/trial")
-    fig.suptitle(title, fontsize=14)
-    fig.tight_layout(rect=(0, 0, 1, 0.98))
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-def _plot_scope(
-    results: list[ProtocolModeResult],
-    target_scope: TargetScope,
-    out_path: Path,
-    *,
-    title: str,
-) -> None:
-    """Plot reference, raw-PPG baseline, and adaptive-filter HR curves."""
-
-    plt = _prepare_matplotlib(out_path)
-    by_scheme = {r.cascade_scheme: r for r in results if r.target_scope == target_scope}
-    fig, axes = plt.subplots(7, 1, figsize=(12, 18), sharex=True)
-    if not isinstance(axes, np.ndarray):
-        axes = np.asarray([axes])
-
-    for ax, scheme in zip(axes, list(CascadeScheme), strict=True):
-        result = by_scheme.get(scheme)
-        ax.set_title(scheme.value)
-        ax.set_ylabel("心率/bpm")
-        ax.grid(True, alpha=0.25)
-        if result is None or result.best_run.frame.empty:
-            ax.text(0.5, 0.5, "无结果", ha="center", va="center", transform=ax.transAxes)
-            continue
-        frame = _scope_frame(result.best_run.frame, target_scope)
-        if frame.empty:
-            ax.text(0.5, 0.5, "目标段无结果", ha="center", va="center", transform=ax.transAxes)
-            continue
-        x = frame["time_s"].to_numpy(dtype=float)
-        ax.plot(x, frame["ref_hr_bpm"], color="black", linewidth=1.6, label="真实 HR")
-        ax.plot(
-            x,
-            frame["baseline_ppg_hr_bpm"],
-            color="0.55",
-            linestyle="--",
-            linewidth=1.2,
-            label="未去伪影 PPG baseline",
-        )
-        label = (
-            f"自适应滤波 HR "
-            f"AAE={result.adaptive_aae_bpm:.2f} "
-            f"accuracy={result.adaptive_acc_pct:.1f}%"
-        )
-        ax.plot(x, frame["adaptive_hr_bpm"], color="#1f77b4", linewidth=1.4, label=label)
-        ax.legend(loc="best", fontsize=8)
-    axes[-1].set_xlabel("时间/s")
-    fig.suptitle(title, fontsize=14)
-    fig.tight_layout(rect=(0, 0, 1, 0.98))
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-def _first_valid_segment(results: list[ProtocolModeResult]) -> Any | None:
-    for result in results:
-        segment = result.best_run.segment_info
-        if segment is not None and segment.is_valid:
-            return segment
-    return None
-
-
-def _scope_frame(frame: pd.DataFrame, target_scope: TargetScope) -> pd.DataFrame:
-    if "segment_label" not in frame.columns:
-        return frame
-    if target_scope == TargetScope.MOTION_ONLY:
-        return frame.loc[frame["segment_label"].astype(str) == "motion"].copy()
-    return frame.loc[frame["segment_label"].astype(str).isin(["motion", "recovery"])].copy()
-
-
-def _lms_stage_summary(frame: pd.DataFrame) -> list[dict[str, Any]]:
-    if frame is None or frame.empty or "lms_stages_json" not in frame.columns:
+def _adaptive_stage_summary(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    if frame is None or frame.empty:
+        return []
+    column = "adaptive_stages_json" if "adaptive_stages_json" in frame.columns else "lms_stages_json"
+    if column not in frame.columns:
         return []
     out: list[dict[str, Any]] = []
     seen: set[tuple[Any, ...]] = set()
-    for text in frame["lms_stages_json"].dropna().astype(str):
+    for text in frame[column].dropna().astype(str):
         try:
             stages = json.loads(text)
         except json.JSONDecodeError:
             continue
         for stage in stages:
             key = (
+                stage.get("filter_type"),
                 stage.get("sensor_type"),
                 stage.get("channel"),
                 stage.get("D_opt_samples"),
                 stage.get("M"),
                 stage.get("K"),
-                round(float(stage.get("mu", 0.0)), 10),
+                stage.get("rff_seed"),
             )
             if key in seen:
                 continue
@@ -530,10 +389,9 @@ def _group_id(sample_stem: str) -> str:
 
 
 def _prepare_matplotlib(out_path: Path) -> Any:
-    mpl_cache = out_path.parent / ".matplotlib"
+    mpl_cache = out_path / ".matplotlib" if out_path.suffix == "" else out_path.parent / ".matplotlib"
     mpl_cache.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", str(mpl_cache))
-
     import matplotlib
 
     matplotlib.use("Agg", force=False)
@@ -561,12 +419,14 @@ def _empty_result_frame() -> pd.DataFrame:
             "group_id",
             "target_scope",
             "cascade_scheme",
+            "adaptive_filter",
             "window_idx",
             "time_s",
             "segment_label",
             "ref_hr_bpm",
             "baseline_ppg_hr_bpm",
             "adaptive_hr_bpm",
+            "adaptive_stages_json",
             "lms_stages_json",
             "is_filtered_segment",
             "baseline_abs_err_bpm",

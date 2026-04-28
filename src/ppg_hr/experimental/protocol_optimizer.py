@@ -1,23 +1,24 @@
-"""Optuna optimiser for the 14-mode batch adaptive protocol.
+"""Optuna optimiser compatibility helpers for protocol modes.
 
-中文说明：
-每个样本会跑 2 个目标段 × 7 个级联方案 = 14 个模式。
-每个模式内部使用 Optuna TPE 采样离散搜索空间，并把每个 trial 的 AAE
-记录在 ``trial_history`` 中，后续用于 JSON 保存和贝叶斯收敛曲线绘图。
+中文说明：新主流程按 motion_type 分组训练，主要逻辑在 ``run_batch_protocol``。
+本模块保留旧的单样本优化 API，便于历史脚本继续调用，同时支持
+``lms``、``volterra`` 和 ``rff_lms`` 三种滤波器。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+import json
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 
-try:  # Optuna is the preferred optimiser; keep a deterministic fallback for lean test envs.
+try:
     import optuna
     from optuna.samplers import TPESampler
-except ModuleNotFoundError:  # pragma: no cover - exercised only when dependencies are incomplete
+except ModuleNotFoundError:  # pragma: no cover - only used in lean environments
     optuna = None
     TPESampler = None
 
@@ -43,7 +44,7 @@ if optuna is not None:
 
 @dataclass
 class ProtocolModeResult:
-    """Optimisation result for one target-scope/cascade-scheme combination."""
+    """Optimisation result for one target-scope/cascade/filter mode."""
 
     target_scope: TargetScope
     cascade_scheme: CascadeScheme
@@ -60,13 +61,15 @@ class ProtocolModeResult:
     n_trials: int
     n_repeats: int
     debug_mode: bool
+    adaptive_filter: str = "lms"
+    objective_mode: str = "aae"
     search_space: dict[str, list[Any]] = field(default_factory=dict)
 
     @property
     def mode_key(self) -> str:
         """Stable key used in JSON reports."""
 
-        return f"{self.target_scope.value}__{self.cascade_scheme.value}"
+        return f"{self.target_scope.value}__{self.cascade_scheme.value}__{self.adaptive_filter}"
 
 
 def optimise_all_protocol_modes(
@@ -76,51 +79,50 @@ def optimise_all_protocol_modes(
     space: ProtocolSearchSpace | None = None,
     target_scopes: list[TargetScope] | None = None,
     cascade_schemes: list[CascadeScheme] | None = None,
+    adaptive_filters: list[str] | None = None,
+    objective_mode: str = "aae",
     on_progress: Any | None = None,
 ) -> list[ProtocolModeResult]:
-    """Run all requested protocol optimisations, defaulting to 2 x 7 modes."""
+    """Run all requested single-sample protocol optimisations."""
 
     config = config or ProtocolParams()
     space = space or default_protocol_search_space()
-    target_scopes = target_scopes or [
-        TargetScope.MOTION_ONLY,
-        TargetScope.MOTION_AND_RECOVERY,
-    ]
+    target_scopes = target_scopes or [TargetScope.MOTION_ONLY, TargetScope.MOTION_AND_RECOVERY]
     cascade_schemes = cascade_schemes or list(CascadeScheme)
+    adaptive_filters = adaptive_filters or ["lms"]
 
     results: list[ProtocolModeResult] = []
-    total = len(target_scopes) * len(cascade_schemes)
+    total = len(target_scopes) * len(cascade_schemes) * len(adaptive_filters)
     idx = 0
     for scope in target_scopes:
         for scheme in cascade_schemes:
-            idx += 1
-            mode_payload = {
-                "mode_idx": idx,
-                "mode_current": idx,
-                "mode_total": total,
-                "target_scope": scope.name,
-                "target_scope_value": scope.value,
-                "cascade_scheme": scheme.value,
-            }
-            # 中文注释：模式级进度用于 Notebook 显示“当前第几个 mode”。
-            if on_progress is not None:
-                on_progress({"stage": "optimization_mode", **mode_payload})
-
-            def _mode_progress(info: dict[str, Any], payload: dict[str, Any] = mode_payload) -> None:
-                if on_progress is None:
-                    return
-                on_progress({**payload, **info})
-
-            results.append(
-                optimise_protocol_mode(
-                    dataset,
-                    cascade_scheme=scheme,
-                    target_scope=scope,
-                    config=config,
-                    space=space,
-                    on_progress=_mode_progress,
+            for adaptive_filter in adaptive_filters:
+                idx += 1
+                payload = {
+                    "stage": "optimization_mode",
+                    "mode_idx": idx,
+                    "mode_current": idx,
+                    "mode_total": total,
+                    "target_scope": scope.name,
+                    "target_scope_value": scope.value,
+                    "cascade_scheme": scheme.value,
+                    "adaptive_filter": adaptive_filter,
+                }
+                if on_progress is not None:
+                    on_progress(payload)
+                results.append(
+                    optimise_protocol_mode(
+                        dataset,
+                        cascade_scheme=scheme,
+                        target_scope=scope,
+                        adaptive_filter=adaptive_filter,
+                        objective_mode=objective_mode,
+                        config=config,
+                        space=space,
+                        on_progress=on_progress,
+                        mode_payload=payload,
+                    )
                 )
-            )
     return results
 
 
@@ -129,235 +131,268 @@ def optimise_protocol_mode(
     *,
     cascade_scheme: CascadeScheme | str,
     target_scope: TargetScope | str,
+    adaptive_filter: str = "lms",
+    objective_mode: str = "aae",
     config: ProtocolParams | None = None,
     space: ProtocolSearchSpace | None = None,
     on_progress: Any | None = None,
+    mode_payload: dict[str, Any] | None = None,
 ) -> ProtocolModeResult:
-    """Optimise one cascade scheme and target scope with repeated TPE studies."""
+    """Optimise one cascade/scope/filter mode on a single dataset.
+
+    中文说明：该函数用于兼容旧单样本流程；分组训练请使用
+    ``run_batch_adaptive_protocol``。
+    """
 
     cfg = config or ProtocolParams()
     space = space or default_protocol_search_space()
     scheme = CascadeScheme(cascade_scheme)
     scope = TargetScope(target_scope)
-    if optuna is None or TPESampler is None:
-        return _optimise_protocol_mode_random(
-            dataset,
-            cascade_scheme=scheme,
-            target_scope=scope,
-            config=cfg,
-            space=space,
-            on_progress=on_progress,
-        )
+    adaptive_filter = str(adaptive_filter)
+    objective_mode = str(objective_mode)
 
     best_value = float("inf")
-    best_params = _default_trial_params(space)
-    best_run: ProtocolRunResult | None = None
+    best_params = _default_trial_params(space, adaptive_filter, objective_mode)
+    best_repeat_idx = 0
     history: list[dict[str, Any]] = []
     best_seen = float("inf")
-    best_repeat_idx = 0
     cache: dict[tuple[tuple[str, Any], ...], ProtocolRunResult] = {}
 
-    for run_idx in range(int(cfg.num_repeats)):
-        # 中文注释：每个 repeat 新建 sampler/study，并使用 random_state + run_idx 保证可复现。
-        sampler = TPESampler(
-            seed=int(cfg.random_state) + run_idx,
-            n_startup_trials=min(int(cfg.num_seed_points), int(cfg.max_iterations)),
-        )
-        study = optuna.create_study(direction="minimize", sampler=sampler)
-
-        def _objective(trial: optuna.trial.Trial) -> float:
-            nonlocal best_seen
-
-            # 中文注释：Optuna 采样整数索引，再解码成协议真实参数值。
-            idx_map = {
-                name: trial.suggest_int(name, 0, len(space.options(name)) - 1)
-                for name in space.names()
-            }
-            trial_params = decode_protocol_search_space(space, idx_map)
-            cache_key = tuple(sorted(trial_params.to_dict().items()))
-            run = cache.get(cache_key)
-            if run is None:
-                run = run_protocol_trial(dataset, scheme, scope, trial_params)
-                cache[cache_key] = run
-            value = float(run.objective_aae_bpm)
-            if not np.isfinite(value):
-                value = float(cfg.penalty_value)
-            best_seen = min(best_seen, value)
-            trial.set_user_attr("decoded", trial_params.to_dict())
-            trial.set_user_attr("reason", run.reason)
-            history.append(
-                {
-                    "repeat_idx": run_idx,
-                    "trial_idx": trial.number,
-                    "value": value,
-                    "params": trial_params.to_dict(),
-                    "success": bool(run.success),
-                    "reason": run.reason,
-                }
+    for repeat_idx in range(int(cfg.num_repeats)):
+        if optuna is not None and TPESampler is not None:
+            sampler = TPESampler(
+                seed=int(cfg.random_state) + repeat_idx,
+                n_startup_trials=min(int(cfg.num_seed_points), int(cfg.max_iterations)),
             )
-            # 中文注释：trial 级进度携带当前 AAE 和历史最优 AAE，Notebook 可直接打印。
-            if on_progress is not None:
-                on_progress(
-                    {
-                        "stage": "optimization",
-                        "target_scope": scope.name,
-                        "target_scope_value": scope.value,
-                        "cascade_scheme": scheme.value,
-                        "repeat_idx": run_idx + 1,
-                        "repeat_total": int(cfg.num_repeats),
-                        "trial_idx": trial.number + 1,
-                        "trial_total": int(cfg.max_iterations),
-                        "value": value,
-                        "best_aae": best_seen,
-                    }
-                )
-            return value
+            study = optuna.create_study(direction="minimize", sampler=sampler)
 
-        study.optimize(_objective, n_trials=int(cfg.max_iterations), show_progress_bar=False)
-        if study.best_value < best_value:
-            best_value = float(study.best_value)
-            best_repeat_idx = run_idx
-            decoded = study.best_trial.user_attrs.get("decoded", {})
-            best_params = ProtocolTrialParams(**decoded)
+            def _objective(trial: optuna.trial.Trial) -> float:
+                nonlocal best_value, best_params, best_repeat_idx, best_seen
+
+                idx_map = {
+                    name: trial.suggest_int(name, 0, len(space.options(name)) - 1)
+                    for name in space.names_for_filter(adaptive_filter)
+                }
+                params = _decode_with_seed(
+                    space,
+                    idx_map,
+                    adaptive_filter=adaptive_filter,
+                    objective_mode=objective_mode,
+                    mode_key=f"{scope.value}__{scheme.value}__{adaptive_filter}",
+                    repeat_idx=repeat_idx,
+                    random_state=cfg.random_state,
+                )
+                run = _cached_run(dataset, scheme, scope, params, cache)
+                value = _objective_value(run, objective_mode, cfg.penalty_value)
+                best_seen = min(best_seen, value)
+                if value < best_value:
+                    best_value = value
+                    best_params = params
+                    best_repeat_idx = repeat_idx
+                _append_history(history, repeat_idx, int(trial.number), value, best_seen, run, params)
+                _emit_progress(on_progress, mode_payload, cfg, repeat_idx, int(trial.number), value, best_seen, run)
+                return value
+
+            study.optimize(_objective, n_trials=int(cfg.max_iterations), show_progress_bar=False)
+        else:
+            rng = np.random.default_rng(int(cfg.random_state) + repeat_idx)
+            for trial_idx in range(int(cfg.max_iterations)):
+                idx_map = {
+                    name: int(rng.integers(0, len(space.options(name))))
+                    for name in space.names_for_filter(adaptive_filter)
+                }
+                params = _decode_with_seed(
+                    space,
+                    idx_map,
+                    adaptive_filter=adaptive_filter,
+                    objective_mode=objective_mode,
+                    mode_key=f"{scope.value}__{scheme.value}__{adaptive_filter}",
+                    repeat_idx=repeat_idx,
+                    random_state=cfg.random_state,
+                )
+                run = _cached_run(dataset, scheme, scope, params, cache)
+                value = _objective_value(run, objective_mode, cfg.penalty_value)
+                best_seen = min(best_seen, value)
+                if value < best_value:
+                    best_value = value
+                    best_params = params
+                    best_repeat_idx = repeat_idx
+                _append_history(history, repeat_idx, trial_idx, value, best_seen, run, params)
+                _emit_progress(on_progress, mode_payload, cfg, repeat_idx, trial_idx, value, best_seen, run)
 
     best_run = run_protocol_trial(dataset, scheme, scope, best_params)
-    if not best_run.success:
-        best_value = float(cfg.penalty_value)
-    else:
-        best_value = float(best_run.objective_aae_bpm)
-
-    importance = _parameter_importance(history, space, cfg)
+    final_value = _objective_value(best_run, objective_mode, cfg.penalty_value)
     return ProtocolModeResult(
         target_scope=scope,
         cascade_scheme=scheme,
         best_params=best_params,
-        best_aae_bpm=best_value,
+        best_aae_bpm=float(best_run.adaptive_aae_bpm) if best_run.success else float(final_value),
         baseline_aae_bpm=float(best_run.baseline_aae_bpm),
         adaptive_aae_bpm=float(best_run.adaptive_aae_bpm),
         baseline_acc_pct=float(best_run.baseline_acc_pct),
         adaptive_acc_pct=float(best_run.adaptive_acc_pct),
-        param_importance=importance,
+        param_importance=_parameter_importance(history, cfg),
         trial_history=history,
         best_run=best_run,
         best_repeat_idx=best_repeat_idx,
         n_trials=int(cfg.max_iterations),
         n_repeats=int(cfg.num_repeats),
         debug_mode=bool(cfg.debug_mode),
-        search_space={name: space.options(name) for name in space.names()},
+        adaptive_filter=adaptive_filter,
+        objective_mode=objective_mode,
+        search_space={name: space.options(name) for name in space.names_for_filter(adaptive_filter)},
     )
 
 
-def _default_trial_params(space: ProtocolSearchSpace) -> ProtocolTrialParams:
-    values = {name: space.options(name)[0] for name in space.names()}
+def _default_trial_params(
+    space: ProtocolSearchSpace,
+    adaptive_filter: str,
+    objective_mode: str,
+) -> ProtocolTrialParams:
+    values: dict[str, Any] = {}
+    for name in space.names_for_filter(adaptive_filter):
+        value = space.options(name)[0]
+        if name == "RFF_LMS_Mu_Base":
+            values["LMS_Mu_Base"] = value
+        else:
+            values[name] = value
+    values["adaptive_filter"] = adaptive_filter
+    values["objective_mode"] = objective_mode
     return ProtocolTrialParams(**values)
 
 
-def _optimise_protocol_mode_random(
-    dataset: ProtocolDataset,
-    *,
-    cascade_scheme: CascadeScheme,
-    target_scope: TargetScope,
-    config: ProtocolParams,
+def _decode_with_seed(
     space: ProtocolSearchSpace,
-    on_progress: Any | None,
-) -> ProtocolModeResult:
-    """Deterministic random-search fallback used only when Optuna is absent."""
+    idx_map: dict[str, int],
+    *,
+    adaptive_filter: str,
+    objective_mode: str,
+    mode_key: str,
+    repeat_idx: int,
+    random_state: int,
+) -> ProtocolTrialParams:
+    params = decode_protocol_search_space(
+        space,
+        idx_map,
+        adaptive_filter=adaptive_filter,
+        objective_mode=objective_mode,
+        rff_seed=0,
+    )
+    if adaptive_filter == "rff_lms":
+        payload = {
+            **{k: v for k, v in params.to_dict().items() if k != "rff_seed"},
+            "mode_key": mode_key,
+            "repeat_idx": int(repeat_idx),
+            "random_state": int(random_state),
+        }
+        params = replace(params, rff_seed=_stable_hash(payload))
+    return params
 
-    best_value = float("inf")
-    best_params = _default_trial_params(space)
-    history: list[dict[str, Any]] = []
-    best_seen = float("inf")
-    best_repeat_idx = 0
-    cache: dict[tuple[tuple[str, Any], ...], ProtocolRunResult] = {}
 
-    for run_idx in range(int(config.num_repeats)):
-        rng = np.random.default_rng(int(config.random_state) + run_idx)
-        for trial_idx in range(int(config.max_iterations)):
-            idx_map = {
-                name: int(rng.integers(0, len(space.options(name))))
-                for name in space.names()
-            }
-            params = decode_protocol_search_space(space, idx_map)
-            cache_key = tuple(sorted(params.to_dict().items()))
-            run = cache.get(cache_key)
-            if run is None:
-                run = run_protocol_trial(dataset, cascade_scheme, target_scope, params)
-                cache[cache_key] = run
-            value = float(run.objective_aae_bpm)
-            if not np.isfinite(value):
-                value = float(config.penalty_value)
-            best_seen = min(best_seen, value)
-            history.append(
-                {
-                    "repeat_idx": run_idx,
-                    "trial_idx": trial_idx,
-                    "value": value,
-                    "params": params.to_dict(),
-                    "success": bool(run.success),
-                    "reason": run.reason,
-                }
-            )
-            if value < best_value:
-                best_value = value
-                best_params = params
-                best_repeat_idx = run_idx
-            if on_progress is not None:
-                on_progress(
-                    {
-                        "stage": "optimization",
-                        "target_scope": target_scope.name,
-                        "target_scope_value": target_scope.value,
-                        "cascade_scheme": cascade_scheme.value,
-                        "repeat_idx": run_idx + 1,
-                        "repeat_total": int(config.num_repeats),
-                        "trial_idx": trial_idx + 1,
-                        "trial_total": int(config.max_iterations),
-                        "value": value,
-                        "best_aae": best_seen,
-                        "optimizer": "random_fallback",
-                    }
-                )
+def _cached_run(
+    dataset: ProtocolDataset,
+    scheme: CascadeScheme,
+    scope: TargetScope,
+    params: ProtocolTrialParams,
+    cache: dict[tuple[tuple[str, Any], ...], ProtocolRunResult],
+) -> ProtocolRunResult:
+    key = params.cache_key()
+    run = cache.get(key)
+    if run is None:
+        run = run_protocol_trial(dataset, scheme, scope, params)
+        cache[key] = run
+    return run
 
-    best_run = run_protocol_trial(dataset, cascade_scheme, target_scope, best_params)
-    if best_run.success:
-        best_value = float(best_run.objective_aae_bpm)
+
+def _objective_value(run: ProtocolRunResult, objective_mode: str, penalty_value: float) -> float:
+    if objective_mode == "accuracy":
+        value = 100.0 - float(run.adaptive_acc_pct)
     else:
-        best_value = float(config.penalty_value)
+        value = float(run.adaptive_aae_bpm)
+    return value if np.isfinite(value) else float(penalty_value)
 
-    return ProtocolModeResult(
-        target_scope=target_scope,
-        cascade_scheme=cascade_scheme,
-        best_params=best_params,
-        best_aae_bpm=best_value,
-        baseline_aae_bpm=float(best_run.baseline_aae_bpm),
-        adaptive_aae_bpm=float(best_run.adaptive_aae_bpm),
-        baseline_acc_pct=float(best_run.baseline_acc_pct),
-        adaptive_acc_pct=float(best_run.adaptive_acc_pct),
-        param_importance=_parameter_importance(history, space, config),
-        trial_history=history,
-        best_run=best_run,
-        best_repeat_idx=best_repeat_idx,
-        n_trials=int(config.max_iterations),
-        n_repeats=int(config.num_repeats),
-        debug_mode=bool(config.debug_mode),
-        search_space={name: space.options(name) for name in space.names()},
+
+def _append_history(
+    history: list[dict[str, Any]],
+    repeat_idx: int,
+    trial_idx: int,
+    value: float,
+    best_seen: float,
+    run: ProtocolRunResult,
+    params: ProtocolTrialParams,
+) -> None:
+    history.append(
+        {
+            "repeat_idx": int(repeat_idx),
+            "trial_idx": int(trial_idx),
+            "objective_value": float(value),
+            "value": float(value),
+            "aae_bpm": float(run.adaptive_aae_bpm),
+            "accuracy_pct": float(run.adaptive_acc_pct),
+            "best_so_far": float(best_seen),
+            "params": params.to_dict(),
+            "rff_seed": int(params.rff_seed),
+            "success": bool(run.success),
+            "reason": run.reason,
+        }
     )
 
 
-def _parameter_importance(
-    history: list[dict[str, Any]],
-    space: ProtocolSearchSpace,
+def _emit_progress(
+    on_progress: Any | None,
+    mode_payload: dict[str, Any] | None,
     cfg: ProtocolParams,
-) -> dict[str, float]:
-    # 中文注释：小预算下样本数不足时返回空字典；完整预算下用随机森林估计参数重要性。
-    names = space.names()
+    repeat_idx: int,
+    trial_idx: int,
+    value: float,
+    best_seen: float,
+    run: ProtocolRunResult,
+) -> None:
+    if on_progress is None:
+        return
+    payload = dict(mode_payload or {})
+    payload.update(
+        {
+            "stage": "optimization",
+            "repeat_idx": int(repeat_idx) + 1,
+            "repeat_total": int(cfg.num_repeats),
+            "trial_idx": int(trial_idx) + 1,
+            "trial_total": int(cfg.max_iterations),
+            "objective_value": float(value),
+            "value": float(value),
+            "aae_bpm": float(run.adaptive_aae_bpm),
+            "accuracy_pct": float(run.adaptive_acc_pct),
+            "best_so_far": float(best_seen),
+        }
+    )
+    on_progress(payload)
+
+
+def _parameter_importance(history: list[dict[str, Any]], cfg: ProtocolParams) -> dict[str, float]:
+    """Estimate rough parameter importance from successful history rows."""
+
+    names: list[str] = []
+    for item in history:
+        params = item.get("params", {})
+        if isinstance(params, dict):
+            names = [
+                name
+                for name, value in params.items()
+                if name not in {"adaptive_filter", "objective_mode"}
+                and isinstance(value, (int, float, np.integer, np.floating))
+            ]
+            if names:
+                break
+    if not names:
+        return {}
+
     rows: list[list[float]] = []
     targets: list[float] = []
     for item in history:
-        value = float(item["value"])
+        value = float(item.get("objective_value", np.nan))
         if not np.isfinite(value) or value >= float(cfg.penalty_value):
             continue
-        params = item["params"]
+        params = item.get("params", {})
         rows.append([float(params[name]) for name in names])
         targets.append(value)
     if len(rows) < 2:
@@ -365,3 +400,9 @@ def _parameter_importance(
     model = RandomForestRegressor(n_estimators=50, random_state=int(cfg.random_state))
     model.fit(np.asarray(rows, dtype=float), np.asarray(targets, dtype=float))
     return {name: float(score) for name, score in zip(names, model.feature_importances_, strict=True)}
+
+
+def _stable_hash(payload: Any) -> int:
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return int(digest[:16], 16) % (2**32)

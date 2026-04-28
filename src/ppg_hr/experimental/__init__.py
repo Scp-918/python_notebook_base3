@@ -1,14 +1,7 @@
 """Experimental batch adaptive-filter protocol.
 
-This package is deliberately isolated from the stable ``solve/optimise/view``
-surface so research protocols can evolve without changing MATLAB-golden paths.
-Heavy optimisation imports are resolved lazily to keep lightweight helpers
-usable in minimal environments.
-
-中文说明：
-这里放的是本轮“批量自适应滤波实验协议”的新增实现。它和旧的
-``ppg_hr.core.heart_rate_solver.solve``、``ppg_hr.optimization.optimise``
-保持隔离，便于实验协议继续迭代，同时不破坏旧 API 和金标测试。
+中文说明：这里放的是批量自适应滤波实验协议实现，和稳定的
+``ppg_hr.core`` 路径保持隔离，便于研究流程继续迭代而不破坏旧 API。
 """
 
 from .batch_pairing import PairDiscovery, SamplePair, UnpairedSample, discover_sample_pairs
@@ -20,18 +13,36 @@ __all__ = [
     "QcResult",
     "SamplePair",
     "UnpairedSample",
+    "build_output_run_name",
     "discover_sample_pairs",
     "quality_filter_sample",
+    "redraw_best_param_hr_curves",
     "run_batch_adaptive_protocol",
+    "safe_prepare_output_dir",
 ]
 
 
 def __getattr__(name: str):
-    if name in {"BatchProtocolResult", "run_batch_adaptive_protocol"}:
-        from .run_batch_protocol import BatchProtocolResult, run_batch_adaptive_protocol
+    if name in {
+        "BatchProtocolResult",
+        "build_output_run_name",
+        "redraw_best_param_hr_curves",
+        "run_batch_adaptive_protocol",
+        "safe_prepare_output_dir",
+    }:
+        from .run_batch_protocol import (
+            BatchProtocolResult,
+            build_output_run_name,
+            redraw_best_param_hr_curves,
+            run_batch_adaptive_protocol,
+            safe_prepare_output_dir,
+        )
 
         return {
             "BatchProtocolResult": BatchProtocolResult,
+            "build_output_run_name": build_output_run_name,
+            "redraw_best_param_hr_curves": redraw_best_param_hr_curves,
             "run_batch_adaptive_protocol": run_batch_adaptive_protocol,
+            "safe_prepare_output_dir": safe_prepare_output_dir,
         }[name]
     raise AttributeError(name)

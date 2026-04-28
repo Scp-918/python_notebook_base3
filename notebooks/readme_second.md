@@ -1,247 +1,402 @@
-# python_notebook_base 批量自适应滤波 Notebook 说明
+# 第二阶段批量自适应滤波协议说明
 
-本文档对应：
-
-```text
-D:\HeartDecode\outline-PPGtoHR-main\python_notebook_base\notebooks\run_batch_adaptive_protocol.ipynb
-```
-
-该 Notebook 用于 PPG 心率估计中的批量数据配对、原始质量过滤、信号预处理、运动/静息/恢复分段、PPG 与参考 HR 对齐、Fmove 估计、2 个优化目标 x 7 个级联自适应滤波方案的 Optuna 贝叶斯优化、CSV/JSON/PNG 结果输出。
-
-## 1. 当前路径
-
-工程根目录：
+当前工程根目录统一为：
 
 ```text
-D:\HeartDecode\outline-PPGtoHR-main
+D:\python_notebook_base
 ```
 
-Notebook 代码目录：
+Notebook：
 
 ```text
-D:\HeartDecode\outline-PPGtoHR-main\python_notebook_base
+D:\python_notebook_base\notebooks\run_batch_adaptive_protocol.ipynb
 ```
 
-输入数据目录：
-
-```text
-D:\HeartDecode\outline-PPGtoHR-main\python_notebook_base\testdata
-```
-
-输出目录：
-
-```text
-D:\HeartDecode\outline-PPGtoHR-main\python_notebook_base\outputs\batch_adaptive_protocol
-```
-
-## 2. 数据命名规则
-
-多通道运动数据：
-
-```text
-multi_<运动拼音数字>.csv
-```
-
-参考心率数据：
-
-```text
-multi_<运动拼音数字>_ref.csv
-```
-
-例如 `multi_kaihe1.csv` 与 `multi_kaihe1_ref.csv` 会配成一组，`group_id` 为 `kaihe1`。没有成对出现的 CSV 会写入 `unpaired_samples.csv`，不会进入 QC 或优化。
-
-## 3. 运行方式
-
-推荐在 Jupyter 中从上到下运行 Notebook。第 0 节会把：
+核心路径：
 
 ```python
-PROJECT_ROOT = Path(r"D:\HeartDecode\outline-PPGtoHR-main")
-PYTHON_DIR = PROJECT_ROOT / "python_notebook_base"
-TESTDATA_DIR = PYTHON_DIR / "testdata"
-SRC_DIR = PYTHON_DIR / "src"
+PROJECT_ROOT = Path(r"D:\python_notebook_base")
+SRC_DIR = PROJECT_ROOT / "src"
+TESTDATA_DIR = PROJECT_ROOT / "testdata"
+OUTPUT_ROOT = PROJECT_ROOT / "outputs"
 ```
 
-加入运行环境。运行前请确认：
+## 数据命名与运动类型
 
-- `TESTDATA_DIR` 中存在配对的 `multi_*.csv` 和 `multi_*_ref.csv`；
-- 当前 kernel 安装了 `numpy/scipy/pandas/matplotlib/scikit-learn/optuna`；
-- `python_notebook_base/outputs` 可写；
-- `CLEAN_OUTPUTS` 默认为 `False`，需要重新生成全部输出时手动改为 `True`。
-
-也可以用命令行做烟测：
-
-```bat
-conda run -n PPG_sensor_env python python_notebook_base\run_debug_protocol.py
-```
-
-## 4. Debug 与正式参数
-
-Notebook 默认是调试模式：
-
-```python
-DEBUG_MODE = True
-QUICK_TEST_N_TRIALS = 3
-MAX_ITERATIONS = QUICK_TEST_N_TRIALS
-NUM_REPEATS = 3
-N_JOBS = 1
-```
-
-调试模式会完整跑 14 个模式，并保留每个模式 3 个 repeat，但每个 repeat 只跑 3 个 trial，便于先验证路径、输出和 repeat 逻辑。
-
-正式训练切换为：
-
-```python
-DEBUG_MODE = False
-FORMAL_N_TRIALS = 250
-MAX_ITERATIONS = FORMAL_N_TRIALS
-NUM_REPEATS = 3
-N_JOBS = None
-```
-
-每个样本正式配置为 2 个优化目标 x 7 个滤波方案 x 3 repeats x 250 trials。JSON 中会记录 `DEBUG_MODE`、`n_trials`、`n_repeats` 和 `best_repeat_idx`。
-
-## 5. 进度显示
-
-Notebook 第 8 节的 `notebook_progress(info)` 会显示批量训练进度，包括：
-
-- QC 正在检查第几个配对文件；
-- 当前训练到第几个好样本；
-- 当前样本名；
-- 当前 14 个模式中的第几个模式；
-- 当前目标段和级联方案；
-- 当前 repeat 与 trial；
-- 当前 trial AAE 与历史最优 AAE；
-- 样本完成后输出 CSV 和 JSON 路径。
-
-调试模式默认每个 trial 都打印。正式模式默认每 10 个 trial 打印一次，同时总会打印每个 repeat 的第 1 个和最后 1 个 trial：
-
-```python
-PROGRESS_EVERY_N_TRIALS = 1   # debug
-PROGRESS_EVERY_N_TRIALS = 10  # formal
-```
-
-## 6. GPU 与加速说明
-
-当前代码不会使用 GPU。主要计算路径是：
-
-- NumPy / SciPy 的滤波、FFT、重采样、相关性计算；
-- Optuna 的 TPE 采样；
-- scikit-learn `RandomForestRegressor` 参数重要性；
-- Python 循环中的逐窗非因果 LMS。
-
-这些实现默认运行在 CPU 上。直接加 GPU 不会自动变快，因为 SciPy `filtfilt/resample_poly`、scikit-learn 随机森林和当前 LMS 循环都不是 GPU 版本。若要真正利用 GPU，需要把核心数组计算迁移到 CuPy / PyTorch / Numba CUDA，并重写或替换滤波、FFT、LMS 与随机森林重要性部分，改动较大，且 Windows/Jupyter 环境和数据传输开销也需要验证。
-
-短期更现实的加速方向是：
-
-- 先用 `DEBUG_MODE=True` 跑通；
-- 正式训练时减少不必要的输出显示；
-- 对不同样本或不同模式做进程级并行；
-- 对 `_run_windows` / `noncausal_lms_filter` 做 Numba CPU JIT 或缓存中间结果。
-
-## 7. QC 规则
-
-QC 只检查每个多通道运动文件前 10 秒的 `Ut1(mV)` 与 `Ut2(mV)`：
-
-- 原始采样率按 100 Hz，前 10 秒共 1000 点；
-- 对 Ut1/Ut2 分别做 4 阶多项式基线拟合并扣除；
-- 计算去基线后的 STD；
-- 统计绝对值超过 `3 * STD` 的离群点数量和比例；
-- 任一路 STD > 2.5 mV，判坏；
-- 任一路 STD 是另一者 3 倍以上，判坏；
-- 若离群点比例一者大于另一者 3 倍以上，且两者不同时小于 1%，判坏；
-- 若两路离群比例都小于 1%，即使比例倍数超过 3，也不因该规则判坏。
-
-QC 表格输出包含 `group_id`、`data_file`、`ref_file`、`is_good`、`reason`、两路 STD、两路离群点数量和两路离群点比例。
-
-## 8. 自适应滤波与动态 LMS 步长
-
-每个时间窗内会先将 13 路信号分别归一化到 0-1。HF、CF、ACC 相对 PPG Green 的包络时延由 `Kstop * Fmove` 低通包络和 Pearson 相关估计得到。
-
-LMS 参数按当前选中的通道独立计算：
+传感器文件和参考 HR 文件必须成对出现：
 
 ```text
-LMS_Mu_Base = 0.01
-LMS_Mu_Min = 1e-5
-curr_corr = abs(best_corr)
-mu = max(LMS_Mu_Min, LMS_Mu_Base - curr_corr / 100)
+multi_<运动类型拼音+数字编号>.csv
+multi_<运动类型拼音+数字编号>_ref.csv
 ```
 
-ACC、HF、CF 三类传感器各自使用自己的 `curr_corr` 与 `mu`。混合级联时，每一级都会记录 `sensor_type`、`channel`、`D_opt_samples`、`R_max`、`curr_corr`、`M`、`K`、`mu` 和 `mode`，并写入结果 CSV 的 `lms_stages_json` 与 JSON 的 `lms_stage_summary`。
-
-## 9. 优化目标与级联方案
-
-优化目标：
-
-- `motion_only`：只以运动段 adaptive HR 的 AAE 最小为目标；
-- `motion_recovery`：以运动段 + 恢复段 adaptive HR 的 AAE 最小为目标。
-
-7 种级联方案：
-
-- `ACC3`
-- `HF2`
-- `CF2`
-- `HF2_CF2`
-- `CF2_HF2`
-- `ACC3_HF2`
-- `HF2_ACC3`
-
-每个模式运行 3 个独立 repeat，随机种子为 `random_state + repeat_idx`，最终取 AAE 最小的 repeat 参数作为该模式输出。贝叶斯训练曲线只绘制最终最优 repeat 的 trial history。
-
-`accuracy` 当前定义为目标段内绝对误差 `< 5 bpm` 的窗口比例，单位为百分比。
-
-## 10. 输出文件
-
-批处理级 CSV：
+当前合法运动类型：
 
 ```text
-csv/good_samples.csv
-csv/bad_samples.csv
-csv/unpaired_samples.csv
-csv/qc_summary.csv
-csv/batch_summary.csv
+tiaosheng, wanju, fuwo, kaihe, bobi
 ```
 
-每个成功样本：
+示例：
 
 ```text
-csv/adaptive_results_<group_id>.csv
-report/Best_Params_Result_<group_id>.json
-filtered_motion_signals/filtered_motion_13ch_<group_id>.png
-hr_compare/hr_compare_motion_only_<group_id>.png
-hr_compare/hr_compare_motion_recovery_<group_id>.png
-bayes_training_curves/bayes_curve_motion_only_<group_id>.png
-bayes_training_curves/bayes_curve_motion_recovery_<group_id>.png
+multi_kaihe1.csv
+motion_type = "kaihe"
+motion_index = 1
+motion_id/group_id = "kaihe1"
 ```
 
-跨样本指标矩阵会输出到新的结果文件夹：
+未配对 CSV 会写入 `unpaired_samples.csv`，不会进入 QC、预处理或训练。
+
+## QC 规则
+
+QC 只检查 Ut1/Ut2 前 10 秒，采样率按 100 Hz：
+
+- 对 Ut1/Ut2 分别做 4 阶多项式基线拟合；
+- 原始信号减去基线得到高频残差；
+- 任一路残差 STD > 2.5 mV，判坏；
+- 两路 STD 比例 > 3，判坏；
+- 大于 3 倍 STD 的离群点比例若一者大于另一者 3 倍以上，且两路离群点比例不都同时小于 3%，判坏。
+
+`bad_samples.csv` 记录：
 
 ```text
-metric_matrix_tables/filtered_motion_aae_bpm.csv
-metric_matrix_tables/filtered_motion_accuracy_pct.csv
-metric_matrix_tables/filtered_motion_recovery_aae_bpm.csv
-metric_matrix_tables/filtered_motion_recovery_accuracy_pct.csv
+group_id, motion_type, data_file, ref_file, reason,
+std_ut1, std_ut2,
+outlier_count_ut1, outlier_count_ut2,
+outlier_ratio_ut1, outlier_ratio_ut2
 ```
 
-这 4 张表均为 `7 行 x n 列`：每行对应 1 种级联滤波方案，每列对应 1 个好采样运动 `group_id`。其中 AAE 与 accuracy 都只按实际滤波时间段计算：`motion_only` 只算运动段，`motion_recovery` 只算运动段 + 运动恢复段。
+## 预处理
 
-图片说明：
+`preprocess_protocol.py` 的协议流程：
 
-- 13 路带通滤波运动段信号图：5 个子图，分别为 HF、CF、PPG、ACC、Gyro；
-- HR 对比图：每个目标 1 张图，7 个子图，对比真实 HR、未去伪影 PPG baseline、adaptive HR；
-- 贝叶斯训练曲线图：每个目标 1 张图，7 个子图，只绘制最优 repeat 的 trial AAE。
+- 时间轴按 `fs_origin` 从 0 重建；
+- 缺失值线性/近邻插值；
+- PPG 毛刺处理；
+- `CF1 = Uc1 / (Ut1 - Uc1)`；
+- `CF2 = Uc2 / (Ut2 - Uc2)`；
+- 输出 13 路协议信号：
 
-## 11. 常见问题
+```text
+ppg_green, ppg_red, ppg_ir,
+hf1, hf2,
+cf1, cf2,
+accx, accy, accz,
+gyrox, gyroy, gyroz
+```
 
-中文乱码：代码会优先使用 `Microsoft YaHei/SimHei/Noto Sans CJK SC`，如果系统没有中文字体，Matplotlib 可能仍会警告或显示方块。安装中文字体后重跑绘图 cell。
+分类型带通和重采样：
 
-Optuna 未安装：Notebook 导入会失败。安装 `optuna` 后重启 kernel；核心优化模块本身有随机搜索 fallback，但 Notebook 推荐安装 Optuna。
+- PPG：0.5-5 Hz；
+- HF：0.1-5 Hz；
+- CF：0.1-5 Hz；
+- ACC：0.5-10 Hz；
+- Gyro：0.5-10 Hz；
+- 使用 `filtfilt` 零相位滤波；
+- 使用 `resample_poly` 重采样到 `Fs_Target`。
 
-路径错误：第 0 节确认 `PROJECT_ROOT` 是 `D:\HeartDecode\outline-PPGtoHR-main`，不是旧路径，也不是 `python_notebook_base` 本身。
+主流程会在 `outputs/<run_name>/signal_figures` 下输出每组运动的完整原始/清洗后 13 路信号图，以及运动段 13 路带通信号图。
 
-数据长度不足：QC、分段或对齐会记录失败原因并跳过该组；查看 `batch_summary.csv` 和 `bad_samples.csv`。
+## 运动分段与 TargetScope
 
-找不到运动段：ACC 合模长没有出现“10 个静息窗到 10 个运动窗再回到静息窗”的明确转移时会跳过，并在结果中记录 reason。
+运动分段规则：
 
-trial 数过大导致运行慢：先保持 `DEBUG_MODE=True` 跑通；确认输出正确后再改为 `DEBUG_MODE=False`。
+- 三轴 ACC 合模长；
+- 前 30 秒为校准期；
+- 阈值为前 30 秒合模长 STD 的 3 倍；
+- `TW` 秒窗口，1 秒步长；
+- 连续 10 个静息窗 -> 连续 10 个运动窗定位运动开始；
+- 连续 10 个运动窗 -> 连续 10 个静息窗定位运动结束。
 
-清理输出：只改 `CLEAN_OUTPUTS=True`，清理函数限制在协议输出目录内，并禁止清理 `testdata`、工程根目录、源码目录。
+支持 3 个 TargetScope：
+
+```text
+motion_only      = 只包含 motion
+motion_recovery  = motion + recovery
+motion_post10    = motion + 运动结束后 10 秒；不足 10 秒则到文件末尾
+```
+
+## PPG 与参考 HR 对齐
+
+对齐搜索：
+
+- `Tdelay` 从 0 到 5 秒；
+- 步长 0.1 秒；
+- 使用静息段绿光 PPG 的 Hamming + FFT HR 与参考 HR 比较；
+- 选择差值 STD 最小的 `best_tdelay_s`。
+
+`alignment_info` 保存：
+
+```text
+std_by_delay, best_tdelay_s, ref_shift_s, num_windows
+```
+
+如果静息段太短、可比较窗口少于 2 个，流程不会崩溃；对应样本/模式会在 summary 中记录失败原因。
+
+## 自适应滤波器
+
+当前 adaptive_filter 只允许：
+
+```text
+lms
+volterra
+rff_lms
+```
+
+不再使用其他旧的非线性滤波器命名或搜索项。
+
+LMS 步长统一使用：
+
+```text
+mu = max(mu_min, LMS_Mu_Base - abs_corr / 100)
+mu_min = 1e-6
+```
+
+Volterra：
+
+- 线性项使用完整 `M + K` 非因果向量；
+- 二阶项只取最近 `M2` 个 tap 的上三角组合；
+- `mu2 = alpha_u * mu1`。
+
+RFF-LMS：
+
+- 固定随机特征；
+- `rff_seed` 由 trial 参数、mode_key、repeat_idx 和 random_state 稳定哈希生成；
+- `rff_seed` 会写入 trial params、trial_history、JSON 和 cache key。
+
+## 搜索空间
+
+公共搜索项：
+
+```text
+Fs_Target: [25, 50, 100]
+TW: [6, 8, 10]
+Kstop: [0.2, 0.3, 0.5]
+max_order: [8, 12, 16, 20]
+M_base: [1, 2]
+C_scale: [0.6, 0.9, 1.2, 1.5]
+K_max: [8, 12, 16, 20, 30]
+Spec_Penalty_Width: [0.1, 0.2, 0.3]
+Spec_Penalty_Weight: [0.1, 0.2, 0.4]
+smooth_win_len: [3, 5, 7, 9]
+hr_range_hz: [15/60, 20/60, 25/60, 30/60, 35/60, 40/60]
+slew_limit_bpm: [8, 9, 10, 11, 12, 13, 14, 15]
+slew_step_bpm: [5, 7, 9]
+```
+
+LMS：
+
+```text
+LMS_Mu_Base: [0.008, 0.01, 0.012]
+```
+
+Volterra：
+
+```text
+LMS_Mu_Base: [0.008, 0.01, 0.012]
+alpha_u: [0.01, 0.05, 0.1, 0.2]
+M2: [2, 3, 4, 5]
+```
+
+RFF-LMS：
+
+```text
+LMS_Mu_Base: [0.006, 0.008, 0.01]
+rff_D: [50, 100, 200, 300]
+rff_sigma: [0.1, 0.5, 1.0, 2.0, 5.0]
+```
+
+## 优化目标
+
+`OPTIMIZATION_OBJECTIVE` 可选：
+
+```text
+aae
+accuracy
+```
+
+`aae`：最小化 adaptive AAE。
+
+`accuracy`：最小化 `100 - adaptive_acc_pct`。
+
+accuracy 定义为目标段内 `abs_err <= 5.0 bpm` 的窗口比例 × 100。
+
+训练进度会同时打印当前 AAE、accuracy、objective_mode 和 objective_value。
+
+## 参考信号来源
+
+支持 7 类 CascadeScheme：
+
+```text
+ACC3
+HF2
+CF2
+HF2_CF2
+CF2_HF2
+ACC3_HF2
+HF2_ACC3
+```
+
+Notebook 的 `ACTIVE_CASCADE_SCHEMES` 支持多选；`CASCADE_TRAIN_BUDGETS` 支持为每个参考源独立设置 `n_trials` 和 `n_repeats`。
+
+## 按运动类型组织训练
+
+训练按 `motion_type` 分组进行。这里的“train”不是传统模型拟合；每个 trial 只是评估一组超参数，自适应滤波器权重在窗口内在线更新，不跨文件保存。
+
+### split 模式
+
+`DATA_SPLIT_MODE = "split"`：
+
+- 同一 motion_type 内固定随机种子划分；
+- test 集默认 1 个文件；
+- validation 集默认 1 个文件；
+- train 集为剩余文件；
+- 三者不重叠；
+- 若 `good_count - m - k < 1`，训练单元格会停止并打印明确错误。
+
+每个 trial 参数会在 train/val/test 上完整运行 HR 估计；objective 只使用 validation 集指定训练段总指标。best params 确定后记录 test 效果。
+
+### all_train 模式
+
+`DATA_SPLIT_MODE = "all_train"`：
+
+- 同一 motion_type 所有好样本合并作为 train；
+- 同时也作为 test；
+- objective 使用 train 集指定训练段总指标。
+
+## 输出目录
+
+每个训练单元格输出到：
+
+```text
+outputs/<run_name>/
+```
+
+`run_name` 自动由以下字段组成：
+
+```text
+target scopes
+cascade schemes
+adaptive filters
+objective mode
+data split mode
+```
+
+示例：
+
+```text
+outputs/motion_only-motion_recovery__ACC3-HF2-CF2-HF2_CF2-HF2_ACC3__lms-volterra-rff_lms__accuracy__split/
+```
+
+主流程输出：
+
+```text
+qc/
+qc/motion_type_samples.csv
+signal_figures/
+motion_types/<motion_type>/split_files.csv
+motion_types/<motion_type>/mode_summary_aae.csv
+motion_types/<motion_type>/mode_summary_accuracy.csv
+motion_types/<motion_type>/per_group_aae.csv
+motion_types/<motion_type>/per_group_accuracy.csv
+motion_types/<motion_type>/best_params_lms.csv
+motion_types/<motion_type>/best_params_volterra.csv
+motion_types/<motion_type>/best_params_rff_lms.csv
+motion_types/<motion_type>/best_params_all.json
+motion_types/<motion_type>/bayes_curve_data.csv
+motion_types/<motion_type>/bayes_curve.png
+final_summary/
+batch_summary.csv
+```
+
+主训练流程不输出 HR 曲线图。HR 曲线只在 Notebook 末尾“手动重画最佳参数”单元格输出。
+
+所有运动类型训练完成后，`final_summary/` 固定输出 6 个 CSV：
+
+```text
+motion_only_test_aae.csv
+motion_only_test_accuracy.csv
+motion_recovery_test_aae.csv
+motion_recovery_test_accuracy.csv
+motion_post10_test_aae.csv
+motion_post10_test_accuracy.csv
+```
+
+若某个 TargetScope 未激活，对应 CSV 仍会创建为空表并带表头。
+
+## 贝叶斯训练曲线
+
+每个 motion_type 输出一张 `bayes_curve.png` 和一个 `bayes_curve_data.csv`。
+
+子图数量动态等于：
+
+```text
+激活 target scopes × 激活 cascade schemes × 激活 adaptive filters
+```
+
+`bayes_curve_data.csv` 包含：
+
+```text
+motion_type, target_scope, cascade_scheme, adaptive_filter,
+repeat_idx, trial_idx, objective_value, aae_bpm, accuracy_pct,
+best_so_far, success, reason
+```
+
+## 手动重画最佳参数
+
+Notebook 末尾手动输入：
+
+```text
+SENSOR_CSV_PATH
+REF_CSV_PATH
+TARGET_SCOPE
+CASCADE_SCHEME
+ADAPTIVE_FILTER
+BEST_PARAM_CSV_PATH
+OUTPUT_DIR
+```
+
+功能：
+
+- 读取单个原始运动 CSV 和参考 HR CSV；
+- 按 `BEST_PARAM_CSV_PATH` 中的单一模式参数重新运行预处理、分段、对齐、Fmove、baseline HR 和 adaptive HR；
+- 输出训练段 HR 曲线；
+- 输出全局 HR 曲线，其中非训练段使用 Hamming + FFT 在 0.5-2 Hz 主频提取 HR。
+
+训练段图：
+
+- 真实 HR：黑色实线；
+- 未去伪影 PPG baseline：灰色虚线；
+- adaptive HR：蓝色实线；
+- legend 标注 AAE 与 accuracy。
+
+全局图：
+
+- 全局真实 HR：黑色实线；
+- 全局未去伪影 PPG baseline：灰色虚线；
+- 训练段 adaptive HR + 非训练段 Hamming FFT HR：蓝色实线；
+- legend 标注全局 AAE 与 accuracy。
+
+## 性能与缓存
+
+主流程继续复用只依赖 `sample_id / Fs_Target / TW` 的缓存：
+
+- 重采样；
+- 分段；
+- 对齐；
+- Fmove。
+
+trial 级缓存键包含：
+
+```text
+sample_id
+Fs_Target
+TW
+target_scope
+cascade_scheme
+adaptive_filter
+filter-specific params
+rff_seed
+```
+
+默认 `n_jobs=1`，避免 Windows/Jupyter 下过度并行导致内存压力。大数组不会写入 JSON，trial 结束后只保留必要 CSV/JSON/PNG。

@@ -1,9 +1,8 @@
 """Trial execution for protocol cascade filtering and HR extraction.
 
-中文说明：
-本模块执行“给定一组协议参数”的完整单次 trial：重采样、分段、对齐、
-估计 Fmove、逐窗归一化、包络时延、非因果 LMS 级联、频谱惩罚提取 HR，
-最后计算目标段 AAE/accuracy。Optuna 每个 trial 都会调用这里。
+中文说明：本模块执行“一组协议参数”的完整 trial：重采样、分段、对齐、估计
+Fmove、逐窗归一化、包络时延、级联自适应滤波、频谱惩罚提取 HR，最后计算
+目标段 AAE 和 accuracy。Optuna 每个 trial 都会调用这里。
 """
 
 from __future__ import annotations
@@ -26,7 +25,9 @@ from .motion_frequency import estimate_motion_frequency
 from .noncausal_lms import map_delay_to_lms_params, noncausal_lms_filter
 from .preprocess_protocol import PROTOCOL_CHANNELS, ProtocolDataset, resample_protocol_dataset
 from .protocol_search_space import ProtocolTrialParams
+from .rff_lms import noncausal_rff_lms_filter
 from .segmentation import SegmentInfo, detect_activity_segments
+from .volterra import noncausal_volterra_filter
 
 __all__ = [
     "ProtocolRunResult",
@@ -38,12 +39,13 @@ __all__ = [
 
 @dataclass
 class ProtocolRunResult:
-    """Full result for one cascade scheme and target scope."""
+    """Full result for one cascade scheme, target scope, and adaptive filter."""
 
     success: bool
     reason: str
     target_scope: TargetScope
     cascade_scheme: CascadeScheme
+    adaptive_filter: str
     params: ProtocolTrialParams
     objective_aae_bpm: float
     baseline_aae_bpm: float
@@ -74,10 +76,15 @@ def run_protocol_trial(
     target_scope: TargetScope | str,
     params: ProtocolTrialParams,
 ) -> ProtocolRunResult:
-    """Run one concrete protocol trial and return AAE/accuracy metrics."""
+    """Run one concrete protocol trial and return AAE/accuracy metrics.
+
+    中文说明：自适应滤波权重只在单个窗口内在线更新，不跨窗口、不跨文件保存。
+    因此这里的“训练”本质是评估一组超参数，而不是拟合持久模型。
+    """
 
     scheme = CascadeScheme(cascade_scheme)
     scope = TargetScope(target_scope)
+    adaptive_filter = str(getattr(params, "adaptive_filter", "lms"))
     empty = pd.DataFrame()
 
     try:
@@ -87,7 +94,6 @@ def run_protocol_trial(
         if base.aligned is None or base.motion_frequency is None:
             return _failed(scope, scheme, params, "cached trial base is incomplete", base.segment_info)
 
-        # 中文注释：核心逐窗循环在 _run_windows 中完成，返回每秒一个 HR 估计。
         frame = _run_windows(base.aligned, scheme, scope, params, base.motion_frequency)
         if frame.empty:
             return _failed(
@@ -99,9 +105,12 @@ def run_protocol_trial(
                 base.aligned.alignment_info,
             )
 
-        # 中文注释：贝叶斯优化目标、输出图例与结果表中的 AAE/accuracy 只针对实际执行
-        # 自适应滤波的时间段计算：motion_only 为运动段，motion_recovery 为运动+恢复段。
-        filtered_mask = _filtered_segment_mask(frame["segment_label"].to_numpy(dtype=str), scope)
+        filtered_mask = _filtered_segment_mask(
+            frame["segment_label"].to_numpy(dtype=str),
+            scope,
+            frame["time_s"].to_numpy(dtype=float),
+            base.aligned.segment_info,
+        )
         if not filtered_mask.any():
             return _failed(
                 scope,
@@ -142,6 +151,7 @@ def run_protocol_trial(
             reason="",
             target_scope=scope,
             cascade_scheme=scheme,
+            adaptive_filter=adaptive_filter,
             params=params,
             objective_aae_bpm=adaptive_aae,
             baseline_aae_bpm=baseline_aae,
@@ -159,6 +169,7 @@ def run_protocol_trial(
             reason=str(exc),
             target_scope=scope,
             cascade_scheme=scheme,
+            adaptive_filter=adaptive_filter,
             params=params,
             objective_aae_bpm=float("inf"),
             baseline_aae_bpm=float("nan"),
@@ -175,9 +186,8 @@ def run_protocol_trial(
 def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _TrialBase:
     """Return resampling/segmentation/alignment/Fmove cached by Fs_Target and TW.
 
-    中文注释：正式训练中 14 个模式、3 个 repeat、250 trials 会大量重复相同
-    Fs_Target 和 TW 组合。重采样、分段、对齐和 Fmove 只依赖这两个参数，
-    因此在样本对象上缓存，可显著减少后续 trial 的固定开销。
+    中文说明：重采样、分段、对齐和 Fmove 只依赖样本、Fs_Target 与 TW，不依赖级联
+    方案或自适应滤波器，因此可复用缓存，减少每个 mode/trial 的固定开销。
     """
 
     fs_target = int(params.Fs_Target)
@@ -205,7 +215,20 @@ def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _T
         cache[key] = base
         return base
 
-    aligned = align_ppg_to_ref_hr(ds, segment, params.TW, fs)
+    try:
+        aligned = align_ppg_to_ref_hr(ds, segment, params.TW, fs)
+    except Exception as exc:
+        base = _TrialBase(
+            dataset=ds,
+            fs=fs,
+            segment_info=segment,
+            aligned=None,
+            motion_frequency=None,
+            failure_reason=f"alignment failed: {exc}",
+        )
+        cache[key] = base
+        return base
+
     if aligned.ref_hr_bpm.size == 0:
         base = _TrialBase(
             dataset=ds,
@@ -261,13 +284,15 @@ def extract_plain_fft_hr(
 
 
 def _run_windows(
-    aligned: Any,
+    aligned: AlignedDataset,
     scheme: CascadeScheme,
     scope: TargetScope,
     params: ProtocolTrialParams,
     fmove: float,
 ) -> pd.DataFrame:
-    ds: ProtocolDataset = aligned.dataset
+    """Run baseline and adaptive HR extraction for every aligned window."""
+
+    ds = aligned.dataset
     fs = int(ds.fs)
     win_len = int(round(float(params.TW) * fs))
     channels = ds.channels()
@@ -275,9 +300,10 @@ def _run_windows(
     rows: list[dict[str, Any]] = []
     prev_baseline: float | None = None
     prev_adaptive: float | None = None
-    for window_idx, (start_s, label, ref_hr) in enumerate(
+    for window_idx, (start_s, center_s, label, ref_hr) in enumerate(
         zip(
             aligned.window_starts_s,
+            aligned.window_centers_s,
             aligned.segment_labels,
             aligned.ref_hr_bpm,
             strict=True,
@@ -288,34 +314,35 @@ def _run_windows(
         if end > len(ds.time_s):
             break
         window = {name: values[start:end] for name, values in channels.items()}
-        # 中文注释：协议要求每个窗口内 13 路信号分别归一化，再做延迟估计与 LMS。
         norm = _normalise_window(window)
         baseline_hr = extract_plain_fft_hr(norm["ppg_green"], prev_baseline, params, fs)
         prev_baseline = baseline_hr if np.isfinite(baseline_hr) else prev_baseline
 
-        if _label_in_scope(str(label), scope):
-            # 中文注释：运动目标段内运行级联自适应滤波，其他段直接用 baseline HR。
-            filtered, penalty_ref, lms_stages = _cascade_filter_window(norm, scheme, params, fmove, fs)
+        if _window_in_scope(str(label), scope, float(center_s), aligned.segment_info):
+            filtered, penalty_ref, adaptive_stages = _cascade_filter_window(norm, scheme, params, fmove, fs)
             adaptive_hr = extract_hr_with_penalty(filtered, penalty_ref, prev_adaptive, params, fs)
         else:
             adaptive_hr = baseline_hr
-            lms_stages = []
+            adaptive_stages = []
 
         if np.isfinite(adaptive_hr):
             prev_adaptive = adaptive_hr
+        stages_json = json.dumps(adaptive_stages, ensure_ascii=False)
         rows.append(
             {
                 "sample": ds.sample_stem,
                 "group_id": ds.sample_stem.removeprefix("multi_"),
                 "target_scope": scope.value,
                 "cascade_scheme": scheme.value,
+                "adaptive_filter": str(getattr(params, "adaptive_filter", "lms")),
                 "window_idx": window_idx,
-                "time_s": float(aligned.window_centers_s[window_idx]),
+                "time_s": float(center_s),
                 "segment_label": str(label),
                 "ref_hr_bpm": float(ref_hr),
                 "baseline_ppg_hr_bpm": float(baseline_hr),
                 "adaptive_hr_bpm": float(adaptive_hr),
-                "lms_stages_json": json.dumps(lms_stages, ensure_ascii=False),
+                "adaptive_stages_json": stages_json,
+                "lms_stages_json": stages_json,
             }
         )
     return pd.DataFrame(rows)
@@ -328,26 +355,65 @@ def _cascade_filter_window(
     fmove: float,
     fs: int,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
+    """Run the configured adaptive-filter cascade on one normalized window."""
+
     delay_est = estimate_envelope_delays(window, fmove, params.Kstop, fs)
     current = np.asarray(window["ppg_green"], dtype=float)
     stages: list[dict[str, Any]] = []
     for sensor_type, max_count in _scheme_plan(scheme):
-        # 中文注释：同类型通道按包络相关性排序，从主到次依次级联输入 LMS。
         for channel in delay_est.order_by_type.get(sensor_type, [])[:max_count]:
             delay = delay_est.by_channel[channel]
-            design = map_delay_to_lms_params(
-                delay,
-                sensor_type,
-                params,
-                fs,
-            )
-            current = noncausal_lms_filter(
-                window[channel],
-                current,
-                M=design.M,
-                K=design.K,
-                mu=design.u,
-            )
+            design = map_delay_to_lms_params(delay, sensor_type, params, fs)
+            filter_type = str(getattr(params, "adaptive_filter", "lms"))
+            stage_extra: dict[str, Any] = {}
+            if filter_type == "lms":
+                current = noncausal_lms_filter(
+                    window[channel],
+                    current,
+                    M=design.M,
+                    K=design.K,
+                    mu=design.u,
+                )
+            elif filter_type == "volterra":
+                alpha_u = float(getattr(params, "alpha_u", 0.1))
+                M2 = int(getattr(params, "M2", 3))
+                current = noncausal_volterra_filter(
+                    window[channel],
+                    current,
+                    M=design.M,
+                    K=design.K,
+                    mu1=design.u,
+                    alpha_u=alpha_u,
+                    M2=M2,
+                    mu_min=float(getattr(params, "LMS_Mu_Min", 1e-6)),
+                )
+                stage_extra.update(
+                    {
+                        "alpha_u": alpha_u,
+                        "M2": M2,
+                        "mu1": float(design.u),
+                        "mu2": float(alpha_u * design.u),
+                    }
+                )
+            elif filter_type == "rff_lms":
+                rff_D = int(getattr(params, "rff_D", 100))
+                rff_sigma = float(getattr(params, "rff_sigma", 1.0))
+                rff_seed = int(getattr(params, "rff_seed", 0))
+                current = noncausal_rff_lms_filter(
+                    window[channel],
+                    current,
+                    M=design.M,
+                    K=design.K,
+                    mu=design.u,
+                    D=rff_D,
+                    sigma=rff_sigma,
+                    rff_seed=rff_seed,
+                    mu_min=float(getattr(params, "LMS_Mu_Min", 1e-6)),
+                )
+                stage_extra.update({"D": rff_D, "sigma": rff_sigma, "rff_seed": rff_seed})
+            else:
+                raise ValueError(f"Unsupported adaptive_filter: {filter_type}")
+
             stages.append(
                 {
                     "sensor_type": sensor_type,
@@ -361,13 +427,17 @@ def _cascade_filter_window(
                     "M": int(design.M),
                     "K": int(design.K),
                     "mu": float(design.u),
+                    "filter_type": filter_type,
                     "mode": design.mode,
+                    **stage_extra,
                 }
             )
     return current, _penalty_reference(window, delay_est, scheme), stages
 
 
 def _scheme_plan(scheme: CascadeScheme) -> list[tuple[str, int]]:
+    """Return the ordered sensor groups for a cascade scheme."""
+
     return {
         CascadeScheme.ACC3: [("ACC", 3)],
         CascadeScheme.HF2: [("HF", 2)],
@@ -384,6 +454,8 @@ def _penalty_reference(
     delay_est: DelayEstimate,
     scheme: CascadeScheme,
 ) -> np.ndarray:
+    """Choose the reference signal used for spectral motion penalties."""
+
     if scheme in {CascadeScheme.ACC3, CascadeScheme.ACC3_HF2, CascadeScheme.HF2_ACC3}:
         return window[_best_energy_channel(window, ("accx", "accy", "accz"))]
     if scheme in {CascadeScheme.HF2, CascadeScheme.HF2_CF2, CascadeScheme.CF2_HF2}:
@@ -412,6 +484,8 @@ def _extract_hr(
     enable_penalty: bool,
     penalty_ref: np.ndarray | None,
 ) -> float:
+    """Extract HR using Hamming FFT, optional spectral penalty, and slew limit."""
+
     freq, amp = _spectrum(signal, fs)
     band = (freq >= 0.5) & (freq <= 4.0)
     if not band.any():
@@ -419,7 +493,6 @@ def _extract_hr(
     amp_work = amp.copy()
 
     if enable_penalty and penalty_ref is not None:
-        # 中文注释：参考补偿信号的主频及二倍频附近按权重压低，减少运动伪影峰被选中。
         motion_freq = _dominant_frequency(penalty_ref, fs, 0.2, 5.0)
         if np.isfinite(motion_freq) and motion_freq > 0:
             width = float(params.Spec_Penalty_Width)
@@ -457,6 +530,8 @@ def _extract_hr(
 
 
 def _spectrum(signal: np.ndarray, fs: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return Hamming-windowed FFT amplitude spectrum."""
+
     sig = np.asarray(signal, dtype=float)
     sig = sig.copy()
     sig[~np.isfinite(sig)] = 0.0
@@ -471,6 +546,8 @@ def _spectrum(signal: np.ndarray, fs: int) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _dominant_frequency(signal: np.ndarray, fs: int, low_hz: float, high_hz: float) -> float:
+    """Find the dominant spectral peak in a frequency band."""
+
     freq, amp = _spectrum(signal, fs)
     mask = (freq >= low_hz) & (freq <= high_hz)
     if not mask.any():
@@ -485,6 +562,8 @@ def _dominant_frequency(signal: np.ndarray, fs: int, low_hz: float, high_hz: flo
 
 
 def _normalise_window(window: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Min-max normalize all 13 protocol channels inside one window."""
+
     out: dict[str, np.ndarray] = {}
     for name in PROTOCOL_CHANNELS:
         arr = np.asarray(window[name], dtype=float)
@@ -508,11 +587,49 @@ def _normalise_window(window: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
 def _label_in_scope(label: str, scope: TargetScope) -> bool:
     if scope == TargetScope.MOTION_ONLY:
         return label == "motion"
+    if scope == TargetScope.MOTION_POST10:
+        return label == "motion"
     return label in {"motion", "recovery"}
 
 
-def _filtered_segment_mask(labels: np.ndarray, scope: TargetScope) -> np.ndarray:
-    return np.asarray([_label_in_scope(str(label), scope) for label in labels], dtype=bool)
+def _window_in_scope(
+    label: str,
+    scope: TargetScope,
+    center_s: float,
+    segment_info: SegmentInfo | None,
+) -> bool:
+    """Return whether one window should run adaptive filtering.
+
+    中文说明：``motion_post10`` 包含 motion 和运动结束后 10 秒；若文件不足 10 秒，
+    已存在窗口自然只覆盖到文件末尾。
+    """
+
+    if scope == TargetScope.MOTION_POST10:
+        if label == "motion":
+            return True
+        if segment_info is None or not np.isfinite(segment_info.motion_end_s):
+            return False
+        return float(segment_info.motion_end_s) < float(center_s) <= float(segment_info.motion_end_s) + 10.0
+    return _label_in_scope(label, scope)
+
+
+def _filtered_segment_mask(
+    labels: np.ndarray,
+    scope: TargetScope,
+    centers_s: np.ndarray | None = None,
+    segment_info: SegmentInfo | None = None,
+) -> np.ndarray:
+    """Build the boolean metric mask for a target scope."""
+
+    if centers_s is None:
+        centers_s = np.full(len(labels), np.nan, dtype=float)
+    return np.asarray(
+        [
+            _window_in_scope(str(label), scope, float(center), segment_info)
+            for label, center in zip(labels, centers_s, strict=False)
+        ],
+        dtype=bool,
+    )
 
 
 def _mean(values: np.ndarray) -> float:
@@ -522,11 +639,13 @@ def _mean(values: np.ndarray) -> float:
 
 
 def _accuracy(abs_err: np.ndarray) -> float:
+    """Return percent of windows whose absolute HR error is <= 5 bpm."""
+
     arr = np.asarray(abs_err, dtype=float)
     arr = arr[np.isfinite(arr)]
     if arr.size == 0:
         return float("nan")
-    return float(np.mean(arr < 5.0) * 100.0)
+    return float(np.mean(arr <= 5.0) * 100.0)
 
 
 def _failed(
@@ -537,11 +656,14 @@ def _failed(
     segment_info: SegmentInfo | None = None,
     alignment_info: AlignmentInfo | None = None,
 ) -> ProtocolRunResult:
+    """Build a failed run result with stable metric fields."""
+
     return ProtocolRunResult(
         success=False,
         reason=reason,
         target_scope=scope,
         cascade_scheme=scheme,
+        adaptive_filter=str(getattr(params, "adaptive_filter", "lms")),
         params=params,
         objective_aae_bpm=float("inf"),
         baseline_aae_bpm=float("nan"),

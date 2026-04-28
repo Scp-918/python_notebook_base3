@@ -1,9 +1,8 @@
 """Motion/rest/recovery segmentation from accelerometer magnitude.
 
-中文说明：
-本模块只根据三轴加速度合模长划分静息、运动、恢复三段。
-前 30 秒作为校准段，阈值为校准段 STD 的 3 倍；再用 TW 秒窗口、
-1 秒步长寻找“连续 10 个静息窗 -> 连续 10 个运动窗”和反向转移。
+中文说明：本模块只根据三轴 ACC 合模长划分静息、运动和恢复窗口。前 30 秒
+作为校准期，阈值为校准段合模长 STD 的 3 倍；再用 TW 秒窗口、1 秒步长寻找
+“连续 10 个静息窗 -> 连续 10 个运动窗”和反向转移。
 """
 
 from __future__ import annotations
@@ -54,7 +53,11 @@ def detect_activity_segments(
     fs: int,
     TW: int | float,
 ) -> SegmentInfo:
-    """Detect rest-motion-recovery boundaries using sliding ACC magnitude STD."""
+    """Detect rest-motion-recovery boundaries using sliding ACC magnitude STD.
+
+    中文说明：输入为三轴加速度、采样率和窗口长度；输出为运动起止时间以及每个
+    滑动窗口的标签。若无法找到完整转移，返回 ``status='error'`` 而不是抛异常。
+    """
 
     fs = int(fs)
     win_s = float(TW)
@@ -70,14 +73,12 @@ def detect_activity_segments(
     if acc_mag.size < win_len:
         return _error("signal shorter than one TW window")
 
-    # 中文注释：校准期使用前 30 秒；如果样本不足 30 秒，则尽量使用已有长度。
     calib_len = min(int(round(30 * fs)), acc_mag.size)
     if calib_len < 2:
         return _error("not enough samples for 30 s calibration")
     baseline_std = float(np.std(acc_mag[:calib_len], ddof=1))
     motion_threshold = 3.0 * baseline_std
 
-    # 中文注释：每秒滑动一次，窗口内合模长 STD 超过阈值即判为运动窗。
     starts = np.arange(0, acc_mag.size - win_len + 1, fs, dtype=int)
     if starts.size < 20:
         return _error("fewer than 20 sliding windows")
@@ -139,6 +140,8 @@ def _find_transition(
     after: bool,
     start_at: int,
 ) -> int | None:
+    """Find the first 10-window state transition after ``start_at``."""
+
     for i in range(max(0, int(start_at)), len(flags) - 19):
         if np.all(flags[i : i + 10] == before) and np.all(flags[i + 10 : i + 20] == after):
             return i + 10
@@ -153,6 +156,8 @@ def _error(
     window_std: np.ndarray | None = None,
     motion_flags: np.ndarray | None = None,
 ) -> SegmentInfo:
+    """Build an invalid ``SegmentInfo`` with enough diagnostics for CSV/JSON."""
+
     starts = np.asarray([] if starts is None else starts, dtype=float)
     centers = starts + win_s / 2.0 if starts.size else starts
     window_std = np.asarray([] if window_std is None else window_std, dtype=float)
