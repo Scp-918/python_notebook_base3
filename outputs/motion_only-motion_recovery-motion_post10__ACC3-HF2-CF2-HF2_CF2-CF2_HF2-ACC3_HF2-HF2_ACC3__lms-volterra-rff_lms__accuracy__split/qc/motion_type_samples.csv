@@ -1,4 +1,0 @@
-﻿group_id,motion_type,motion_index,data_file,ref_file
-tiaosheng1,tiaosheng,1,multi_tiaosheng1.csv,multi_tiaosheng1_ref.csv
-tiaosheng2,tiaosheng,2,multi_tiaosheng2.csv,multi_tiaosheng2_ref.csv
-tiaosheng3,tiaosheng,3,multi_tiaosheng3.csv,multi_tiaosheng3_ref.csv
