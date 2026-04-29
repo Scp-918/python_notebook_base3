@@ -1,7 +1,0 @@
-﻿split,group_id,motion_type,data_file,ref_file
-train,bobi2,bobi,D:\python_notebook_base\testdata\multi_bobi2.csv,D:\python_notebook_base\testdata\multi_bobi2_ref.csv
-train,bobi6,bobi,D:\python_notebook_base\testdata\multi_bobi6.csv,D:\python_notebook_base\testdata\multi_bobi6_ref.csv
-train,bobi4,bobi,D:\python_notebook_base\testdata\multi_bobi4.csv,D:\python_notebook_base\testdata\multi_bobi4_ref.csv
-train,bobi5,bobi,D:\python_notebook_base\testdata\multi_bobi5.csv,D:\python_notebook_base\testdata\multi_bobi5_ref.csv
-val,bobi3,bobi,D:\python_notebook_base\testdata\multi_bobi3.csv,D:\python_notebook_base\testdata\multi_bobi3_ref.csv
-test,bobi1,bobi,D:\python_notebook_base\testdata\multi_bobi1.csv,D:\python_notebook_base\testdata\multi_bobi1_ref.csv
