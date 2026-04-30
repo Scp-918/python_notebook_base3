@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from .tap_matrix import build_noncausal_tap_matrix
+
 __all__ = ["noncausal_volterra_filter"]
 
 
@@ -40,28 +42,37 @@ def noncausal_volterra_filter(
 
     M = max(1, int(M))
     K = max(0, int(K))
-    span = M + K
     out = d_arr.copy()
-    if n - K < M:
+    X, valid_indices = build_noncausal_tap_matrix(u_arr, M, K)
+    if valid_indices.size == 0:
         return out
 
     mu1 = _safe_positive(mu1, mu_min)
     mu2 = _safe_positive(float(alpha_u) * mu1, mu_min * max(float(alpha_u), 1e-6))
     near_idx = _nearest_tap_indices(M, K, M2)
     q_count = int(len(near_idx) * (len(near_idx) + 1) / 2)
+    if q_count:
+        near = X[:, near_idx]
+        tri_i, tri_j = np.triu_indices(len(near_idx))
+        Q = near[:, tri_i] * near[:, tri_j]
+    else:
+        Q = np.empty((valid_indices.size, 0), dtype=float)
 
+    span = X.shape[1]
     w1 = np.zeros(span, dtype=float)
     w2 = np.zeros(q_count, dtype=float)
     eps = 1e-9
-    for idx in range(M - 1, n - K):
-        x = u_arr[idx - M + 1 : idx + K + 1][::-1]
-        q = _quadratic_features(x[near_idx])
+    # 中文注释：二阶 Q 只在当前窗口/级联级内预计算，用完即释放，不跨 trial 缓存。
+    for row, idx in enumerate(valid_indices):
+        x = X[row]
+        q = Q[row]
         y = float(np.dot(w1, x) + np.dot(w2, q))
         err = float(d_arr[idx] - y)
         out[idx] = err
         w1 += (mu1 / (float(np.dot(x, x)) + eps)) * x * err
         if q.size:
             w2 += (mu2 / (float(np.dot(q, q)) + eps)) * q * err
+    del Q
     out[~np.isfinite(out)] = 0.0
     return out
 

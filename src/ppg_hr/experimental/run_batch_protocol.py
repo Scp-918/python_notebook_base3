@@ -30,7 +30,14 @@ except ModuleNotFoundError:  # pragma: no cover - only used in lean environments
 from ..params import CascadeScheme, ProtocolParams, TargetScope
 from .batch_pairing import PairDiscovery, SamplePair, discover_sample_pairs_with_unpaired
 from .alignment import _window_fft_hr
-from .cascade_solver import ProtocolRunResult, _get_trial_base, run_protocol_trial
+from .cascade_solver import (
+    MetricArrays,
+    ProtocolRunResult,
+    _get_trial_base,
+    aggregate_metric_arrays,
+    clear_trial_caches,
+    run_protocol_trial,
+)
 from .preprocess_protocol import ProtocolDataset, load_and_preprocess_protocol
 from .protocol_outputs import SampleOutputPaths, plot_signal_figures, write_qc_tables
 from .protocol_search_space import (
@@ -55,7 +62,7 @@ if optuna is not None:
 
 _VALID_FILTERS = ("lms", "volterra", "rff_lms")
 _VALID_OBJECTIVES = ("aae", "accuracy")
-_VALID_SPLIT_MODES = ("split", "all_train")
+_VALID_SPLIT_MODES = ("split", "all_train", "leave_one_group_out")
 
 
 @dataclass
@@ -102,6 +109,12 @@ class _ModeOptimisation:
     history: list[dict[str, Any]]
     success: bool
     reason: str
+    fold_id: int | None = None
+    heldout_group_id: str = ""
+    train_group_ids: list[str] = field(default_factory=list)
+    test_group_id: str = ""
+    fold_results: list["_ModeOptimisation"] = field(default_factory=list, repr=False)
+    metric_arrays_by_split: dict[str, MetricArrays] = field(default_factory=dict, repr=False)
 
     @property
     def mode_key(self) -> str:
@@ -179,6 +192,7 @@ def run_batch_adaptive_protocol(
     adaptive_filters: list[str] | None = None,
     objective_mode: str = "aae",
     data_split_mode: str = "split",
+    delay_estimation_mode: str = "envelope",
     val_groups_per_type: int = 1,
     test_groups_per_type: int = 1,
     cascade_train_budgets: dict[str, dict[str, int]] | None = None,
@@ -197,10 +211,13 @@ def run_batch_adaptive_protocol(
 
     objective_mode = str(objective_mode).lower()
     data_split_mode = str(data_split_mode).lower()
+    delay_estimation_mode = str(delay_estimation_mode).lower()
     if objective_mode not in _VALID_OBJECTIVES:
         raise ValueError(f"objective_mode must be one of {_VALID_OBJECTIVES}")
     if data_split_mode not in _VALID_SPLIT_MODES:
         raise ValueError(f"data_split_mode must be one of {_VALID_SPLIT_MODES}")
+    if delay_estimation_mode not in {"envelope", "direct"}:
+        raise ValueError("delay_estimation_mode must be 'envelope' or 'direct'")
 
     scopes = [TargetScope(x) for x in (target_scopes or [TargetScope.MOTION_ONLY, TargetScope.MOTION_AND_RECOVERY])]
     schemes = [CascadeScheme(x) for x in (cascade_schemes or list(CascadeScheme))]
@@ -339,7 +356,7 @@ def run_batch_adaptive_protocol(
         detail = ", ".join(f"{p.motion_id}/{p.sensor_csv.name}" for p in members)
         _log(f"{motion_type}: {detail}")
 
-    splits = _build_splits(
+    split_plans = _build_split_plan(
         grouped_pairs,
         data_split_mode=data_split_mode,
         val_groups_per_type=val_groups_per_type,
@@ -359,21 +376,18 @@ def run_batch_adaptive_protocol(
         motion_dir = motion_root / motion_type
         motion_dir.mkdir(parents=True, exist_ok=True)
         motion_type_dirs[motion_type] = motion_dir
-        split_rows = _split_rows(splits[motion_type], pair_by_group)
+        folds = split_plans[motion_type]
+        valid_folds = [fold for fold in folds if fold.get("status") == "ok"]
+        split_rows = _split_rows(folds, pair_by_group)
         split_path = motion_dir / "split_files.csv"
         pd.DataFrame(split_rows).to_csv(split_path, index=False, encoding="utf-8-sig")
+        if data_split_mode == "leave_one_group_out":
+            pd.DataFrame(split_rows).to_csv(motion_dir / "fold_split_files.csv", index=False, encoding="utf-8-sig")
 
-        train_ids = splits[motion_type]["train"]
-        val_ids = splits[motion_type]["val"]
-        test_ids = splits[motion_type]["test"]
-        train_sets = {gid: datasets[gid] for gid in train_ids}
-        val_sets = {gid: datasets[gid] for gid in val_ids}
-        test_sets = {gid: datasets[gid] for gid in test_ids}
-        if data_split_mode == "all_train":
-            val_sets = {}
+        all_ids = _unique_ids_from_folds(folds)
 
         mode_results: list[_ModeOptimisation] = []
-        trial_cache: dict[tuple[Any, ...], ProtocolRunResult] = {}
+        shared_trial_cache: dict[tuple[Any, ...], ProtocolRunResult] = {}
         for scope in scopes:
             for scheme in schemes:
                 budget = _budget_for_scheme(cascade_train_budgets, scheme, cfg)
@@ -392,39 +406,116 @@ def run_batch_adaptive_protocol(
                             "adaptive_filter": adaptive_filter,
                         }
                     )
-                    result = _optimise_group_mode(
-                        motion_type=motion_type,
-                        train_sets=train_sets,
-                        val_sets=val_sets,
-                        test_sets=test_sets,
-                        scope=scope,
-                        scheme=scheme,
-                        adaptive_filter=adaptive_filter,
-                        objective_mode=objective_mode,
-                        data_split_mode=data_split_mode,
-                        cfg=cfg,
-                        space=space,
-                        n_trials=budget["n_trials"],
-                        n_repeats=budget["n_repeats"],
-                        trial_cache=trial_cache,
-                        penalty_value=float(penalty_value),
-                        mode_idx=mode_counter,
-                        mode_total=total_modes,
-                        random_state=int(random_state),
-                        on_progress=_progress,
-                    )
+                    if not valid_folds:
+                        reason = str(folds[0].get("reason", "no valid folds")) if folds else "no valid folds"
+                        result = _failed_mode_optimisation(
+                            motion_type=motion_type,
+                            scope=scope,
+                            scheme=scheme,
+                            adaptive_filter=adaptive_filter,
+                            objective_mode=objective_mode,
+                            data_split_mode=data_split_mode,
+                            delay_estimation_mode=delay_estimation_mode,
+                            space=space,
+                            n_trials=budget["n_trials"],
+                            n_repeats=budget["n_repeats"],
+                            reason=reason,
+                        )
+                    elif data_split_mode == "leave_one_group_out":
+                        fold_results: list[_ModeOptimisation] = []
+                        for fold in valid_folds:
+                            fold_trial_cache: dict[tuple[Any, ...], ProtocolRunResult] = {}
+                            train_ids = list(fold["train"])
+                            test_ids = list(fold["test"])
+                            result_fold = _optimise_group_mode(
+                                motion_type=motion_type,
+                                train_sets={gid: datasets[gid] for gid in train_ids},
+                                val_sets={},
+                                test_sets={gid: datasets[gid] for gid in test_ids},
+                                scope=scope,
+                                scheme=scheme,
+                                adaptive_filter=adaptive_filter,
+                                objective_mode=objective_mode,
+                                data_split_mode=data_split_mode,
+                                delay_estimation_mode=delay_estimation_mode,
+                                cfg=cfg,
+                                space=space,
+                                n_trials=budget["n_trials"],
+                                n_repeats=budget["n_repeats"],
+                                trial_cache=fold_trial_cache,
+                                penalty_value=float(penalty_value),
+                                mode_idx=mode_counter,
+                                mode_total=total_modes,
+                                random_state=int(random_state),
+                                on_progress=_progress,
+                                fold_id=int(fold["fold_id"]),
+                                heldout_group_id=str(fold["heldout_group_id"]),
+                                train_group_ids=train_ids,
+                                test_group_id=test_ids[0] if test_ids else "",
+                            )
+                            fold_results.append(result_fold)
+                            fold_trial_cache.clear()
+                            for gid in train_ids + test_ids:
+                                clear_trial_caches(datasets[gid])
+                            del fold_trial_cache
+                            gc.collect()
+                        result = _aggregate_logo_fold_results(
+                            motion_type=motion_type,
+                            scope=scope,
+                            scheme=scheme,
+                            adaptive_filter=adaptive_filter,
+                            objective_mode=objective_mode,
+                            data_split_mode=data_split_mode,
+                            fold_results=fold_results,
+                            n_trials=budget["n_trials"],
+                            n_repeats=budget["n_repeats"],
+                        )
+                    else:
+                        fold = valid_folds[0]
+                        train_ids = list(fold["train"])
+                        val_ids = list(fold["val"])
+                        test_ids = list(fold["test"])
+                        result = _optimise_group_mode(
+                            motion_type=motion_type,
+                            train_sets={gid: datasets[gid] for gid in train_ids},
+                            val_sets={gid: datasets[gid] for gid in val_ids},
+                            test_sets={gid: datasets[gid] for gid in test_ids},
+                            scope=scope,
+                            scheme=scheme,
+                            adaptive_filter=adaptive_filter,
+                            objective_mode=objective_mode,
+                            data_split_mode=data_split_mode,
+                            delay_estimation_mode=delay_estimation_mode,
+                            cfg=cfg,
+                            space=space,
+                            n_trials=budget["n_trials"],
+                            n_repeats=budget["n_repeats"],
+                            trial_cache=shared_trial_cache,
+                            penalty_value=float(penalty_value),
+                            mode_idx=mode_counter,
+                            mode_total=total_modes,
+                            random_state=int(random_state),
+                            on_progress=_progress,
+                            fold_id=0,
+                            heldout_group_id="",
+                            train_group_ids=train_ids,
+                            test_group_id=test_ids[0] if len(test_ids) == 1 else "",
+                        )
                     mode_results.append(result)
                     gc.collect()
         all_mode_results[motion_type] = mode_results
         _write_motion_type_outputs(motion_dir, motion_type, mode_results)
         bayes_path = _plot_bayes_curves(motion_dir, motion_type, mode_results, objective_mode)
         bayes_tables[motion_type] = bayes_path
+        shared_trial_cache.clear()
+        for gid in all_ids:
+            clear_trial_caches(datasets[gid])
         batch_rows.append(
             {
                 "motion_type": motion_type,
-                "sample": ",".join(train_ids + val_ids + test_ids),
-                "status": "ok",
-                "reason": "",
+                "sample": ",".join(all_ids),
+                "status": "ok" if valid_folds else "failed",
+                "reason": "" if valid_folds else str(folds[0].get("reason", "no valid folds")),
                 "split": str(split_path),
                 "result_csv": str(motion_dir / "mode_summary_aae.csv"),
                 "report_json": str(motion_dir / "best_params_all.json"),
@@ -454,22 +545,64 @@ def run_batch_adaptive_protocol(
     )
 
 
-def _build_splits(
+def _build_split_plan(
     grouped_pairs: dict[str, list[SamplePair]],
     *,
     data_split_mode: str,
     val_groups_per_type: int,
     test_groups_per_type: int,
     random_state: int,
-) -> dict[str, dict[str, list[str]]]:
-    """Build fixed train/val/test or all_train splits per motion type."""
+) -> dict[str, list[dict[str, Any]]]:
+    """Build one or many folds per motion type.
 
-    splits: dict[str, dict[str, list[str]]] = {}
+    中文说明：``split`` 和 ``all_train`` 仍然只返回一个 fold；LOGO 模式为每个
+    held-out group 返回一个独立 fold。如果某个 motion_type 少于 2 个好样本，
+    返回失败 fold，主流程会写 reason 并继续处理其他运动类型。
+    """
+
+    plans: dict[str, list[dict[str, Any]]] = {}
     for motion_type, pairs in grouped_pairs.items():
         pairs_sorted = sorted(pairs, key=lambda p: (p.motion_index, p.motion_id))
         ids = [p.motion_id for p in pairs_sorted]
         if data_split_mode == "all_train":
-            splits[motion_type] = {"train": ids, "val": [], "test": ids}
+            plans[motion_type] = [
+                {
+                    "fold_id": 0,
+                    "heldout_group_id": "",
+                    "train": ids,
+                    "val": [],
+                    "test": ids,
+                    "status": "ok",
+                    "reason": "",
+                }
+            ]
+            continue
+        if data_split_mode == "leave_one_group_out":
+            if len(ids) < 2:
+                plans[motion_type] = [
+                    {
+                        "fold_id": 0,
+                        "heldout_group_id": "",
+                        "train": [],
+                        "val": [],
+                        "test": [],
+                        "status": "failed",
+                        "reason": f"运动类型 {motion_type} 好样本数量少于 2，无法执行 leave-one-group-out。",
+                    }
+                ]
+                continue
+            plans[motion_type] = [
+                {
+                    "fold_id": fold_id,
+                    "heldout_group_id": heldout,
+                    "train": [gid for gid in ids if gid != heldout],
+                    "val": [],
+                    "test": [heldout],
+                    "status": "ok",
+                    "reason": "",
+                }
+                for fold_id, heldout in enumerate(ids)
+            ]
             continue
         m = int(val_groups_per_type)
         k = int(test_groups_per_type)
@@ -483,25 +616,71 @@ def _build_splits(
         test = shuffled[:k]
         val = shuffled[k : k + m]
         train = shuffled[k + m :]
-        splits[motion_type] = {"train": train, "val": val, "test": test}
-    return splits
+        plans[motion_type] = [
+            {
+                "fold_id": 0,
+                "heldout_group_id": "",
+                "train": train,
+                "val": val,
+                "test": test,
+                "status": "ok",
+                "reason": "",
+            }
+        ]
+    return plans
 
 
-def _split_rows(split: dict[str, list[str]], pair_by_group: dict[str, SamplePair]) -> list[dict[str, Any]]:
+def _split_rows(folds: list[dict[str, Any]], pair_by_group: dict[str, SamplePair]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for split_name, ids in split.items():
-        for gid in ids:
-            pair = pair_by_group.get(gid)
+    for fold in folds:
+        if fold.get("status") != "ok":
             rows.append(
                 {
-                    "split": split_name,
-                    "group_id": gid,
-                    "motion_type": pair.motion_type if pair is not None else "",
-                    "data_file": str(pair.sensor_csv) if pair is not None else "",
-                    "ref_file": str(pair.ref_csv) if pair is not None else "",
+                    "fold_id": int(fold.get("fold_id", 0)),
+                    "heldout_group_id": str(fold.get("heldout_group_id", "")),
+                    "split": "failed",
+                    "group_id": "",
+                    "motion_type": "",
+                    "data_file": "",
+                    "ref_file": "",
+                    "reason": str(fold.get("reason", "")),
                 }
             )
+            continue
+        for split_name in ("train", "val", "test"):
+            for gid in fold.get(split_name, []):
+                pair = pair_by_group.get(gid)
+                rows.append(
+                    {
+                        "fold_id": int(fold.get("fold_id", 0)),
+                        "heldout_group_id": str(fold.get("heldout_group_id", "")),
+                        "split": split_name,
+                        "group_id": gid,
+                        "motion_type": pair.motion_type if pair is not None else "",
+                        "data_file": str(pair.sensor_csv) if pair is not None else "",
+                        "ref_file": str(pair.ref_csv) if pair is not None else "",
+                        "reason": "",
+                    }
+                )
     return rows
+
+
+def _unique_ids_from_folds(folds: list[dict[str, Any]]) -> list[str]:
+    """Return stable unique group ids appearing anywhere in a split plan.
+
+    中文说明：LOGO 中同一 group 会在多个 fold 的 train/test 中重复出现；这里按
+    首次出现顺序去重，只用于 batch_summary 的样本列表展示。
+    """
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for fold in folds:
+        for split_name in ("train", "val", "test"):
+            for gid in fold.get(split_name, []):
+                if gid not in seen:
+                    seen.add(gid)
+                    out.append(gid)
+    return out
 
 
 def _budget_for_scheme(
@@ -529,6 +708,7 @@ def _optimise_group_mode(
     adaptive_filter: str,
     objective_mode: str,
     data_split_mode: str,
+    delay_estimation_mode: str,
     cfg: ProtocolParams,
     space: ProtocolSearchSpace,
     n_trials: int,
@@ -539,28 +719,82 @@ def _optimise_group_mode(
     mode_total: int,
     random_state: int,
     on_progress: Callable[[dict[str, Any]], None],
+    fold_id: int | None = None,
+    heldout_group_id: str = "",
+    train_group_ids: list[str] | None = None,
+    test_group_id: str = "",
 ) -> _ModeOptimisation:
     """Optimise one motion_type/mode over train/val/test datasets."""
 
     best_value = float("inf")
-    best_params = _default_params_for_filter(space, adaptive_filter, objective_mode)
+    best_params = _default_params_for_filter(
+        space,
+        adaptive_filter,
+        objective_mode,
+        delay_estimation_mode=delay_estimation_mode,
+    )
     best_repeat_idx = 0
     best_trial_idx = 0
     history: list[dict[str, Any]] = []
     best_so_far = float("inf")
     objective_sets = val_sets if data_split_mode == "split" else train_sets
+    objective_split = "val" if data_split_mode == "split" else "train"
 
-    def _evaluate_params(params: ProtocolTrialParams) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
-        train_metrics, train_rows = _evaluate_dataset_map(
-            train_sets, scope, scheme, params, "train", trial_cache
+    def _evaluate_objective_params(params: ProtocolTrialParams) -> dict[str, Any]:
+        metrics, _, _ = _evaluate_dataset_map(
+            objective_sets,
+            scope,
+            scheme,
+            params,
+            objective_split,
+            trial_cache,
+            eval_mode="light",
+            fold_id=fold_id,
+            heldout_group_id=heldout_group_id,
         )
-        val_metrics, val_rows = _evaluate_dataset_map(
-            val_sets, scope, scheme, params, "val", trial_cache
-        ) if val_sets else (_empty_metrics("val"), [])
-        test_metrics, test_rows = _evaluate_dataset_map(
-            test_sets, scope, scheme, params, "test", trial_cache
+        return metrics
+
+    def _evaluate_params_full(
+        params: ProtocolTrialParams,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[dict[str, Any]], dict[str, MetricArrays]]:
+        train_metrics, train_rows, train_arrays = _evaluate_dataset_map(
+            train_sets,
+            scope,
+            scheme,
+            params,
+            "train",
+            trial_cache,
+            eval_mode="full",
+            fold_id=fold_id,
+            heldout_group_id=heldout_group_id,
         )
-        return train_metrics, val_metrics, test_metrics, [*train_rows, *val_rows, *test_rows]
+        if val_sets:
+            val_metrics, val_rows, val_arrays = _evaluate_dataset_map(
+                val_sets,
+                scope,
+                scheme,
+                params,
+                "val",
+                trial_cache,
+                eval_mode="full",
+                fold_id=fold_id,
+                heldout_group_id=heldout_group_id,
+            )
+        else:
+            val_metrics, val_rows, val_arrays = _empty_metrics("val"), [], {}
+        test_metrics, test_rows, test_arrays = _evaluate_dataset_map(
+            test_sets,
+            scope,
+            scheme,
+            params,
+            "test",
+            trial_cache,
+            eval_mode="full",
+            fold_id=fold_id,
+            heldout_group_id=heldout_group_id,
+        )
+        arrays_by_split = {"train": train_arrays, "val": val_arrays, "test": test_arrays}
+        return train_metrics, val_metrics, test_metrics, [*train_rows, *val_rows, *test_rows], arrays_by_split
 
     for repeat_idx in range(int(n_repeats)):
         if optuna is not None and TPESampler is not None:
@@ -582,12 +816,12 @@ def _optimise_group_mode(
                     idx_map,
                     adaptive_filter=adaptive_filter,
                     objective_mode=objective_mode,
+                    delay_estimation_mode=delay_estimation_mode,
                     mode_key=f"{scope.value}__{scheme.value}__{adaptive_filter}",
                     repeat_idx=repeat_idx,
                     random_state=random_state,
                 )
-                train_metrics, val_metrics, test_metrics, _ = _evaluate_params(params)
-                objective_metrics = val_metrics if data_split_mode == "split" else train_metrics
+                objective_metrics = _evaluate_objective_params(params)
                 value = _objective_value(objective_metrics, objective_mode, penalty_value)
                 best_so_far = min(best_so_far, value)
                 if value < best_value:
@@ -607,6 +841,8 @@ def _optimise_group_mode(
                     value,
                     objective_metrics,
                     best_so_far,
+                    fold_id=fold_id,
+                    heldout_group_id=heldout_group_id,
                 )
                 _emit_trial_progress(
                     on_progress,
@@ -641,12 +877,12 @@ def _optimise_group_mode(
                     idx_map,
                     adaptive_filter=adaptive_filter,
                     objective_mode=objective_mode,
+                    delay_estimation_mode=delay_estimation_mode,
                     mode_key=f"{scope.value}__{scheme.value}__{adaptive_filter}",
                     repeat_idx=repeat_idx,
                     random_state=random_state,
                 )
-                train_metrics, val_metrics, test_metrics, _ = _evaluate_params(params)
-                objective_metrics = val_metrics if data_split_mode == "split" else train_metrics
+                objective_metrics = _evaluate_objective_params(params)
                 value = _objective_value(objective_metrics, objective_mode, penalty_value)
                 best_so_far = min(best_so_far, value)
                 if value < best_value:
@@ -666,6 +902,8 @@ def _optimise_group_mode(
                     value,
                     objective_metrics,
                     best_so_far,
+                    fold_id=fold_id,
+                    heldout_group_id=heldout_group_id,
                 )
                 _emit_trial_progress(
                     on_progress,
@@ -686,7 +924,7 @@ def _optimise_group_mode(
                     mode_total,
                 )
 
-    train_metrics, val_metrics, test_metrics, per_group_rows = _evaluate_params(best_params)
+    train_metrics, val_metrics, test_metrics, per_group_rows, arrays_by_split = _evaluate_params_full(best_params)
     success = bool((val_metrics if data_split_mode == "split" else train_metrics).get("success", False))
     reason = str((val_metrics if data_split_mode == "split" else train_metrics).get("reason", ""))
     return _ModeOptimisation(
@@ -708,6 +946,11 @@ def _optimise_group_mode(
         history=history,
         success=success,
         reason=reason,
+        fold_id=fold_id,
+        heldout_group_id=heldout_group_id,
+        train_group_ids=list(train_group_ids or train_sets.keys()),
+        test_group_id=str(test_group_id),
+        metric_arrays_by_split=arrays_by_split,
     )
 
 
@@ -715,6 +958,8 @@ def _default_params_for_filter(
     space: ProtocolSearchSpace,
     adaptive_filter: str,
     objective_mode: str,
+    *,
+    delay_estimation_mode: str = "envelope",
 ) -> ProtocolTrialParams:
     values = {}
     for name in space.names_for_filter(adaptive_filter):
@@ -725,6 +970,7 @@ def _default_params_for_filter(
             values[name] = value
     values["adaptive_filter"] = adaptive_filter
     values["objective_mode"] = objective_mode
+    values["delay_estimation_mode"] = str(delay_estimation_mode)
     return ProtocolTrialParams(**values)
 
 
@@ -734,6 +980,7 @@ def _decode_with_seed(
     *,
     adaptive_filter: str,
     objective_mode: str,
+    delay_estimation_mode: str,
     mode_key: str,
     repeat_idx: int,
     random_state: int,
@@ -745,6 +992,7 @@ def _decode_with_seed(
         objective_mode=objective_mode,
         rff_seed=0,
     )
+    params = replace(params, delay_estimation_mode=str(delay_estimation_mode))
     if adaptive_filter == "rff_lms":
         seed_payload = {
             **{k: v for k, v in params.to_dict().items() if k != "rff_seed"},
@@ -756,6 +1004,138 @@ def _decode_with_seed(
     return params
 
 
+def _failed_mode_optimisation(
+    *,
+    motion_type: str,
+    scope: TargetScope,
+    scheme: CascadeScheme,
+    adaptive_filter: str,
+    objective_mode: str,
+    data_split_mode: str,
+    delay_estimation_mode: str,
+    space: ProtocolSearchSpace,
+    n_trials: int,
+    n_repeats: int,
+    reason: str,
+) -> _ModeOptimisation:
+    """Build a stable failed mode result without stopping the batch.
+
+    中文说明：当某个 motion_type 无法执行 LOGO 时，仍为每个 mode 写出失败指标和
+    reason，避免整个批处理因为单个运动类型样本不足而中断。
+    """
+
+    metrics = _failed_metrics("test", reason)
+    return _ModeOptimisation(
+        motion_type=motion_type,
+        target_scope=scope,
+        cascade_scheme=scheme,
+        adaptive_filter=adaptive_filter,
+        objective_mode=objective_mode,
+        data_split_mode=data_split_mode,
+        best_params=_default_params_for_filter(
+            space,
+            adaptive_filter,
+            objective_mode,
+            delay_estimation_mode=delay_estimation_mode,
+        ),
+        best_repeat_idx=0,
+        best_trial_idx=0,
+        n_trials=int(n_trials),
+        n_repeats=int(n_repeats),
+        train_metrics=_failed_metrics("train", reason),
+        val_metrics=_empty_metrics("val"),
+        test_metrics=metrics,
+        per_group_rows=[],
+        history=[],
+        success=False,
+        reason=reason,
+    )
+
+
+def _aggregate_logo_fold_results(
+    *,
+    motion_type: str,
+    scope: TargetScope,
+    scheme: CascadeScheme,
+    adaptive_filter: str,
+    objective_mode: str,
+    data_split_mode: str,
+    fold_results: list[_ModeOptimisation],
+    n_trials: int,
+    n_repeats: int,
+) -> _ModeOptimisation:
+    """Aggregate LOGO folds into one motion_type/mode result.
+
+    中文说明：正式泛化指标在这里把所有 held-out test 窗口的 metric_arrays 拼接后
+    统一计算 AAE/accuracy，绝不使用每个 fold 指标的简单平均。
+    """
+
+    if not fold_results:
+        reason = "leave_one_group_out has no fold results"
+        return _ModeOptimisation(
+            motion_type=motion_type,
+            target_scope=scope,
+            cascade_scheme=scheme,
+            adaptive_filter=adaptive_filter,
+            objective_mode=objective_mode,
+            data_split_mode=data_split_mode,
+            best_params=ProtocolTrialParams(adaptive_filter=adaptive_filter, objective_mode=objective_mode),
+            best_repeat_idx=0,
+            best_trial_idx=0,
+            n_trials=int(n_trials),
+            n_repeats=int(n_repeats),
+            train_metrics=_failed_metrics("train", reason),
+            val_metrics=_empty_metrics("val"),
+            test_metrics=_failed_metrics("test", reason),
+            per_group_rows=[],
+            history=[],
+            success=False,
+            reason=reason,
+        )
+
+    test_arrays = _concat_metric_arrays([r.metric_arrays_by_split.get("test", {}) for r in fold_results])
+    train_arrays = _concat_metric_arrays([r.metric_arrays_by_split.get("train", {}) for r in fold_results])
+    test_failures = [str(r.test_metrics.get("reason", "")) for r in fold_results if not r.test_metrics.get("success", False)]
+    train_failures = [str(r.train_metrics.get("reason", "")) for r in fold_results if not r.train_metrics.get("success", False)]
+    test_metrics = _metrics_from_arrays_with_status(test_arrays, "test", test_failures)
+    train_metrics = _metrics_from_arrays_with_status(train_arrays, "train", train_failures)
+
+    def _fold_score(result: _ModeOptimisation) -> float:
+        return _objective_value(result.test_metrics, objective_mode, float("inf"))
+
+    best_fold = min(fold_results, key=_fold_score)
+    history = [row for fold in fold_results for row in fold.history]
+    per_group_rows = [row for fold in fold_results for row in fold.per_group_rows]
+    reason = "; ".join([r for r in test_failures[:3] if r])
+    success = bool(test_metrics.get("success", False))
+
+    # 中文注释：汇总指标算完后清掉 fold 内大数组，只保留 CSV/JSON 需要的小指标。
+    for fold in fold_results:
+        fold.metric_arrays_by_split = {}
+
+    return _ModeOptimisation(
+        motion_type=motion_type,
+        target_scope=scope,
+        cascade_scheme=scheme,
+        adaptive_filter=adaptive_filter,
+        objective_mode=objective_mode,
+        data_split_mode=data_split_mode,
+        best_params=best_fold.best_params,
+        best_repeat_idx=best_fold.best_repeat_idx,
+        best_trial_idx=best_fold.best_trial_idx,
+        n_trials=int(n_trials),
+        n_repeats=int(n_repeats),
+        train_metrics=train_metrics,
+        val_metrics=_empty_metrics("val"),
+        test_metrics=test_metrics,
+        per_group_rows=per_group_rows,
+        history=history,
+        success=success,
+        reason=reason,
+        fold_results=fold_results,
+    )
+
+
 def _evaluate_dataset_map(
     datasets: dict[str, ProtocolDataset],
     scope: TargetScope,
@@ -763,13 +1143,26 @@ def _evaluate_dataset_map(
     params: ProtocolTrialParams,
     split_name: str,
     trial_cache: dict[tuple[Any, ...], ProtocolRunResult],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Run one trial params on all datasets in one split and aggregate metrics."""
+    *,
+    eval_mode: str = "full",
+    fold_id: int | None = None,
+    heldout_group_id: str = "",
+) -> tuple[dict[str, Any], list[dict[str, Any]], MetricArrays]:
+    """Run one trial params on all datasets in one split and aggregate metrics.
 
+    中文说明：``eval_mode='light'`` 只用于 Optuna objective，不生成 DataFrame 或
+    stage JSON；``eval_mode='full'`` 只在 best_params 复评估时使用。缓存键包含
+    eval_mode，避免 light 结果被误当作 full 结果复用。
+    """
+
+    eval_mode = str(eval_mode).lower()
+    if eval_mode not in {"light", "full"}:
+        raise ValueError("eval_mode must be 'light' or 'full'")
     runs: list[ProtocolRunResult] = []
     rows: list[dict[str, Any]] = []
     for group_id, dataset in datasets.items():
         cache_key = (
+            eval_mode,
             group_id,
             int(params.Fs_Target),
             int(params.TW),
@@ -780,19 +1173,40 @@ def _evaluate_dataset_map(
         )
         run = trial_cache.get(cache_key)
         if run is None:
-            run = run_protocol_trial(dataset, scheme, scope, params)
+            run = run_protocol_trial(
+                dataset,
+                scheme,
+                scope,
+                params,
+                collect_frame=eval_mode == "full",
+                collect_stages=eval_mode == "full",
+            )
             trial_cache[cache_key] = run
         runs.append(run)
-        rows.append(_per_group_row(group_id, split_name, run))
-    return _aggregate_runs(runs, split_name), rows
+        if eval_mode == "full":
+            rows.append(
+                _per_group_row(
+                    group_id,
+                    split_name,
+                    run,
+                    fold_id=fold_id,
+                    heldout_group_id=heldout_group_id,
+                )
+            )
+    arrays = _concat_metric_arrays([r.metric_arrays for r in runs if r.success])
+    return _aggregate_runs(runs, split_name, arrays), rows, arrays
 
 
-def _aggregate_runs(runs: list[ProtocolRunResult], split_name: str) -> dict[str, Any]:
+def _aggregate_runs(
+    runs: list[ProtocolRunResult],
+    split_name: str,
+    arrays: MetricArrays | None = None,
+) -> dict[str, Any]:
     """Aggregate window-level metrics across a split."""
 
-    frames = [r.frame for r in runs if r.success and r.frame is not None and not r.frame.empty]
     failures = [r.reason for r in runs if not r.success]
-    if not frames:
+    arrays = arrays if arrays is not None else _concat_metric_arrays([r.metric_arrays for r in runs if r.success])
+    if not arrays or arrays.get("ref_hr_bpm", np.asarray([], dtype=float)).size == 0:
         return {
             "split": split_name,
             "success": False,
@@ -803,24 +1217,51 @@ def _aggregate_runs(runs: list[ProtocolRunResult], split_name: str) -> dict[str,
             "adaptive_acc_pct": float("nan"),
             "num_windows": 0,
         }
-    frame = pd.concat(frames, ignore_index=True)
-    mask = frame.get("is_filtered_segment", pd.Series(True, index=frame.index)).to_numpy(dtype=bool)
-    baseline_err = frame.loc[mask, "baseline_abs_err_bpm"].to_numpy(dtype=float)
-    adaptive_err = frame.loc[mask, "adaptive_abs_err_bpm"].to_numpy(dtype=float)
+    metrics = aggregate_metric_arrays(arrays, split_name=split_name)
     return {
         "split": split_name,
         "success": len(failures) == 0,
         "reason": "; ".join(failures[:3]),
-        "baseline_aae_bpm": _nanmean(baseline_err),
-        "adaptive_aae_bpm": _nanmean(adaptive_err),
-        "baseline_acc_pct": _accuracy_from_abs_err(baseline_err),
-        "adaptive_acc_pct": _accuracy_from_abs_err(adaptive_err),
-        "num_windows": int(np.isfinite(adaptive_err).sum()),
+        "baseline_aae_bpm": metrics["baseline_aae_bpm"],
+        "adaptive_aae_bpm": metrics["adaptive_aae_bpm"],
+        "baseline_acc_pct": metrics["baseline_acc_pct"],
+        "adaptive_acc_pct": metrics["adaptive_acc_pct"],
+        "num_windows": metrics["num_windows"],
     }
 
 
-def _per_group_row(group_id: str, split_name: str, run: ProtocolRunResult) -> dict[str, Any]:
+def _concat_metric_arrays(items: list[MetricArrays]) -> MetricArrays:
+    """Concatenate compact metric arrays from multiple successful runs.
+
+    中文说明：split/all_train/LOGO 的指标都从窗口级数组拼接后统一计算；LOGO 的
+    held-out test 指标尤其不能用各 fold AAE 的简单平均替代。
+    """
+
+    valid = [item for item in items if item and item.get("ref_hr_bpm", np.asarray([], dtype=float)).size]
+    if not valid:
+        return {}
+    keys = set().union(*(item.keys() for item in valid))
+    out: MetricArrays = {}
+    for key in keys:
+        arrays = [np.asarray(item[key]) for item in valid if key in item]
+        if arrays:
+            out[key] = np.concatenate(arrays)
+    return out
+
+
+def _per_group_row(
+    group_id: str,
+    split_name: str,
+    run: ProtocolRunResult,
+    *,
+    fold_id: int | None = None,
+    heldout_group_id: str = "",
+) -> dict[str, Any]:
+    """Build one per-group output row with optional LOGO fold metadata."""
+
     return {
+        "fold_id": "" if fold_id is None else int(fold_id),
+        "heldout_group_id": str(heldout_group_id),
         "split": split_name,
         "group_id": group_id,
         "target_scope": run.target_scope.value,
@@ -856,9 +1297,13 @@ def _append_history(
     objective_value: float,
     metrics: dict[str, Any],
     best_so_far: float,
+    fold_id: int | None = None,
+    heldout_group_id: str = "",
 ) -> None:
     history.append(
         {
+            "fold_id": "" if fold_id is None else int(fold_id),
+            "heldout_group_id": str(heldout_group_id),
             "motion_type": motion_type,
             "target_scope": scope.value,
             "cascade_scheme": scheme.value,
@@ -927,16 +1372,28 @@ def _write_motion_type_outputs(
     """Write all required per-motion_type CSV/JSON files."""
 
     summary_rows = [_summary_row(r) for r in results]
-    summary_df = pd.DataFrame(summary_rows)
+    summary_df = pd.DataFrame(summary_rows, columns=_summary_columns())
     summary_df.to_csv(motion_dir / "mode_summary_aae.csv", index=False, encoding="utf-8-sig")
     summary_df.to_csv(motion_dir / "mode_summary_accuracy.csv", index=False, encoding="utf-8-sig")
+
+    fold_summary = pd.DataFrame(
+        [_summary_row(fold) for r in results for fold in r.fold_results],
+        columns=_summary_columns(),
+    )
+    fold_summary.to_csv(motion_dir / "fold_summary_aae.csv", index=False, encoding="utf-8-sig")
+    fold_summary.to_csv(motion_dir / "fold_summary_accuracy.csv", index=False, encoding="utf-8-sig")
 
     per_group = pd.DataFrame([row for r in results for row in r.per_group_rows])
     per_group.to_csv(motion_dir / "per_group_aae.csv", index=False, encoding="utf-8-sig")
     per_group.to_csv(motion_dir / "per_group_accuracy.csv", index=False, encoding="utf-8-sig")
 
     for adaptive_filter in _VALID_FILTERS:
-        rows = [_best_param_row(r) for r in results if r.adaptive_filter == adaptive_filter]
+        rows = [
+            _best_param_row(item)
+            for r in results
+            if r.adaptive_filter == adaptive_filter
+            for item in (r.fold_results if r.fold_results else [r])
+        ]
         pd.DataFrame(rows, columns=_best_param_columns()).to_csv(
             motion_dir / f"best_params_{adaptive_filter}.csv",
             index=False,
@@ -959,6 +1416,26 @@ def _write_motion_type_outputs(
             "train_metrics": r.train_metrics,
             "val_metrics": r.val_metrics,
             "test_metrics": r.test_metrics,
+            "fold_results": [
+                {
+                    "fold_id": fold.fold_id,
+                    "heldout_group_id": fold.heldout_group_id,
+                    "train_group_ids": fold.train_group_ids,
+                    "test_group_id": fold.test_group_id,
+                    "best_repeat_idx": fold.best_repeat_idx,
+                    "best_trial_idx": fold.best_trial_idx,
+                    "n_trials": fold.n_trials,
+                    "n_repeats": fold.n_repeats,
+                    "best_params": fold.best_params.to_dict(),
+                    "train_metrics": fold.train_metrics,
+                    "val_metrics": fold.val_metrics,
+                    "test_metrics": fold.test_metrics,
+                    "success": fold.success,
+                    "reason": fold.reason,
+                    "trial_history": fold.history,
+                }
+                for fold in r.fold_results
+            ],
             "success": r.success,
             "reason": r.reason,
             "trial_history": r.history,
@@ -982,6 +1459,10 @@ def _summary_row(result: _ModeOptimisation) -> dict[str, Any]:
         "adaptive_filter": result.adaptive_filter,
         "objective_mode": result.objective_mode,
         "data_split_mode": result.data_split_mode,
+        "fold_id": "" if result.fold_id is None else result.fold_id,
+        "heldout_group_id": result.heldout_group_id,
+        "train_group_ids": ",".join(result.train_group_ids),
+        "test_group_id": result.test_group_id,
         "n_trials": result.n_trials,
         "n_repeats": result.n_repeats,
         "best_repeat_idx": result.best_repeat_idx,
@@ -1009,13 +1490,29 @@ def _best_param_row(result: _ModeOptimisation) -> dict[str, Any]:
 def _best_param_columns() -> list[str]:
     """Return stable best-params CSV columns, including headers for empty files."""
 
-    summary_cols = [
+    summary_cols = _summary_columns()
+    param_cols = [item.name for item in fields(ProtocolTrialParams) if item.name not in summary_cols]
+    return [*summary_cols, *param_cols]
+
+
+def _summary_columns() -> list[str]:
+    """Return stable summary CSV columns, including headers for empty LOGO files.
+
+    中文说明：非 LOGO 模式也会输出空的 fold_summary_*.csv；固定表头可以让
+    Notebook 检查单元格安全读取空 fold summary。
+    """
+
+    return [
         "motion_type",
         "target_scope",
         "cascade_scheme",
         "adaptive_filter",
         "objective_mode",
         "data_split_mode",
+        "fold_id",
+        "heldout_group_id",
+        "train_group_ids",
+        "test_group_id",
         "n_trials",
         "n_repeats",
         "best_repeat_idx",
@@ -1038,8 +1535,6 @@ def _best_param_columns() -> list[str]:
         "test_baseline_accuracy_pct",
         "test_num_windows",
     ]
-    param_cols = [item.name for item in fields(ProtocolTrialParams) if item.name not in summary_cols]
-    return [*summary_cols, *param_cols]
 
 
 def _plot_bayes_curves(
@@ -1161,6 +1656,8 @@ def redraw_best_param_hr_curves(
     best_param_csv_path: str | Path,
     output_dir: str | Path,
     fs_origin: int = 100,
+    fold_id: int | None = None,
+    heldout_group_id: str | None = None,
 ) -> dict[str, Path]:
     """Re-run one sample with one best-param row and draw HR curves.
 
@@ -1171,7 +1668,14 @@ def redraw_best_param_hr_curves(
     scope = TargetScope(target_scope)
     scheme = CascadeScheme(cascade_scheme)
     adaptive_filter = str(adaptive_filter)
-    params = _params_from_best_csv(best_param_csv_path, scope, scheme, adaptive_filter)
+    params = _params_from_best_csv(
+        best_param_csv_path,
+        scope,
+        scheme,
+        adaptive_filter,
+        fold_id=fold_id,
+        heldout_group_id=heldout_group_id,
+    )
     dataset = load_and_preprocess_protocol(sensor_csv_path, ref_csv_path, fs_origin=fs_origin)
     run = run_protocol_trial(dataset, scheme, scope, params)
     if not run.success or run.frame.empty:
@@ -1217,6 +1721,9 @@ def _params_from_best_csv(
     scope: TargetScope,
     scheme: CascadeScheme,
     adaptive_filter: str,
+    *,
+    fold_id: int | None = None,
+    heldout_group_id: str | None = None,
 ) -> ProtocolTrialParams:
     df = pd.read_csv(best_param_csv_path)
     mask = pd.Series(True, index=df.index)
@@ -1227,8 +1734,13 @@ def _params_from_best_csv(
     ):
         if column in df.columns:
             mask &= df[column].astype(str) == str(value)
+    if fold_id is not None and "fold_id" in df.columns:
+        mask &= pd.to_numeric(df["fold_id"], errors="coerce") == int(fold_id)
+    if heldout_group_id is not None and "heldout_group_id" in df.columns:
+        mask &= df["heldout_group_id"].astype(str) == str(heldout_group_id)
     if mask.any():
-        row = df.loc[mask].iloc[0]
+        candidates = df.loc[mask].copy()
+        row = _select_best_param_row_for_redraw(candidates, fold_id, heldout_group_id)
     elif not df.empty:
         row = df.iloc[0]
     else:
@@ -1250,6 +1762,37 @@ def _params_from_best_csv(
             values[item.name] = str(value)
     values["adaptive_filter"] = adaptive_filter
     return ProtocolTrialParams(**values)
+
+
+def _select_best_param_row_for_redraw(
+    candidates: pd.DataFrame,
+    fold_id: int | None,
+    heldout_group_id: str | None,
+) -> pd.Series:
+    """Choose one best-param row for manual redraw, including LOGO CSVs.
+
+    中文说明：LOGO 的 best_params CSV 每个 fold 一行；若用户未指定 fold_id 或
+    heldout_group_id，则默认选择该 mode 下 test 指标最优的一行并打印提示。
+    """
+
+    if len(candidates) <= 1:
+        return candidates.iloc[0]
+    objective = str(candidates.get("objective_mode", pd.Series(["aae"])).iloc[0]).lower()
+    if objective == "accuracy" and "test_accuracy_pct" in candidates.columns:
+        score = pd.to_numeric(candidates["test_accuracy_pct"], errors="coerce")
+        idx = score.idxmax() if score.notna().any() else candidates.index[0]
+    elif "test_aae_bpm" in candidates.columns:
+        score = pd.to_numeric(candidates["test_aae_bpm"], errors="coerce")
+        idx = score.idxmin() if score.notna().any() else candidates.index[0]
+    else:
+        idx = candidates.index[0]
+    row = candidates.loc[idx]
+    if fold_id is None and heldout_group_id is None and "fold_id" in candidates.columns:
+        print(
+            "[redraw] best_params CSV 含多行 LOGO fold；未指定 fold_id/heldout_group_id，"
+            f"默认使用 fold_id={row.get('fold_id', '')}, heldout_group_id={row.get('heldout_group_id', '')}。"
+        )
+    return row
 
 
 def _global_combined_hr(
@@ -1319,6 +1862,37 @@ def _empty_metrics(split_name: str) -> dict[str, Any]:
         "baseline_acc_pct": float("nan"),
         "adaptive_acc_pct": float("nan"),
         "num_windows": 0,
+    }
+
+
+def _failed_metrics(split_name: str, reason: str) -> dict[str, Any]:
+    return {
+        "split": split_name,
+        "success": False,
+        "reason": str(reason),
+        "baseline_aae_bpm": float("nan"),
+        "adaptive_aae_bpm": float("nan"),
+        "baseline_acc_pct": float("nan"),
+        "adaptive_acc_pct": float("nan"),
+        "num_windows": 0,
+    }
+
+
+def _metrics_from_arrays_with_status(
+    arrays: MetricArrays,
+    split_name: str,
+    failures: list[str],
+) -> dict[str, Any]:
+    """Aggregate concatenated arrays and attach split success/reason fields."""
+
+    if not arrays or arrays.get("ref_hr_bpm", np.asarray([], dtype=float)).size == 0:
+        reason = "; ".join([x for x in failures if x]) or "no successful runs"
+        return _failed_metrics(split_name, reason)
+    metrics = aggregate_metric_arrays(arrays, split_name=split_name)
+    return {
+        **metrics,
+        "success": len([x for x in failures if x]) == 0,
+        "reason": "; ".join([x for x in failures[:3] if x]),
     }
 
 

@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 
 from .envelope_delay import ChannelDelay
+from .tap_matrix import build_noncausal_tap_matrix
 
 __all__ = ["LmsDesign", "map_delay_to_lms_params", "noncausal_lms_filter"]
 
@@ -110,16 +111,17 @@ def noncausal_lms_filter(
 
     M = max(1, int(M))
     K = max(0, int(K))
-    span = M + K
     out = d_arr.copy()
-    if n - K < M:
+    X, valid_indices = build_noncausal_tap_matrix(u_arr, M, K)
+    if valid_indices.size == 0:
         return out
 
+    span = X.shape[1]
     w = np.zeros(span, dtype=float)
     mu = float(mu)
     eps = 1e-9
-    for idx in range(M - 1, n - K):
-        uvec = u_arr[idx - M + 1 : idx + K + 1][::-1]
+    # 中文注释：tap 矩阵已一次性构造；权重更新仍按时间递推，保持 NLMS 语义不变。
+    for idx, uvec in zip(valid_indices, X, strict=True):
         y = float(np.dot(w, uvec))
         err = float(d_arr[idx] - y)
         out[idx] = err

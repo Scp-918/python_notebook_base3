@@ -45,6 +45,7 @@ class DelayEstimate:
     by_channel: dict[str, ChannelDelay]
     order_by_type: dict[str, list[str]]
     primary_by_type: dict[str, str | None]
+    mode: str = "envelope"
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly representation."""
@@ -53,6 +54,7 @@ class DelayEstimate:
             "by_channel": {k: v.to_dict() for k, v in self.by_channel.items()},
             "order_by_type": self.order_by_type,
             "primary_by_type": self.primary_by_type,
+            "mode": self.mode,
         }
 
 
@@ -61,19 +63,31 @@ def estimate_envelope_delays(
     Fmove: float,
     Kstop: float,
     fs: int,
+    mode: str = "envelope",
 ) -> DelayEstimate:
-    """Estimate channel delays by envelope correlation against ``ppg_green``.
+    """Estimate channel delays by envelope or direct correlation against PPG.
 
     Positive ``D_opt_samples`` means the compensation channel leads PPG and can
     be used causally. Negative values imply a non-causal forward-tap design.
+
+    中文说明：``mode='envelope'`` 完全保留旧逻辑：Hilbert 包络、低通后做 Pearson
+    相关搜索；``mode='direct'`` 直接对窗口内已带通/归一化的原始波形做 z-score 和
+    Pearson 相关搜索，不计算包络，也不额外低通。
     """
 
     if "ppg_green" not in window_signals:
         raise KeyError("window_signals must include ppg_green")
     fs = int(fs)
+    mode = str(mode).lower()
+    if mode not in {"envelope", "direct"}:
+        raise ValueError("delay_estimation mode must be 'envelope' or 'direct'")
     cutoff = float(np.clip(float(Kstop) * float(Fmove), 0.05, 0.45 * fs))
-    # 中文注释：包络低通截止频率由 Kstop * Fmove 决定，并限制在滤波器稳定范围内。
-    ppg_env = _envelope(window_signals["ppg_green"], fs, cutoff)
+    if mode == "envelope":
+        # 中文注释：包络低通截止频率由 Kstop * Fmove 决定，并限制在滤波器稳定范围内。
+        ppg_ref = _envelope(window_signals["ppg_green"], fs, cutoff)
+    else:
+        # 中文注释：direct 模式直接比较原始波形形状，只做有限值修复和 z-score。
+        ppg_ref = _direct_signal(window_signals["ppg_green"])
     max_lag = int(round(0.5 * fs))
 
     by_channel: dict[str, ChannelDelay] = {}
@@ -86,8 +100,12 @@ def estimate_envelope_delays(
             if channel not in window_signals:
                 continue
             # 中文注释：每一路独立搜索最优延迟，最后按相关性强弱排序。
-            comp_env = _envelope(window_signals[channel], fs, cutoff)
-            delay, corr = _best_delay(ppg_env, comp_env, max_lag)
+            comp_ref = (
+                _envelope(window_signals[channel], fs, cutoff)
+                if mode == "envelope"
+                else _direct_signal(window_signals[channel])
+            )
+            delay, corr = _best_delay(ppg_ref, comp_ref, max_lag)
             item = ChannelDelay(
                 channel=channel,
                 sensor_type=sensor_type,
@@ -106,6 +124,7 @@ def estimate_envelope_delays(
         by_channel=by_channel,
         order_by_type=order_by_type,
         primary_by_type=primary_by_type,
+        mode=mode,
     )
 
 
@@ -125,6 +144,20 @@ def _envelope(x: np.ndarray, fs: int, cutoff: float) -> np.ndarray:
     except ValueError:
         pass
     return _zscore(env)
+
+
+def _direct_signal(x: np.ndarray) -> np.ndarray:
+    """Return the direct-correlation signal used by ``mode='direct'``.
+
+    中文说明：调用方传入的窗口已经按协议完成带通和 min-max 归一化，这里只负责
+    修复 NaN/inf 并统一成 z-score，保证与包络模式使用同一 Pearson 搜索函数。
+    """
+
+    sig = np.asarray(x, dtype=float).copy()
+    if sig.size == 0:
+        return sig
+    sig[~np.isfinite(sig)] = 0.0
+    return _zscore(sig)
 
 
 def _best_delay(ppg_env: np.ndarray, comp_env: np.ndarray, max_lag: int) -> tuple[int, float]:

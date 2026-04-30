@@ -48,6 +48,8 @@ class ProtocolTrialParams:
     LMS_Mu_Min: float = 1e-6
     adaptive_filter: str = "lms"
     objective_mode: str = "aae"
+    # 中文说明：默认保留旧的 Hilbert 包络时延估计；Notebook/脚本可显式改成 direct。
+    delay_estimation_mode: str = "envelope"
     alpha_u: float = 0.1
     M2: int = 3
     rff_D: int = 100

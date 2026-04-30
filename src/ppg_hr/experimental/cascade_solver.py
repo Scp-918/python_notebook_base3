@@ -8,7 +8,8 @@ Fmove、逐窗归一化、包络时延、级联自适应滤波、频谱惩罚提
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -30,11 +31,16 @@ from .segmentation import SegmentInfo, detect_activity_segments
 from .volterra import noncausal_volterra_filter
 
 __all__ = [
+    "MetricArrays",
     "ProtocolRunResult",
+    "aggregate_metric_arrays",
+    "clear_trial_caches",
     "extract_hr_with_penalty",
     "extract_plain_fft_hr",
     "run_protocol_trial",
 ]
+
+MetricArrays = dict[str, np.ndarray]
 
 
 @dataclass
@@ -56,6 +62,7 @@ class ProtocolRunResult:
     segment_info: SegmentInfo | None
     alignment_info: AlignmentInfo | None
     motion_frequency: float | None
+    metric_arrays: MetricArrays = field(default_factory=dict)
 
 
 @dataclass
@@ -68,6 +75,30 @@ class _TrialBase:
     aligned: AlignedDataset | None
     motion_frequency: float | None
     failure_reason: str = ""
+    norm_window_cache: dict[str, Any] = field(default_factory=dict)
+    delay_estimate_cache: dict[tuple[Any, ...], DelayEstimate] = field(default_factory=dict)
+    spectral_cache: dict[tuple[Any, ...], tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+
+
+@dataclass
+class _NormalisedWindowCache:
+    """Compact normalized-window cache for one sample/Fs_Target/TW base."""
+
+    norm_by_channel: dict[str, np.ndarray]
+    window_idx: np.ndarray
+    start_s: np.ndarray
+    center_s: np.ndarray
+    segment_label: np.ndarray
+    ref_hr_bpm: np.ndarray
+    win_len: int
+
+
+@dataclass
+class _WindowRunPayload:
+    """Window-loop output in either light or full collection mode."""
+
+    frame: pd.DataFrame
+    metric_arrays: MetricArrays
 
 
 def run_protocol_trial(
@@ -75,11 +106,17 @@ def run_protocol_trial(
     cascade_scheme: CascadeScheme | str,
     target_scope: TargetScope | str,
     params: ProtocolTrialParams,
+    collect_frame: bool = True,
+    collect_stages: bool = True,
 ) -> ProtocolRunResult:
     """Run one concrete protocol trial and return AAE/accuracy metrics.
 
     中文说明：自适应滤波权重只在单个窗口内在线更新，不跨窗口、不跨文件保存。
     因此这里的“训练”本质是评估一组超参数，而不是拟合持久模型。
+
+    ``collect_frame=False`` 是 Optuna trial 阶段使用的轻量路径：不构造完整
+    DataFrame，也不序列化 stage JSON；但仍保留统一的 metric_arrays，因此 AAE
+    和 accuracy 与 full 模式共用同一套计算逻辑。
     """
 
     scheme = CascadeScheme(cascade_scheme)
@@ -94,8 +131,17 @@ def run_protocol_trial(
         if base.aligned is None or base.motion_frequency is None:
             return _failed(scope, scheme, params, "cached trial base is incomplete", base.segment_info)
 
-        frame = _run_windows(base.aligned, scheme, scope, params, base.motion_frequency)
-        if frame.empty:
+        payload = _run_windows(
+            base,
+            scheme,
+            scope,
+            params,
+            base.motion_frequency,
+            collect_frame=bool(collect_frame),
+            collect_stages=bool(collect_stages),
+        )
+        arrays = payload.metric_arrays
+        if arrays.get("ref_hr_bpm", np.asarray([], dtype=float)).size == 0:
             return _failed(
                 scope,
                 scheme,
@@ -106,9 +152,9 @@ def run_protocol_trial(
             )
 
         filtered_mask = _filtered_segment_mask(
-            frame["segment_label"].to_numpy(dtype=str),
+            arrays["segment_label"].astype(str),
             scope,
-            frame["time_s"].to_numpy(dtype=float),
+            arrays["time_s"].astype(float),
             base.aligned.segment_info,
         )
         if not filtered_mask.any():
@@ -121,30 +167,37 @@ def run_protocol_trial(
                 base.aligned.alignment_info,
             )
 
-        frame["is_filtered_segment"] = filtered_mask
-        adaptive = frame["adaptive_hr_bpm"].to_numpy(dtype=float)
+        adaptive = arrays["adaptive_hr_bpm"].astype(float, copy=True)
         adaptive[filtered_mask] = smoothdata_movmedian(
             adaptive[filtered_mask],
             int(params.smooth_win_len),
         )
-        frame["adaptive_hr_bpm"] = adaptive
-        frame["baseline_abs_err_bpm"] = np.abs(
-            frame["baseline_ppg_hr_bpm"].to_numpy(dtype=float)
-            - frame["ref_hr_bpm"].to_numpy(dtype=float)
-        )
-        frame["adaptive_abs_err_bpm"] = np.abs(
-            frame["adaptive_hr_bpm"].to_numpy(dtype=float)
-            - frame["ref_hr_bpm"].to_numpy(dtype=float)
-        )
+        baseline_abs_err = np.abs(arrays["baseline_hr_bpm"].astype(float) - arrays["ref_hr_bpm"].astype(float))
+        adaptive_abs_err = np.abs(adaptive - arrays["ref_hr_bpm"].astype(float))
+        metric_arrays: MetricArrays = {
+            **arrays,
+            "adaptive_hr_bpm": adaptive,
+            "baseline_abs_err_bpm": baseline_abs_err,
+            "adaptive_abs_err_bpm": adaptive_abs_err,
+            "filtered_mask": filtered_mask,
+        }
 
-        baseline_aae = _mean(frame.loc[filtered_mask, "baseline_abs_err_bpm"].to_numpy(dtype=float))
-        adaptive_aae = _mean(frame.loc[filtered_mask, "adaptive_abs_err_bpm"].to_numpy(dtype=float))
-        baseline_acc = _accuracy(frame.loc[filtered_mask, "baseline_abs_err_bpm"].to_numpy(dtype=float))
-        adaptive_acc = _accuracy(frame.loc[filtered_mask, "adaptive_abs_err_bpm"].to_numpy(dtype=float))
-        frame["baseline_aae_bpm"] = baseline_aae
-        frame["baseline_acc_pct"] = baseline_acc
-        frame["adaptive_aae_bpm"] = adaptive_aae
-        frame["adaptive_acc_pct"] = adaptive_acc
+        metrics = aggregate_metric_arrays(metric_arrays, split_name="")
+        baseline_aae = float(metrics["baseline_aae_bpm"])
+        adaptive_aae = float(metrics["adaptive_aae_bpm"])
+        baseline_acc = float(metrics["baseline_acc_pct"])
+        adaptive_acc = float(metrics["adaptive_acc_pct"])
+
+        frame = payload.frame
+        if collect_frame:
+            frame["is_filtered_segment"] = filtered_mask
+            frame["adaptive_hr_bpm"] = adaptive
+            frame["baseline_abs_err_bpm"] = baseline_abs_err
+            frame["adaptive_abs_err_bpm"] = adaptive_abs_err
+            frame["baseline_aae_bpm"] = baseline_aae
+            frame["baseline_acc_pct"] = baseline_acc
+            frame["adaptive_aae_bpm"] = adaptive_aae
+            frame["adaptive_acc_pct"] = adaptive_acc
 
         return ProtocolRunResult(
             success=True,
@@ -162,6 +215,7 @@ def run_protocol_trial(
             segment_info=base.aligned.segment_info,
             alignment_info=base.aligned.alignment_info,
             motion_frequency=base.motion_frequency,
+            metric_arrays=metric_arrays,
         )
     except Exception as exc:
         return ProtocolRunResult(
@@ -180,6 +234,7 @@ def run_protocol_trial(
             segment_info=None,
             alignment_info=None,
             motion_frequency=None,
+            metric_arrays={},
         )
 
 
@@ -198,7 +253,10 @@ def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _T
         cache = {}
         setattr(dataset, "_trial_base_cache", cache)
     if key in cache:
-        return cache[key]
+        # 中文注释：小型 LRU，避免 Notebook 长时间运行后保留过多 Fs/TW 大数组。
+        base = cache.pop(key)
+        cache[key] = base
+        return base
 
     ds = resample_protocol_dataset(dataset, fs_target)
     fs = int(ds.fs)
@@ -212,7 +270,7 @@ def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _T
             motion_frequency=None,
             failure_reason=f"segmentation failed: {segment.reason}",
         )
-        cache[key] = base
+        _store_trial_base(cache, key, base)
         return base
 
     try:
@@ -226,7 +284,7 @@ def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _T
             motion_frequency=None,
             failure_reason=f"alignment failed: {exc}",
         )
-        cache[key] = base
+        _store_trial_base(cache, key, base)
         return base
 
     if aligned.ref_hr_bpm.size == 0:
@@ -238,7 +296,7 @@ def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _T
             motion_frequency=None,
             failure_reason="alignment produced zero windows",
         )
-        cache[key] = base
+        _store_trial_base(cache, key, base)
         return base
 
     fmove = estimate_motion_frequency(ds.accx, ds.accy, ds.accz, aligned.segment_info, fs)
@@ -249,8 +307,32 @@ def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _T
         aligned=aligned,
         motion_frequency=fmove,
     )
-    cache[key] = base
+    _store_trial_base(cache, key, base)
     return base
+
+
+def _store_trial_base(cache: dict[Any, _TrialBase], key: Any, base: _TrialBase) -> None:
+    """Store one TrialBase with a tiny insertion-ordered LRU cap.
+
+    中文说明：每个 TrialBase 可能持有归一化窗口大数组；当前默认搜索空间通常是
+    3 个 Fs_Target × 3 个 TW，因此保留最近 9 个组合，兼顾复用率和内存上限。
+    """
+
+    cache[key] = base
+    while len(cache) > 9:
+        cache.pop(next(iter(cache)))
+
+
+def clear_trial_caches(dataset: ProtocolDataset) -> None:
+    """Clear per-dataset TrialBase caches created by this module.
+
+    中文说明：LOGO 每个 fold 完成后会调用它释放归一化窗口、频谱和 delay estimate
+    小缓存，避免长时间 Notebook 运行时内存随 trial/fold 持续增长。
+    """
+
+    cache = getattr(dataset, "_trial_base_cache", None)
+    if isinstance(cache, dict):
+        cache.clear()
 
 
 def extract_hr_with_penalty(
@@ -259,6 +341,7 @@ def extract_hr_with_penalty(
     previous_hr: float | None,
     params: ProtocolTrialParams,
     fs: int,
+    precomputed_spectrum: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> float:
     """Extract HR in BPM with motion-frequency spectral penalties and slew limits."""
 
@@ -269,6 +352,7 @@ def extract_hr_with_penalty(
         params,
         enable_penalty=True,
         penalty_ref=penalty_ref,
+        precomputed_spectrum=precomputed_spectrum,
     )
 
 
@@ -277,49 +361,81 @@ def extract_plain_fft_hr(
     previous_hr: float | None,
     params: ProtocolTrialParams,
     fs: int,
+    precomputed_spectrum: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> float:
     """Extract baseline HR from PPG Green without adaptive filtering or penalty."""
 
-    return _extract_hr(ppg, fs, previous_hr, params, enable_penalty=False, penalty_ref=None)
+    return _extract_hr(
+        ppg,
+        fs,
+        previous_hr,
+        params,
+        enable_penalty=False,
+        penalty_ref=None,
+        precomputed_spectrum=precomputed_spectrum,
+    )
 
 
 def _run_windows(
-    aligned: AlignedDataset,
+    base: _TrialBase,
     scheme: CascadeScheme,
     scope: TargetScope,
     params: ProtocolTrialParams,
     fmove: float,
-) -> pd.DataFrame:
-    """Run baseline and adaptive HR extraction for every aligned window."""
+    *,
+    collect_frame: bool,
+    collect_stages: bool,
+) -> _WindowRunPayload:
+    """Run baseline/adaptive HR extraction with optional frame/stage collection."""
 
+    if base.aligned is None:
+        return _WindowRunPayload(pd.DataFrame(), {})
+
+    aligned = base.aligned
     ds = aligned.dataset
     fs = int(ds.fs)
-    win_len = int(round(float(params.TW) * fs))
-    channels = ds.channels()
+    norm_cache = _get_normalised_window_cache(base, params)
 
     rows: list[dict[str, Any]] = []
+    window_idx_out: list[int] = []
+    time_out: list[float] = []
+    labels_out: list[str] = []
+    ref_out: list[float] = []
+    baseline_out: list[float] = []
+    adaptive_out: list[float] = []
     prev_baseline: float | None = None
     prev_adaptive: float | None = None
-    for window_idx, (start_s, center_s, label, ref_hr) in enumerate(
-        zip(
-            aligned.window_starts_s,
-            aligned.window_centers_s,
-            aligned.segment_labels,
-            aligned.ref_hr_bpm,
-            strict=True,
+    for row_idx, window_idx in enumerate(norm_cache.window_idx):
+        center_s = float(norm_cache.center_s[row_idx])
+        label = str(norm_cache.segment_label[row_idx])
+        ref_hr = float(norm_cache.ref_hr_bpm[row_idx])
+        norm = {name: values[row_idx] for name, values in norm_cache.norm_by_channel.items()}
+
+        spec_key = ("baseline_ppg", int(window_idx))
+        baseline_spectrum = base.spectral_cache.get(spec_key)
+        if baseline_spectrum is None:
+            baseline_spectrum = _spectrum(norm["ppg_green"], fs)
+            base.spectral_cache[spec_key] = baseline_spectrum
+        baseline_hr = extract_plain_fft_hr(
+            norm["ppg_green"],
+            prev_baseline,
+            params,
+            fs,
+            precomputed_spectrum=baseline_spectrum,
         )
-    ):
-        start = int(round(float(start_s) * fs))
-        end = start + win_len
-        if end > len(ds.time_s):
-            break
-        window = {name: values[start:end] for name, values in channels.items()}
-        norm = _normalise_window(window)
-        baseline_hr = extract_plain_fft_hr(norm["ppg_green"], prev_baseline, params, fs)
         prev_baseline = baseline_hr if np.isfinite(baseline_hr) else prev_baseline
 
         if _window_in_scope(str(label), scope, float(center_s), aligned.segment_info):
-            filtered, penalty_ref, adaptive_stages = _cascade_filter_window(norm, scheme, params, fmove, fs)
+            filtered, penalty_ref, adaptive_stages = _cascade_filter_window(
+                norm,
+                scheme,
+                params,
+                fmove,
+                fs,
+                delay_cache=base.delay_estimate_cache,
+                window_idx=int(window_idx),
+                collect_stages=collect_stages,
+            )
             adaptive_hr = extract_hr_with_penalty(filtered, penalty_ref, prev_adaptive, params, fs)
         else:
             adaptive_hr = baseline_hr
@@ -327,25 +443,101 @@ def _run_windows(
 
         if np.isfinite(adaptive_hr):
             prev_adaptive = adaptive_hr
-        stages_json = json.dumps(adaptive_stages, ensure_ascii=False)
-        rows.append(
-            {
-                "sample": ds.sample_stem,
-                "group_id": ds.sample_stem.removeprefix("multi_"),
-                "target_scope": scope.value,
-                "cascade_scheme": scheme.value,
-                "adaptive_filter": str(getattr(params, "adaptive_filter", "lms")),
-                "window_idx": window_idx,
-                "time_s": float(center_s),
-                "segment_label": str(label),
-                "ref_hr_bpm": float(ref_hr),
-                "baseline_ppg_hr_bpm": float(baseline_hr),
-                "adaptive_hr_bpm": float(adaptive_hr),
-                "adaptive_stages_json": stages_json,
-                "lms_stages_json": stages_json,
-            }
+
+        window_idx_out.append(int(window_idx))
+        time_out.append(float(center_s))
+        labels_out.append(str(label))
+        ref_out.append(float(ref_hr))
+        baseline_out.append(float(baseline_hr))
+        adaptive_out.append(float(adaptive_hr))
+
+        if collect_frame:
+            stages_json = json.dumps(adaptive_stages, ensure_ascii=False) if collect_stages else "[]"
+            rows.append(
+                {
+                    "sample": ds.sample_stem,
+                    "group_id": ds.sample_stem.removeprefix("multi_"),
+                    "target_scope": scope.value,
+                    "cascade_scheme": scheme.value,
+                    "adaptive_filter": str(getattr(params, "adaptive_filter", "lms")),
+                    "window_idx": int(window_idx),
+                    "time_s": float(center_s),
+                    "segment_label": str(label),
+                    "ref_hr_bpm": float(ref_hr),
+                    "baseline_ppg_hr_bpm": float(baseline_hr),
+                    "adaptive_hr_bpm": float(adaptive_hr),
+                    "adaptive_stages_json": stages_json,
+                    "lms_stages_json": stages_json,
+                }
+            )
+
+    metric_arrays: MetricArrays = {
+        "window_idx": np.asarray(window_idx_out, dtype=int),
+        "time_s": np.asarray(time_out, dtype=float),
+        "segment_label": np.asarray(labels_out, dtype=object),
+        "ref_hr_bpm": np.asarray(ref_out, dtype=float),
+        "baseline_hr_bpm": np.asarray(baseline_out, dtype=float),
+        "adaptive_hr_bpm": np.asarray(adaptive_out, dtype=float),
+    }
+    return _WindowRunPayload(pd.DataFrame(rows) if collect_frame else pd.DataFrame(), metric_arrays)
+
+
+def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) -> _NormalisedWindowCache:
+    """Return compact per-window min-max normalized arrays for one TrialBase.
+
+    中文说明：这个缓存只依赖样本、Fs_Target、TW 和对齐后的窗口边界；不依赖级联
+    方案、滤波器类型或 Optuna 超参数，因此可以在同一 TrialBase 下安全复用。
+    """
+
+    key = "normalised_protocol_windows_v1"
+    cached = base.norm_window_cache.get(key)
+    if isinstance(cached, _NormalisedWindowCache):
+        return cached
+    if base.aligned is None:
+        empty = _NormalisedWindowCache(
+            norm_by_channel={name: np.empty((0, 0), dtype=np.float32) for name in PROTOCOL_CHANNELS},
+            window_idx=np.empty(0, dtype=int),
+            start_s=np.empty(0, dtype=float),
+            center_s=np.empty(0, dtype=float),
+            segment_label=np.empty(0, dtype=object),
+            ref_hr_bpm=np.empty(0, dtype=float),
+            win_len=0,
         )
-    return pd.DataFrame(rows)
+        base.norm_window_cache[key] = empty
+        return empty
+
+    aligned = base.aligned
+    ds = aligned.dataset
+    fs = int(ds.fs)
+    win_len = int(round(float(params.TW) * fs))
+    starts = np.rint(aligned.window_starts_s.astype(float) * fs).astype(int)
+    valid = starts + win_len <= len(ds.time_s)
+    valid_idx = np.flatnonzero(valid)
+    starts = starts[valid]
+    channels = ds.channels()
+    n_windows = int(starts.size)
+    norm_by_channel = {
+        name: np.zeros((n_windows, win_len), dtype=np.float32)
+        for name in PROTOCOL_CHANNELS
+    }
+
+    for out_idx, start in enumerate(starts):
+        end = int(start) + win_len
+        for name in PROTOCOL_CHANNELS:
+            arr = np.asarray(channels[name][start:end], dtype=float)
+            norm_by_channel[name][out_idx] = _normalise_array(arr).astype(np.float32, copy=False)
+
+    cache = _NormalisedWindowCache(
+        norm_by_channel=norm_by_channel,
+        window_idx=valid_idx.astype(int),
+        start_s=aligned.window_starts_s[valid].astype(float),
+        center_s=aligned.window_centers_s[valid].astype(float),
+        segment_label=aligned.segment_labels[valid].astype(object),
+        ref_hr_bpm=aligned.ref_hr_bpm[valid].astype(float),
+        win_len=win_len,
+    )
+    base.norm_window_cache[key] = cache
+    return cache
 
 
 def _cascade_filter_window(
@@ -354,10 +546,32 @@ def _cascade_filter_window(
     params: ProtocolTrialParams,
     fmove: float,
     fs: int,
+    *,
+    delay_cache: dict[tuple[Any, ...], DelayEstimate] | None = None,
+    window_idx: int | None = None,
+    collect_stages: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
     """Run the configured adaptive-filter cascade on one normalized window."""
 
-    delay_est = estimate_envelope_delays(window, fmove, params.Kstop, fs)
+    delay_mode = str(getattr(params, "delay_estimation_mode", "envelope"))
+    delay_key = (
+        int(window_idx) if window_idx is not None else -1,
+        round(float(params.Kstop), 8),
+        round(float(fmove), 8),
+        delay_mode,
+    )
+    delay_est = delay_cache.get(delay_key) if delay_cache is not None else None
+    if delay_est is None:
+        delay_est = estimate_envelope_delays(
+            window,
+            fmove,
+            params.Kstop,
+            fs,
+            mode=delay_mode,
+        )
+        if delay_cache is not None:
+            # 中文注释：只缓存 DelayEstimate 小对象，不保存包络/相关数组，避免内存放大。
+            delay_cache[delay_key] = delay_est
     current = np.asarray(window["ppg_green"], dtype=float)
     stages: list[dict[str, Any]] = []
     for sensor_type, max_count in _scheme_plan(scheme):
@@ -414,24 +628,26 @@ def _cascade_filter_window(
             else:
                 raise ValueError(f"Unsupported adaptive_filter: {filter_type}")
 
-            stages.append(
-                {
-                    "sensor_type": sensor_type,
-                    "channel": channel,
-                    "selected_channel": channel,
-                    "D_opt_samples": int(delay.D_opt_samples),
-                    "D_opt_seconds": float(delay.D_opt_seconds),
-                    "R_max": float(delay.R_max),
-                    "abs_corr": float(abs(delay.R_max)),
-                    "curr_corr": float(design.curr_corr),
-                    "M": int(design.M),
-                    "K": int(design.K),
-                    "mu": float(design.u),
-                    "filter_type": filter_type,
-                    "mode": design.mode,
-                    **stage_extra,
-                }
-            )
+            if collect_stages:
+                stages.append(
+                    {
+                        "sensor_type": sensor_type,
+                        "channel": channel,
+                        "selected_channel": channel,
+                        "D_opt_samples": int(delay.D_opt_samples),
+                        "D_opt_seconds": float(delay.D_opt_seconds),
+                        "R_max": float(delay.R_max),
+                        "abs_corr": float(abs(delay.R_max)),
+                        "curr_corr": float(design.curr_corr),
+                        "M": int(design.M),
+                        "K": int(design.K),
+                        "mu": float(design.u),
+                        "filter_type": filter_type,
+                        "mode": design.mode,
+                        "delay_estimation_mode": delay_mode,
+                        **stage_extra,
+                    }
+                )
     return current, _penalty_reference(window, delay_est, scheme), stages
 
 
@@ -483,10 +699,11 @@ def _extract_hr(
     *,
     enable_penalty: bool,
     penalty_ref: np.ndarray | None,
+    precomputed_spectrum: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> float:
     """Extract HR using Hamming FFT, optional spectral penalty, and slew limit."""
 
-    freq, amp = _spectrum(signal, fs)
+    freq, amp = precomputed_spectrum if precomputed_spectrum is not None else _spectrum(signal, fs)
     band = (freq >= 0.5) & (freq <= 4.0)
     if not band.any():
         return float(previous_hr) if previous_hr is not None else float("nan")
@@ -538,11 +755,36 @@ def _spectrum(signal: np.ndarray, fs: int) -> tuple[np.ndarray, np.ndarray]:
     if sig.size == 0:
         return np.asarray([], dtype=float), np.asarray([], dtype=float)
     sig = sig - float(np.mean(sig))
-    sig = sig * hamming(sig.size, sym=False)
+    sig = sig * _cached_hamming(sig.size)
     nfft = max(8192, 1 << int(np.ceil(np.log2(max(sig.size, 1)))))
-    freq = np.fft.rfftfreq(nfft, d=1.0 / fs)
+    freq = _cached_rfftfreq(int(fs), int(nfft))
     amp = np.abs(np.fft.rfft(sig, n=nfft))
     return freq, amp
+
+
+@lru_cache(maxsize=32)
+def _cached_hamming(signal_len: int) -> np.ndarray:
+    """Return a cached read-only Hamming window.
+
+    中文说明：FFT HR 提取会反复使用同长度 Hamming 窗，缓存只读数组可以减少
+    小对象分配，调用方不得原地修改。
+    """
+
+    win = hamming(int(signal_len), sym=False)
+    win.setflags(write=False)
+    return win
+
+
+@lru_cache(maxsize=32)
+def _cached_rfftfreq(fs: int, nfft: int) -> np.ndarray:
+    """Return a cached read-only FFT frequency axis.
+
+    中文说明：频率轴只由采样率和 nfft 决定，适合小型 LRU 缓存复用。
+    """
+
+    freq = np.fft.rfftfreq(int(nfft), d=1.0 / int(fs))
+    freq.setflags(write=False)
+    return freq
 
 
 def _dominant_frequency(signal: np.ndarray, fs: int, low_hz: float, high_hz: float) -> float:
@@ -566,22 +808,24 @@ def _normalise_window(window: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
 
     out: dict[str, np.ndarray] = {}
     for name in PROTOCOL_CHANNELS:
-        arr = np.asarray(window[name], dtype=float)
-        arr = arr.copy()
-        arr[~np.isfinite(arr)] = np.nan
-        finite = np.isfinite(arr)
-        if not finite.any():
-            out[name] = np.zeros_like(arr, dtype=float)
-            continue
-        mn = float(np.nanmin(arr))
-        mx = float(np.nanmax(arr))
-        if mx - mn <= 1e-12:
-            out[name] = np.zeros_like(arr, dtype=float)
-        else:
-            filled = arr.copy()
-            filled[~finite] = mn
-            out[name] = (filled - mn) / (mx - mn)
+        out[name] = _normalise_array(window[name])
     return out
+
+
+def _normalise_array(values: np.ndarray) -> np.ndarray:
+    """Min-max normalize one window and return a finite float array."""
+
+    arr = np.asarray(values, dtype=float).copy()
+    arr[~np.isfinite(arr)] = np.nan
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return np.zeros_like(arr, dtype=float)
+    mn = float(np.nanmin(arr))
+    mx = float(np.nanmax(arr))
+    if mx - mn <= 1e-12:
+        return np.zeros_like(arr, dtype=float)
+    arr[~finite] = mn
+    return (arr - mn) / (mx - mn)
 
 
 def _label_in_scope(label: str, scope: TargetScope) -> bool:
@@ -632,6 +876,46 @@ def _filtered_segment_mask(
     )
 
 
+def aggregate_metric_arrays(metric_arrays: MetricArrays, split_name: str = "") -> dict[str, Any]:
+    """Aggregate baseline/adaptive metrics from compact window arrays.
+
+    中文说明：full DataFrame 和 light objective 都先生成同一组 ``metric_arrays``，
+    再用本函数统一计算 AAE/accuracy；LOGO 汇总也会拼接 held-out 窗口后调用这里，
+    因此不会退化成 fold 均值。
+    """
+
+    ref = np.asarray(metric_arrays.get("ref_hr_bpm", []), dtype=float)
+    if ref.size == 0:
+        return {
+            "split": split_name,
+            "baseline_aae_bpm": float("nan"),
+            "adaptive_aae_bpm": float("nan"),
+            "baseline_acc_pct": float("nan"),
+            "adaptive_acc_pct": float("nan"),
+            "num_windows": 0,
+        }
+    mask = np.asarray(metric_arrays.get("filtered_mask", np.ones(ref.size, dtype=bool)), dtype=bool)
+    baseline_err = metric_arrays.get("baseline_abs_err_bpm")
+    adaptive_err = metric_arrays.get("adaptive_abs_err_bpm")
+    if baseline_err is None:
+        baseline_err = np.abs(np.asarray(metric_arrays["baseline_hr_bpm"], dtype=float) - ref)
+    if adaptive_err is None:
+        adaptive_err = np.abs(np.asarray(metric_arrays["adaptive_hr_bpm"], dtype=float) - ref)
+    baseline_err = np.asarray(baseline_err, dtype=float)
+    adaptive_err = np.asarray(adaptive_err, dtype=float)
+    mask = mask[: min(mask.size, baseline_err.size, adaptive_err.size)]
+    baseline_target = baseline_err[: mask.size][mask]
+    adaptive_target = adaptive_err[: mask.size][mask]
+    return {
+        "split": split_name,
+        "baseline_aae_bpm": _mean(baseline_target),
+        "adaptive_aae_bpm": _mean(adaptive_target),
+        "baseline_acc_pct": _accuracy(baseline_target),
+        "adaptive_acc_pct": _accuracy(adaptive_target),
+        "num_windows": int(np.isfinite(adaptive_target).sum()),
+    }
+
+
 def _mean(values: np.ndarray) -> float:
     arr = np.asarray(values, dtype=float)
     arr = arr[np.isfinite(arr)]
@@ -674,4 +958,5 @@ def _failed(
         segment_info=segment_info,
         alignment_info=alignment_info,
         motion_frequency=None,
+        metric_arrays={},
     )

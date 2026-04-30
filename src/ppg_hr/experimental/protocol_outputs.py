@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,11 +18,13 @@ import numpy as np
 import pandas as pd
 
 from ..params import CascadeScheme, TargetScope
-from .batch_pairing import UnpairedSample
+from .alignment import align_ppg_to_ref_hr, compute_rest_alignment_diagnostic_curve
+from .batch_pairing import SamplePair, UnpairedSample
 from .preprocess_protocol import (
     PROTOCOL_CHANNELS,
     ProtocolDataset,
     load_protocol_raw_clean_frames,
+    resample_protocol_dataset,
 )
 from .protocol_optimizer import ProtocolModeResult
 from .qc import QcResult
@@ -29,6 +32,7 @@ from .segmentation import SegmentInfo
 
 __all__ = [
     "SampleOutputPaths",
+    "plot_rest_alignment_diagnostics_by_motion_type",
     "plot_signal_figures",
     "write_batch_summary",
     "write_metric_matrix_tables",
@@ -108,6 +112,91 @@ def write_qc_tables(
         ]
     ).to_csv(paths["summary"], index=False, encoding="utf-8-sig")
     return paths
+
+
+def plot_rest_alignment_diagnostics_by_motion_type(
+    pairs: list[SamplePair],
+    datasets: dict[str, ProtocolDataset],
+    output_dir: str | Path,
+    fs_target: int = 100,
+    TW: int = 10,
+) -> dict[str, Path]:
+    """Plot rest-segment alignment diagnostics grouped by motion type.
+
+    中文说明：每个运动类型输出一张 PNG；每个子图对应一组运动，显示全局 Tdelay
+    选定后静息段的参考 HR 与 PPG Green Hamming+FFT HR。该诊断只用于人工检查
+    Tdelay 合理性，不改变训练、Optuna objective 或 best_tdelay_s 搜索逻辑。
+    """
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    plt = _prepare_matplotlib(out)
+    grouped: dict[str, list[SamplePair]] = {}
+    for pair in pairs:
+        if pair.motion_id in datasets:
+            grouped.setdefault(pair.motion_type, []).append(pair)
+
+    paths: dict[str, Path] = {}
+    for motion_type, members in sorted(grouped.items()):
+        members = sorted(members, key=lambda p: (p.motion_index, p.motion_id))
+        n = max(1, len(members))
+        cols = 2 if n > 1 else 1
+        rows = int(math.ceil(n / cols))
+        fig, axes = plt.subplots(rows, cols, figsize=(6.4 * cols, 3.4 * rows), squeeze=False)
+        flat = axes.ravel()
+        for ax in flat[n:]:
+            ax.axis("off")
+        for ax, pair in zip(flat, members, strict=False):
+            ax.grid(True, alpha=0.25)
+            ax.set_xlabel("Rest window time (s)")
+            ax.set_ylabel("HR (bpm)")
+            title = pair.motion_id
+            try:
+                ds = resample_protocol_dataset(datasets[pair.motion_id], int(fs_target))
+                segment = _detect_segments_for_alignment_plot(ds, TW)
+                if not segment.is_valid:
+                    raise RuntimeError(segment.reason)
+                aligned = align_ppg_to_ref_hr(ds, segment, TW, int(fs_target))
+                curve = compute_rest_alignment_diagnostic_curve(ds, segment, aligned, TW, int(fs_target))
+                title = f"{pair.motion_id} | Tdelay={aligned.alignment_info.best_tdelay_s:.2f}s"
+                if curve.empty:
+                    ax.text(0.5, 0.5, "no comparable rest windows", ha="center", va="center", transform=ax.transAxes)
+                else:
+                    ax.plot(
+                        curve["time_s"].to_numpy(dtype=float),
+                        curve["ref_hr_bpm"].to_numpy(dtype=float),
+                        color="black",
+                        linewidth=1.5,
+                        label="Reference HR",
+                    )
+                    ax.plot(
+                        curve["time_s"].to_numpy(dtype=float),
+                        curve["ppg_hr_bpm"].to_numpy(dtype=float),
+                        color="#1f77b4",
+                        linewidth=1.2,
+                        label="PPG FFT HR",
+                    )
+                    ax.legend(loc="best", fontsize=8)
+            except Exception as exc:
+                title = f"{pair.motion_id} | Tdelay=nan"
+                ax.text(0.5, 0.5, f"alignment failed\n{exc}", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(title)
+
+        fig.suptitle(f"{motion_type} Rest alignment diagnostics, TW={int(TW)}", fontsize=14)
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
+        path = out / f"{motion_type}_rest_alignment_TW{int(TW)}.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        paths[motion_type] = path
+    return paths
+
+
+def _detect_segments_for_alignment_plot(dataset: ProtocolDataset, TW: int | float) -> SegmentInfo:
+    """Detect segments for the standalone alignment diagnostic plot."""
+
+    from .segmentation import detect_activity_segments
+
+    return detect_activity_segments(dataset.accx, dataset.accy, dataset.accz, dataset.fs, TW=TW)
 
 
 def plot_signal_figures(

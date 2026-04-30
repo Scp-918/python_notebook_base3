@@ -19,12 +19,18 @@ from threading import Lock
 from typing import Any
 
 import numpy as np
+import pandas as pd
 from scipy.signal.windows import hamming
 
 from .preprocess_protocol import ProtocolDataset
 from .segmentation import SegmentInfo
 
-__all__ = ["AlignedDataset", "AlignmentInfo", "align_ppg_to_ref_hr"]
+__all__ = [
+    "AlignedDataset",
+    "AlignmentInfo",
+    "align_ppg_to_ref_hr",
+    "compute_rest_alignment_diagnostic_curve",
+]
 
 _PRINTED_ALIGNMENT_SAMPLE_STEMS: set[str] = set()
 _PRINTED_ALIGNMENT_LOCK = Lock()
@@ -219,6 +225,63 @@ def _reference_sequence_after_half_window(
     return seq[np.isfinite(seq)]
 
 
+def compute_rest_alignment_diagnostic_curve(
+    dataset: ProtocolDataset,
+    segment_info: SegmentInfo,
+    aligned: AlignedDataset,
+    TW: float,
+    fs_target: int,
+) -> pd.DataFrame:
+    """Return comparable rest-window reference HR and PPG FFT HR curves.
+
+    中文说明：诊断曲线使用 ``aligned.alignment_info.best_tdelay_s``，并复用全局
+    Tdelay 搜索时的静息段 PPG、TW/2 参考 HR 窗口中心校正、Hamming + FFT 提取
+    方法。它只导出两条曲线的共同可比较窗口，不参与训练或重新选择 Tdelay。
+    """
+
+    delay_s = float(aligned.alignment_info.best_tdelay_s)
+    score_start_s = _REST_ALIGNMENT_SCORE_START_S
+    ppg_time_s, ppg_hr = _rest_ppg_hr_curve_for_delay(
+        dataset.ppg_green,
+        int(fs_target),
+        float(TW),
+        delay_s,
+        float(segment_info.motion_start_s),
+        score_start_s,
+    )
+    ref_time_s, ref_hr = _reference_curve_after_half_window(dataset, float(TW), score_start_s)
+    common = min(ppg_hr.size, ref_hr.size, ppg_time_s.size, ref_time_s.size)
+    if common <= 0:
+        return pd.DataFrame(columns=["time_s", "ppg_hr_bpm", "ref_hr_bpm"])
+    return pd.DataFrame(
+        {
+            "time_s": ppg_time_s[:common],
+            "ppg_hr_bpm": ppg_hr[:common],
+            "ref_hr_bpm": ref_hr[:common],
+        }
+    )
+
+
+def _reference_curve_after_half_window(
+    dataset: ProtocolDataset,
+    TW: float,
+    score_start_s: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return finite reference HR curve after the same TW/2 correction.
+
+    中文说明：这里与全局 Tdelay 搜索的参考 HR 对齐口径一致，把参考时间减去
+    ``TW/2``，使其对应 PPG FFT 窗口的起点序列。
+    """
+
+    ref_time = np.asarray(dataset.ref_time_s, dtype=float)
+    ref_hr = np.asarray(dataset.ref_hr_bpm, dtype=float)
+    mask = ref_time >= float(score_start_s) + TW / 2.0
+    time_s = ref_time[mask] - TW / 2.0
+    values = ref_hr[mask]
+    finite = np.isfinite(values)
+    return time_s[finite].astype(float), values[finite].astype(float)
+
+
 def _shift_channel_for_delay(values: np.ndarray, delay_s: float, fs: int) -> np.ndarray:
     """Shift one channel according to signed global Tdelay.
 
@@ -277,6 +340,31 @@ def _rest_ppg_hr_for_delay(
 ) -> np.ndarray:
     """Estimate rest-window PPG HR for one candidate delay."""
 
+    _, hr = _rest_ppg_hr_curve_for_delay(
+        ppg_green,
+        fs,
+        TW,
+        delay_s,
+        motion_start_s,
+        score_start_s,
+    )
+    return hr
+
+
+def _rest_ppg_hr_curve_for_delay(
+    ppg_green: np.ndarray,
+    fs: int,
+    TW: float,
+    delay_s: float,
+    motion_start_s: float,
+    score_start_s: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Estimate rest-window PPG HR and its comparable rest-window start times.
+
+    中文说明：这是 ``_rest_ppg_hr_for_delay`` 的曲线版封装，仍然调用同一个
+    Hamming + FFT HR 提取逻辑，避免诊断图和真实搜索使用两套算法。
+    """
+
     shifted = _shift_channel_for_delay(ppg_green, delay_s, fs)
     # Keep this as motion_start_s - delay_s for both signs: positive delay shifts
     # the sensor left and advances the motion boundary on the shifted axis, while
@@ -286,10 +374,12 @@ def _rest_ppg_hr_for_delay(
     max_start = min(len(shifted) - win_len, int(round((usable_rest_s - TW) * fs)))
     min_start = max(0, int(round(float(score_start_s) * fs)))
     if max_start < min_start:
-        return np.asarray([], dtype=float)
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
     starts = np.arange(min_start, max_start + 1, fs, dtype=int)
     hrs = [_window_fft_hr(shifted[s : s + win_len], fs, 0.5, 2.0) for s in starts]
-    return np.asarray([h for h in hrs if np.isfinite(h)], dtype=float)
+    hrs_arr = np.asarray(hrs, dtype=float)
+    finite = np.isfinite(hrs_arr)
+    return starts[finite].astype(float) / float(fs), hrs_arr[finite]
 
 
 def _window_fft_hr(x: np.ndarray, fs: int, low_hz: float, high_hz: float) -> float:
