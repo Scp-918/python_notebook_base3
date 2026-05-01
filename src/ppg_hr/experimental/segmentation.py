@@ -2,7 +2,7 @@
 
 中文说明：本模块只根据三轴 ACC 合模长划分静息、运动和恢复窗口。前 30 秒
 作为校准期，阈值为校准段合模长 STD 的 3 倍；再用 TW 秒窗口、1 秒步长寻找
-“连续 10 个静息窗 -> 连续 10 个运动窗”和反向转移。
+“连续 6 个静息窗 -> 连续 6 个运动窗”和反向转移。
 """
 
 from __future__ import annotations
@@ -13,6 +13,10 @@ from typing import Any
 import numpy as np
 
 __all__ = ["SegmentInfo", "detect_activity_segments"]
+
+# 中文说明：运动起止点判定需要的连续状态窗口数。旧逻辑为 10+10，
+# 当前实验要求改为 6+6，让分段对较短或较快的状态转换更敏感。
+TRANSITION_RUN_WINDOWS = 6
 
 
 @dataclass(frozen=True)
@@ -80,8 +84,9 @@ def detect_activity_segments(
     motion_threshold = 3.0 * baseline_std
 
     starts = np.arange(0, acc_mag.size - win_len + 1, fs, dtype=int)
-    if starts.size < 20:
-        return _error("fewer than 20 sliding windows")
+    min_windows = 2 * TRANSITION_RUN_WINDOWS
+    if starts.size < min_windows:
+        return _error(f"fewer than {min_windows} sliding windows")
     window_std = np.array(
         [np.std(acc_mag[s : s + win_len], ddof=1) for s in starts],
         dtype=float,
@@ -91,7 +96,7 @@ def detect_activity_segments(
     start_idx = _find_transition(motion_flags, before=False, after=True, start_at=0)
     if start_idx is None:
         return _error(
-            "cannot find 10 rest windows followed by 10 motion windows",
+            f"cannot find {TRANSITION_RUN_WINDOWS} rest windows followed by {TRANSITION_RUN_WINDOWS} motion windows",
             motion_threshold,
             starts,
             win_s,
@@ -102,7 +107,7 @@ def detect_activity_segments(
     end_idx = _find_transition(motion_flags, before=True, after=False, start_at=start_idx)
     if end_idx is None:
         return _error(
-            "cannot find 10 motion windows followed by 10 rest windows",
+            f"cannot find {TRANSITION_RUN_WINDOWS} motion windows followed by {TRANSITION_RUN_WINDOWS} rest windows",
             motion_threshold,
             starts,
             win_s,
@@ -140,11 +145,15 @@ def _find_transition(
     after: bool,
     start_at: int,
 ) -> int | None:
-    """Find the first 10-window state transition after ``start_at``."""
+    """Find the first configured consecutive-window state transition.
 
-    for i in range(max(0, int(start_at)), len(flags) - 19):
-        if np.all(flags[i : i + 10] == before) and np.all(flags[i + 10 : i + 20] == after):
-            return i + 10
+    中文说明：返回新状态开始的窗口索引，即 6 个 before 窗之后的第一个 after 窗。
+    """
+
+    run_len = TRANSITION_RUN_WINDOWS
+    for i in range(max(0, int(start_at)), len(flags) - (2 * run_len) + 1):
+        if np.all(flags[i : i + run_len] == before) and np.all(flags[i + run_len : i + 2 * run_len] == after):
+            return i + run_len
     return None
 
 

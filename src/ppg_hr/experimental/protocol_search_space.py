@@ -50,6 +50,16 @@ class ProtocolTrialParams:
     objective_mode: str = "aae"
     # 中文说明：默认保留旧的 Hilbert 包络时延估计；Notebook/脚本可显式改成 direct。
     delay_estimation_mode: str = "envelope"
+    # 中文说明：Alignment_TW 专用于静息段 PPG-HR 提取和全局 Tdelay 搜索；
+    # TW 仍专用于后续自适应滤波训练/验证/测试切窗，二者不能混用。
+    Alignment_TW: float = 8.0
+    Alignment_Step: float = 1.0
+    Rest_HR_Band_BPM: tuple[float, float] = (40.0, 180.0)
+    Rest_HR_Track_Band_BPM: float = 30.0
+    Rest_HR_Slew_Limit_BPM: float = 6.0
+    Rest_HR_Slew_Step_BPM: float = 4.0
+    Rest_HR_Smooth_Method: str = "median"
+    Rest_HR_Smooth_Win: int = 3
     alpha_u: float = 0.1
     M2: int = 3
     rff_D: int = 100

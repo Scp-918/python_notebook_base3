@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import ast
 import gc
 import hashlib
 import json
@@ -1758,10 +1759,29 @@ def _params_from_best_csv(
             values[item.name] = int(value)
         elif isinstance(default, float):
             values[item.name] = float(value)
+        elif isinstance(default, tuple):
+            values[item.name] = _parse_tuple_param(value, default)
         else:
             values[item.name] = str(value)
     values["adaptive_filter"] = adaptive_filter
     return ProtocolTrialParams(**values)
+
+
+def _parse_tuple_param(value: Any, default: tuple[Any, ...]) -> tuple[Any, ...]:
+    """从 best_params CSV 中恢复 tuple 参数，保证手动重画复用同一套配置。
+
+    CSV 会把 ``(40.0, 180.0)`` 这类参数写成字符串；这里用安全的
+    ``ast.literal_eval`` 解析，解析失败时回退到默认值，避免旧 CSV 或手工编辑
+    的文件破坏后续 Tdelay 缓存 key。
+    """
+
+    try:
+        parsed = ast.literal_eval(value) if isinstance(value, str) else value
+        if not isinstance(parsed, (list, tuple)):
+            return default
+        return tuple(type(default[idx])(item) if idx < len(default) else item for idx, item in enumerate(parsed))
+    except (SyntaxError, ValueError, TypeError):
+        return default
 
 
 def _select_best_param_row_for_redraw(

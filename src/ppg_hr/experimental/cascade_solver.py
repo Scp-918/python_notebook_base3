@@ -20,7 +20,13 @@ from scipy.signal.windows import hamming
 from ..core.find_near_biggest import find_near_biggest
 from ..params import CascadeScheme, TargetScope
 from ..preprocess.utils import smoothdata_movmedian
-from .alignment import AlignedDataset, AlignmentInfo, align_ppg_to_ref_hr
+from .alignment import (
+    AlignedDataset,
+    AlignmentInfo,
+    TDelayEstimateResult,
+    build_aligned_training_windows,
+    estimate_global_tdelay_from_rest,
+)
 from .envelope_delay import DelayEstimate, estimate_envelope_delays
 from .motion_frequency import estimate_motion_frequency
 from .noncausal_lms import map_delay_to_lms_params, noncausal_lms_filter
@@ -41,6 +47,7 @@ __all__ = [
 ]
 
 MetricArrays = dict[str, np.ndarray]
+_PRINTED_GLOBAL_ALIGNMENT_KEYS: set[tuple[Any, ...]] = set()
 
 
 @dataclass
@@ -67,7 +74,7 @@ class ProtocolRunResult:
 
 @dataclass
 class _TrialBase:
-    """Cached trial base that depends only on Fs_Target and TW."""
+    """Cached trial base that depends on Fs_Target and training TW."""
 
     dataset: ProtocolDataset
     fs: int
@@ -78,6 +85,18 @@ class _TrialBase:
     norm_window_cache: dict[str, Any] = field(default_factory=dict)
     delay_estimate_cache: dict[tuple[Any, ...], DelayEstimate] = field(default_factory=dict)
     spectral_cache: dict[tuple[Any, ...], tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+
+
+@dataclass
+class _GlobalAlignmentBase:
+    """Cached global Tdelay base that is independent of training TW."""
+
+    dataset: ProtocolDataset
+    fs: int
+    segment_info: SegmentInfo
+    tdelay_result: TDelayEstimateResult | None
+    failure_reason: str = ""
+    cache_hit: bool = False
 
 
 @dataclass
@@ -239,15 +258,17 @@ def run_protocol_trial(
 
 
 def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _TrialBase:
-    """Return resampling/segmentation/alignment/Fmove cached by Fs_Target and TW.
+    """Return trial windows cached by Fs_Target and training TW.
 
-    中文说明：重采样、分段、对齐和 Fmove 只依赖样本、Fs_Target 与 TW，不依赖级联
-    方案或自适应滤波器，因此可复用缓存，减少每个 mode/trial 的固定开销。
+    中文说明：全局 Tdelay 先用固定 Alignment_TW 独立估计并缓存，不依赖
+    ``params.TW``；随后才用贝叶斯 trial 的 ``params.TW`` 构建训练/验证/测试窗口。
+    因此不同训练 TW 可以复用同一个 best_tdelay_s，但仍得到不同训练窗口。
     """
 
     fs_target = int(params.Fs_Target)
     tw = float(params.TW)
-    key = (fs_target, tw, "signed_tdelay_edgepad_rest5_v1")
+    align_key = _global_tdelay_cache_key(dataset, params)
+    key = (fs_target, tw, align_key, "tracked_tdelay_train_windows_v2")
     cache = getattr(dataset, "_trial_base_cache", None)
     if cache is None:
         cache = {}
@@ -258,23 +279,40 @@ def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _T
         cache[key] = base
         return base
 
-    ds = resample_protocol_dataset(dataset, fs_target)
-    fs = int(ds.fs)
-    segment = detect_activity_segments(ds.accx, ds.accy, ds.accz, fs, params.TW)
-    if not segment.is_valid:
+    global_base = _get_global_alignment_base(dataset, params)
+    ds = global_base.dataset
+    fs = int(global_base.fs)
+    segment = global_base.segment_info
+    if global_base.failure_reason:
         base = _TrialBase(
             dataset=ds,
             fs=fs,
             segment_info=segment,
             aligned=None,
             motion_frequency=None,
-            failure_reason=f"segmentation failed: {segment.reason}",
+            failure_reason=global_base.failure_reason,
         )
         _store_trial_base(cache, key, base)
         return base
 
     try:
-        aligned = align_ppg_to_ref_hr(ds, segment, params.TW, fs)
+        if global_base.tdelay_result is None:
+            raise RuntimeError("global Tdelay cache is empty")
+        aligned = build_aligned_training_windows(
+            ds,
+            segment,
+            fs,
+            train_TW=tw,
+            best_tdelay_s=global_base.tdelay_result.best_tdelay_s,
+            tdelay_result=global_base.tdelay_result,
+        )
+        _log_global_alignment_once(
+            dataset,
+            params,
+            global_base.tdelay_result,
+            train_tw=tw,
+            cache_hit=global_base.cache_hit,
+        )
     except Exception as exc:
         base = _TrialBase(
             dataset=ds,
@@ -311,6 +349,162 @@ def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _T
     return base
 
 
+def _get_global_alignment_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _GlobalAlignmentBase:
+    """Return resampling/segmentation/global Tdelay cached independently of train_TW."""
+
+    key = _global_tdelay_cache_key(dataset, params)
+    cache = getattr(dataset, "_global_tdelay_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(dataset, "_global_tdelay_cache", cache)
+    if key in cache:
+        cached = cache.pop(key)
+        cached.cache_hit = True
+        cache[key] = cached
+        return cached
+
+    fs_target = int(params.Fs_Target)
+    ds = resample_protocol_dataset(dataset, fs_target)
+    fs = int(ds.fs)
+    alignment_tw = float(getattr(params, "Alignment_TW", 8.0))
+    # 中文说明：分段用于界定静息段和运动边界，因此也固定使用 Alignment_TW，
+    # 避免 train_TW 改变时牵连全局 Tdelay 估计。
+    segment = detect_activity_segments(ds.accx, ds.accy, ds.accz, fs, alignment_tw)
+    if not segment.is_valid:
+        base = _GlobalAlignmentBase(
+            dataset=ds,
+            fs=fs,
+            segment_info=segment,
+            tdelay_result=None,
+            failure_reason=f"segmentation failed: {segment.reason}",
+        )
+        _store_global_alignment_base(cache, key, base)
+        return base
+
+    try:
+        tdelay = estimate_global_tdelay_from_rest(
+            ds,
+            segment,
+            fs,
+            alignment_TW=alignment_tw,
+            alignment_step_s=float(getattr(params, "Alignment_Step", 1.0)),
+            delay_range_s=None,
+            delay_step_s=0.1,
+            rest_hr_kwargs=_rest_hr_kwargs_from_params(params),
+            return_debug=False,
+        )
+    except Exception as exc:
+        base = _GlobalAlignmentBase(
+            dataset=ds,
+            fs=fs,
+            segment_info=segment,
+            tdelay_result=None,
+            failure_reason=f"alignment failed: {exc}",
+        )
+        _store_global_alignment_base(cache, key, base)
+        return base
+
+    base = _GlobalAlignmentBase(
+        dataset=ds,
+        fs=fs,
+        segment_info=segment,
+        tdelay_result=tdelay,
+        cache_hit=False,
+    )
+    _store_global_alignment_base(cache, key, base)
+    return base
+
+
+def _store_global_alignment_base(cache: dict[Any, _GlobalAlignmentBase], key: Any, base: _GlobalAlignmentBase) -> None:
+    """Store global Tdelay cache with a small LRU cap independent of train_TW."""
+
+    cache[key] = base
+    while len(cache) > 9:
+        cache.pop(next(iter(cache)))
+
+
+def _global_tdelay_cache_key(dataset: ProtocolDataset, params: ProtocolTrialParams) -> tuple[Any, ...]:
+    """Build a Tdelay cache key that intentionally excludes params.TW."""
+
+    alignment_tw = float(getattr(params, "Alignment_TW", 8.0))
+    delay_range = (-min(5.0, alignment_tw / 2.0), 5.0)
+    return (
+        str(dataset.sample_stem),
+        int(params.Fs_Target),
+        round(alignment_tw, 8),
+        round(float(getattr(params, "Alignment_Step", 1.0)), 8),
+        tuple(round(float(x), 8) for x in delay_range),
+        round(0.1, 8),
+        tuple(round(float(x), 8) for x in getattr(params, "Rest_HR_Band_BPM", (40.0, 180.0))),
+        round(float(getattr(params, "Rest_HR_Track_Band_BPM", 30.0)), 8),
+        round(float(getattr(params, "Rest_HR_Slew_Limit_BPM", 6.0)), 8),
+        round(float(getattr(params, "Rest_HR_Slew_Step_BPM", 4.0)), 8),
+        str(getattr(params, "Rest_HR_Smooth_Method", "median")).lower(),
+        int(getattr(params, "Rest_HR_Smooth_Win", 3)),
+        "tracked_rest_hr_tdelay_v1",
+    )
+
+
+def _rest_hr_kwargs_from_params(params: ProtocolTrialParams) -> dict[str, Any]:
+    """Collect rest-HR extraction knobs from non-Optuna alignment params."""
+
+    return {
+        "hr_band_bpm": tuple(float(x) for x in getattr(params, "Rest_HR_Band_BPM", (40.0, 180.0))),
+        "track_band_bpm": float(getattr(params, "Rest_HR_Track_Band_BPM", 30.0)),
+        "slew_limit_bpm": float(getattr(params, "Rest_HR_Slew_Limit_BPM", 6.0)),
+        "slew_step_bpm": float(getattr(params, "Rest_HR_Slew_Step_BPM", 4.0)),
+        "smooth_method": str(getattr(params, "Rest_HR_Smooth_Method", "median")),
+        "smooth_win": int(getattr(params, "Rest_HR_Smooth_Win", 3)),
+    }
+
+
+def _log_global_alignment_once(
+    dataset: ProtocolDataset,
+    params: ProtocolTrialParams,
+    tdelay: TDelayEstimateResult,
+    *,
+    train_tw: float,
+    cache_hit: bool,
+) -> None:
+    """Print a concise Chinese global-alignment diagnostic once per train TW."""
+
+    alignment_tw = float(getattr(params, "Alignment_TW", 8.0))
+    delay_range = (-min(5.0, alignment_tw / 2.0), 5.0)
+    key = (
+        str(dataset.sample_stem),
+        int(params.Fs_Target),
+        round(alignment_tw, 3),
+        round(float(train_tw), 3),
+        bool(cache_hit),
+    )
+    if key in _PRINTED_GLOBAL_ALIGNMENT_KEYS:
+        return
+    _PRINTED_GLOBAL_ALIGNMENT_KEYS.add(key)
+    best_row = (
+        tdelay.score_table.loc[
+            np.isclose(tdelay.score_table["delay_s"].to_numpy(dtype=float), float(tdelay.best_tdelay_s))
+        ].head(1)
+        if not tdelay.score_table.empty
+        else pd.DataFrame()
+    )
+    n_valid = int(best_row["n_valid"].iloc[0]) if not best_row.empty else 0
+    print(
+        f"[全局对齐] group={dataset.sample_stem}, Fs={int(params.Fs_Target)}, "
+        f"alignment_TW={alignment_tw:.1f}s, train_TW={float(train_tw):.1f}s, "
+        f"delay_range=[{delay_range[0]:.1f}, {delay_range[1]:.1f}]s, step=0.1s, "
+        f"cache={'hit' if cache_hit else 'miss'}"
+    )
+    print(
+        f"[全局对齐] 使用静息段 tracked PPG-HR 估计 Tdelay: "
+        f"best_tdelay={tdelay.best_tdelay_s:.2f}s, score_std={tdelay.best_score:.3f} BPM, "
+        f"n_valid={n_valid}"
+    )
+    print(
+        f"[全局对齐] 后续训练窗口使用 train_TW={float(train_tw):.1f}s，"
+        "不使用 alignment_TW 切训练窗"
+    )
+
+
 def _store_trial_base(cache: dict[Any, _TrialBase], key: Any, base: _TrialBase) -> None:
     """Store one TrialBase with a tiny insertion-ordered LRU cap.
 
@@ -324,7 +518,7 @@ def _store_trial_base(cache: dict[Any, _TrialBase], key: Any, base: _TrialBase) 
 
 
 def clear_trial_caches(dataset: ProtocolDataset) -> None:
-    """Clear per-dataset TrialBase caches created by this module.
+    """Clear per-dataset TrialBase/global-alignment caches created by this module.
 
     中文说明：LOGO 每个 fold 完成后会调用它释放归一化窗口、频谱和 delay estimate
     小缓存，避免长时间 Notebook 运行时内存随 trial/fold 持续增长。
@@ -333,6 +527,9 @@ def clear_trial_caches(dataset: ProtocolDataset) -> None:
     cache = getattr(dataset, "_trial_base_cache", None)
     if isinstance(cache, dict):
         cache.clear()
+    align_cache = getattr(dataset, "_global_tdelay_cache", None)
+    if isinstance(align_cache, dict):
+        align_cache.clear()
 
 
 def extract_hr_with_penalty(

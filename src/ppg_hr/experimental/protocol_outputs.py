@@ -119,7 +119,7 @@ def plot_rest_alignment_diagnostics_by_motion_type(
     datasets: dict[str, ProtocolDataset],
     output_dir: str | Path,
     fs_target: int = 100,
-    TW: int = 10,
+    TW: int = 8,
 ) -> dict[str, Path]:
     """Plot rest-segment alignment diagnostics grouped by motion type.
 
@@ -156,7 +156,7 @@ def plot_rest_alignment_diagnostics_by_motion_type(
                 segment = _detect_segments_for_alignment_plot(ds, TW)
                 if not segment.is_valid:
                     raise RuntimeError(segment.reason)
-                aligned = align_ppg_to_ref_hr(ds, segment, TW, int(fs_target))
+                aligned = align_ppg_to_ref_hr(ds, segment, TW, int(fs_target), alignment_TW=float(TW))
                 curve = compute_rest_alignment_diagnostic_curve(ds, segment, aligned, TW, int(fs_target))
                 title = f"{pair.motion_id} | Tdelay={aligned.alignment_info.best_tdelay_s:.2f}s"
                 if curve.empty:
