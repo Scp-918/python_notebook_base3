@@ -36,6 +36,7 @@ from .segmentation import SegmentInfo
 
 __all__ = [
     "SampleOutputPaths",
+    "plot_raw_ppg_and_unaligned_hr_by_motion_type",
     "plot_unaligned_fullfield_ppg_hr_by_motion_type",
     "plot_rest_alignment_diagnostics_by_motion_type",
     "plot_signal_figures",
@@ -322,12 +323,174 @@ def _shade_unaligned_segments(plt_ax: Any, dataset: ProtocolDataset, segment: Se
     plt_ax.axvspan(min(t1, end), t1, color="#9ecae1", alpha=0.16, label="Recovery")
 
 
+def plot_raw_ppg_and_unaligned_hr_by_motion_type(
+    pairs: list[SamplePair],
+    datasets: dict[str, ProtocolDataset],
+    output_dir: str | Path,
+    fs_target: int = 100,
+    fs_origin: int = 100,
+    TW: int | float = 8,
+    step_s: float = 1.0,
+    hr_band_hz: tuple[float, float] = (0.5, 2.0),
+    track_band_bpm: float = 30.0,
+    slew_limit_bpm: float = 6.0,
+    slew_step_bpm: float = 4.0,
+    smooth_win: int = 3,
+) -> dict[str, Path]:
+    """绘制静息段原始 PPG 绿光信号和静息段 PPG 解算 HR 的双 y 轴诊断图。
+
+    中文说明：每个运动类型输出一张 PNG，每个子图对应一组运动。左轴绘制传感器
+    CSV 中的静息段 PPG_Green 原始信号；右轴绘制未做 Tdelay 对齐的静息段 PPG
+    解算 HR 曲线。该图用于判断静息 HR 偏差是否来自原始波形质量、静息段边界或
+    频谱选峰流程。
+    """
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    plt = _prepare_matplotlib(out)
+    grouped: dict[str, list[SamplePair]] = {}
+    for pair in pairs:
+        if pair.motion_id in datasets:
+            grouped.setdefault(pair.motion_type, []).append(pair)
+
+    paths: dict[str, Path] = {}
+    tw_value = float(TW)
+    hr_band_bpm = (float(hr_band_hz[0]) * 60.0, float(hr_band_hz[1]) * 60.0)
+    for motion_type, members in sorted(grouped.items()):
+        members = sorted(members, key=lambda p: (p.motion_index, p.motion_id))
+        n = max(1, len(members))
+        cols = 2 if n > 1 else 1
+        rows = int(math.ceil(n / cols))
+        fig, axes = plt.subplots(rows, cols, figsize=(7.6 * cols, 4.0 * rows), squeeze=False)
+        flat = axes.ravel()
+        for ax in flat[n:]:
+            ax.axis("off")
+        for ax_left, pair in zip(flat, members, strict=False):
+            ax_left.grid(True, alpha=0.22)
+            ax_left.set_xlabel("Rest window time (s)")
+            ax_left.set_ylabel("Rest PPG_Green raw", color="#2ca02c")
+            ax_right = ax_left.twinx()
+            ax_right.set_ylabel("Rest PPG FFT HR (bpm)", color="#d62728")
+            try:
+                ds = resample_protocol_dataset(datasets[pair.motion_id], int(fs_target))
+                segment = _detect_segments_for_alignment_plot(ds, tw_value)
+                if not segment.is_valid:
+                    raise RuntimeError(segment.reason)
+                raw_time, raw_ppg = _load_raw_ppg_green_for_pair(pair, ds, int(fs_origin))
+                raw_time, raw_ppg = _slice_time_range(raw_time, raw_ppg, 0.0, float(segment.motion_start_s))
+                rest_end_idx = int(round(float(segment.motion_start_s) * int(ds.fs)))
+                rest_ppg = np.asarray(ds.ppg_green[: max(0, rest_end_idx)], dtype=float)
+                ppg_hr = extract_rest_ppg_hr_tracked(
+                    rest_ppg,
+                    ds.fs,
+                    tw_s=tw_value,
+                    step_s=float(step_s),
+                    hr_band_bpm=hr_band_bpm,
+                    track_band_bpm=float(track_band_bpm),
+                    slew_limit_bpm=float(slew_limit_bpm),
+                    slew_step_bpm=float(slew_step_bpm),
+                    smooth_method="median",
+                    smooth_win=int(smooth_win),
+                )
+                raw_line = ax_left.plot(
+                    raw_time,
+                    raw_ppg,
+                    color="#2ca02c",
+                    linewidth=0.7,
+                    alpha=0.82,
+                    label="Rest PPG_Green raw",
+                )
+                hr_lines = []
+                if ppg_hr.times_s.size:
+                    hr_lines = ax_right.plot(
+                        ppg_hr.times_s,
+                        ppg_hr.hr_bpm_smooth,
+                        color="#d62728",
+                        linewidth=1.25,
+                        label="Rest PPG FFT HR",
+                    )
+                else:
+                    ax_right.text(
+                        0.5,
+                        0.5,
+                        "PPG HR windows are empty",
+                        ha="center",
+                        va="center",
+                        transform=ax_right.transAxes,
+                    )
+                title = f"{pair.motion_id} | rest 0-{segment.motion_start_s:.1f}s | {_tw_label(tw_value)}"
+                ax_left.set_title(title)
+                ax_left.set_xlim(0.0, max(float(segment.motion_start_s), tw_value))
+                _set_combined_legend(ax_left, raw_line + hr_lines)
+            except Exception as exc:
+                ax_left.set_title(f"{pair.motion_id} | failed")
+                ax_left.text(0.5, 0.5, str(exc), ha="center", va="center", transform=ax_left.transAxes)
+
+        fig.suptitle(f"{motion_type} rest raw PPG and rest PPG-HR, {_tw_label(tw_value)}", fontsize=14)
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
+        path = out / f"{motion_type}_rest_raw_ppg_hr_dual_axis_{_tw_label(tw_value)}.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        paths[motion_type] = path
+    return paths
+
+
 def _tw_label(value: float) -> str:
     """返回文件名安全的 TW 标签，例如 TW8 或 TW8p5。"""
 
     if float(value).is_integer():
         return f"TW{int(value)}"
     return f"TW{str(float(value)).replace('.', 'p')}"
+
+
+def _load_raw_ppg_green_for_pair(
+    pair: SamplePair,
+    fallback_dataset: ProtocolDataset,
+    fs_origin: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """优先读取传感器 CSV 中的原始 PPG_Green；失败时回退到已预处理数据。"""
+
+    try:
+        raw_frame, _ = load_protocol_raw_clean_frames(pair.sensor_csv, fs_origin=fs_origin)
+        return raw_frame["time_s"].to_numpy(dtype=float), raw_frame["ppg_green"].to_numpy(dtype=float)
+    except Exception:
+        return fallback_dataset.time_s.astype(float), fallback_dataset.ppg_green.astype(float)
+
+
+def _slice_time_range(
+    time_s: np.ndarray,
+    values: np.ndarray,
+    start_s: float,
+    end_s: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """按时间范围截取信号，主要用于静息段原始 PPG 诊断图。"""
+
+    t = np.asarray(time_s, dtype=float)
+    v = np.asarray(values, dtype=float)
+    n = min(t.size, v.size)
+    if n == 0:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+    t = t[:n]
+    v = v[:n]
+    mask = (t >= float(start_s)) & (t <= float(end_s))
+    return t[mask], v[mask]
+
+
+def _set_combined_legend(plt_ax: Any, line_handles: list[Any]) -> None:
+    """合并双 y 轴线条图例，并保留分段背景的说明。"""
+
+    handles, labels = plt_ax.get_legend_handles_labels()
+    for handle in line_handles:
+        label = handle.get_label()
+        if label not in labels:
+            handles.append(handle)
+            labels.append(label)
+    dedup: dict[str, Any] = {}
+    for handle, label in zip(handles, labels, strict=False):
+        if label and not label.startswith("_"):
+            dedup.setdefault(label, handle)
+    if dedup:
+        plt_ax.legend(dedup.values(), dedup.keys(), loc="best", fontsize=8)
 
 
 def _detect_segments_for_alignment_plot(dataset: ProtocolDataset, TW: int | float) -> SegmentInfo:

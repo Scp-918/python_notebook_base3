@@ -1,4 +1,4 @@
-"""Smoke tests for full-record unaligned PPG-HR diagnostic plots."""
+"""Smoke tests for unaligned PPG-HR diagnostic plots."""
 
 from __future__ import annotations
 
@@ -8,7 +8,10 @@ import numpy as np
 
 from ppg_hr.experimental.batch_pairing import SamplePair
 from ppg_hr.experimental.preprocess_protocol import ProtocolDataset
-from ppg_hr.experimental.protocol_outputs import plot_unaligned_fullfield_ppg_hr_by_motion_type
+from ppg_hr.experimental.protocol_outputs import (
+    plot_raw_ppg_and_unaligned_hr_by_motion_type,
+    plot_unaligned_fullfield_ppg_hr_by_motion_type,
+)
 
 
 def _dataset_for_plot(fs: int = 20, duration_s: float = 80.0) -> ProtocolDataset:
@@ -64,5 +67,30 @@ def test_plot_unaligned_fullfield_ppg_hr_by_motion_type_writes_png(tmp_path: Pat
 
     assert set(paths) == {"kaihe"}
     assert paths["kaihe"].name == "kaihe_all_alignment_TW8.png"
+    assert paths["kaihe"].exists()
+    assert paths["kaihe"].stat().st_size > 0
+
+
+def test_plot_raw_ppg_and_unaligned_hr_by_motion_type_writes_rest_dual_axis_png(tmp_path: Path) -> None:
+    pair = SamplePair(
+        motion_id="kaihe1",
+        motion_type="kaihe",
+        motion_index=1,
+        stem="multi_kaihe1",
+        sensor_csv=tmp_path / "missing_sensor.csv",
+        ref_csv=tmp_path / "missing_ref.csv",
+    )
+
+    paths = plot_raw_ppg_and_unaligned_hr_by_motion_type(
+        pairs=[pair],
+        datasets={"kaihe1": _dataset_for_plot()},
+        output_dir=tmp_path / "allfield",
+        fs_target=20,
+        fs_origin=20,
+        TW=8,
+    )
+
+    assert set(paths) == {"kaihe"}
+    assert paths["kaihe"].name == "kaihe_rest_raw_ppg_hr_dual_axis_TW8.png"
     assert paths["kaihe"].exists()
     assert paths["kaihe"].stat().st_size > 0
