@@ -18,7 +18,11 @@ import numpy as np
 import pandas as pd
 
 from ..params import CascadeScheme, TargetScope
-from .alignment import align_ppg_to_ref_hr, compute_rest_alignment_diagnostic_curve
+from .alignment import (
+    align_ppg_to_ref_hr,
+    compute_rest_alignment_diagnostic_curve,
+    extract_rest_ppg_hr_tracked,
+)
 from .batch_pairing import SamplePair, UnpairedSample
 from .preprocess_protocol import (
     PROTOCOL_CHANNELS,
@@ -32,6 +36,7 @@ from .segmentation import SegmentInfo
 
 __all__ = [
     "SampleOutputPaths",
+    "plot_unaligned_fullfield_ppg_hr_by_motion_type",
     "plot_rest_alignment_diagnostics_by_motion_type",
     "plot_signal_figures",
     "write_batch_summary",
@@ -189,6 +194,140 @@ def plot_rest_alignment_diagnostics_by_motion_type(
         plt.close(fig)
         paths[motion_type] = path
     return paths
+
+
+def plot_unaligned_fullfield_ppg_hr_by_motion_type(
+    pairs: list[SamplePair],
+    datasets: dict[str, ProtocolDataset],
+    output_dir: str | Path,
+    fs_target: int = 100,
+    TW: int | float = 8,
+    step_s: float = 1.0,
+    hr_band_hz: tuple[float, float] = (0.5, 2.0),
+    track_band_bpm: float = 30.0,
+    slew_limit_bpm: float = 6.0,
+    slew_step_bpm: float = 4.0,
+    smooth_win: int = 3,
+) -> dict[str, Path]:
+    """按运动类型绘制原始 PPG 全段未对齐 HR 测试图。
+
+    中文说明：该图只用于测试和人工检查，不参与 Tdelay 搜索、Optuna objective 或
+    自适应滤波训练。PPG_Green 不做全局对齐，直接在原始时间轴上按 ``TW`` 秒滑窗，
+    每 1 秒一步，用 Hamming+FFT 提取 0.5-2 Hz 主频，再做上一 HR 邻域追踪、
+    slew limit/step 防跳峰和 moving median 平滑。背景色按同一未对齐时间轴上的
+    静息、运动、运动恢复三段标注。
+    """
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    plt = _prepare_matplotlib(out)
+    grouped: dict[str, list[SamplePair]] = {}
+    for pair in pairs:
+        if pair.motion_id in datasets:
+            grouped.setdefault(pair.motion_type, []).append(pair)
+
+    paths: dict[str, Path] = {}
+    tw_value = float(TW)
+    hr_band_bpm = (float(hr_band_hz[0]) * 60.0, float(hr_band_hz[1]) * 60.0)
+    for motion_type, members in sorted(grouped.items()):
+        members = sorted(members, key=lambda p: (p.motion_index, p.motion_id))
+        n = max(1, len(members))
+        cols = 2 if n > 1 else 1
+        rows = int(math.ceil(n / cols))
+        fig, axes = plt.subplots(rows, cols, figsize=(7.2 * cols, 3.8 * rows), squeeze=False)
+        flat = axes.ravel()
+        for ax in flat[n:]:
+            ax.axis("off")
+        for ax, pair in zip(flat, members, strict=False):
+            ax.grid(True, alpha=0.25)
+            ax.set_xlabel("Original PPG time (s)")
+            ax.set_ylabel("HR (bpm)")
+            try:
+                ds = resample_protocol_dataset(datasets[pair.motion_id], int(fs_target))
+                segment = _detect_segments_for_alignment_plot(ds, tw_value)
+                _shade_unaligned_segments(ax, ds, segment)
+                ppg_hr = extract_rest_ppg_hr_tracked(
+                    ds.ppg_green,
+                    ds.fs,
+                    tw_s=tw_value,
+                    step_s=float(step_s),
+                    hr_band_bpm=hr_band_bpm,
+                    track_band_bpm=float(track_band_bpm),
+                    slew_limit_bpm=float(slew_limit_bpm),
+                    slew_step_bpm=float(slew_step_bpm),
+                    smooth_method="median",
+                    smooth_win=int(smooth_win),
+                )
+                ax.plot(
+                    ds.ref_time_s,
+                    ds.ref_hr_bpm,
+                    color="black",
+                    linewidth=1.4,
+                    label="Reference HR",
+                )
+                if ppg_hr.times_s.size:
+                    ax.plot(
+                        ppg_hr.times_s,
+                        ppg_hr.hr_bpm_smooth,
+                        color="#1f77b4",
+                        linewidth=1.2,
+                        label="Raw PPG FFT HR",
+                    )
+                else:
+                    ax.text(
+                        0.5,
+                        0.5,
+                        "PPG HR windows are empty",
+                        ha="center",
+                        va="center",
+                        transform=ax.transAxes,
+                    )
+                title = f"{pair.motion_id} | {_tw_label(tw_value)}"
+                if not segment.is_valid:
+                    title += " | segment failed"
+                    ax.text(0.02, 0.95, segment.reason, ha="left", va="top", fontsize=8, transform=ax.transAxes)
+                ax.set_title(title)
+                ax.legend(loc="best", fontsize=8)
+            except Exception as exc:
+                ax.set_title(f"{pair.motion_id} | failed")
+                ax.text(0.5, 0.5, str(exc), ha="center", va="center", transform=ax.transAxes)
+
+        fig.suptitle(f"{motion_type} raw unaligned full-record PPG HR, {_tw_label(tw_value)}", fontsize=14)
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
+        path = out / f"{motion_type}_all_alignment_{_tw_label(tw_value)}.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        paths[motion_type] = path
+    return paths
+
+
+def _shade_unaligned_segments(plt_ax: Any, dataset: ProtocolDataset, segment: SegmentInfo) -> None:
+    """在未对齐 PPG 时间轴上标出静息、运动和运动恢复三段。
+
+    中文说明：这里直接使用未做 Tdelay 平移的 ``dataset.time_s`` 和分段边界，保证
+    背景区域与原始 PPG-HR 曲线处在同一个时间轴上。
+    """
+
+    if dataset.time_s.size == 0:
+        return
+    t0 = float(dataset.time_s[0])
+    t1 = float(dataset.time_s[-1])
+    if not segment.is_valid:
+        plt_ax.axvspan(t0, t1, color="#eeeeee", alpha=0.22, label="segment unknown")
+        return
+    start = float(segment.motion_start_s)
+    end = float(segment.motion_end_s)
+    plt_ax.axvspan(t0, max(t0, start), color="#8fd19e", alpha=0.16, label="Rest")
+    plt_ax.axvspan(max(t0, start), min(t1, end), color="#f6c177", alpha=0.18, label="Motion")
+    plt_ax.axvspan(min(t1, end), t1, color="#9ecae1", alpha=0.16, label="Recovery")
+
+
+def _tw_label(value: float) -> str:
+    """返回文件名安全的 TW 标签，例如 TW8 或 TW8p5。"""
+
+    if float(value).is_integer():
+        return f"TW{int(value)}"
+    return f"TW{str(float(value)).replace('.', 'p')}"
 
 
 def _detect_segments_for_alignment_plot(dataset: ProtocolDataset, TW: int | float) -> SegmentInfo:
