@@ -441,7 +441,11 @@ def _global_tdelay_cache_key(dataset: ProtocolDataset, params: ProtocolTrialPara
         round(float(getattr(params, "Rest_HR_Slew_Step_BPM", 4.0)), 8),
         str(getattr(params, "Rest_HR_Smooth_Method", "median")).lower(),
         int(getattr(params, "Rest_HR_Smooth_Win", 3)),
-        "tracked_rest_hr_tdelay_v1",
+        round(float(getattr(params, "Rest_HR_Peak_Percent", 0.3)), 8),
+        bool(getattr(params, "Rest_HR_Spec_Penalty_Enable", True)),
+        round(float(getattr(params, "Rest_HR_Spec_Penalty_Weight", 0.2)), 8),
+        round(float(getattr(params, "Rest_HR_Spec_Penalty_Width_Hz", 0.2)), 8),
+        "tracked_rest_hr_tdelay_v2",
     )
 
 
@@ -455,6 +459,10 @@ def _rest_hr_kwargs_from_params(params: ProtocolTrialParams) -> dict[str, Any]:
         "slew_step_bpm": float(getattr(params, "Rest_HR_Slew_Step_BPM", 4.0)),
         "smooth_method": str(getattr(params, "Rest_HR_Smooth_Method", "median")),
         "smooth_win": int(getattr(params, "Rest_HR_Smooth_Win", 3)),
+        "peak_percent": float(getattr(params, "Rest_HR_Peak_Percent", 0.3)),
+        "spec_penalty_enable": bool(getattr(params, "Rest_HR_Spec_Penalty_Enable", True)),
+        "spec_penalty_weight": float(getattr(params, "Rest_HR_Spec_Penalty_Weight", 0.2)),
+        "spec_penalty_width_hz": float(getattr(params, "Rest_HR_Spec_Penalty_Width_Hz", 0.2)),
     }
 
 

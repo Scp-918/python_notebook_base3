@@ -380,6 +380,7 @@ def plot_raw_ppg_and_unaligned_hr_by_motion_type(
                 raw_time, raw_ppg = _slice_time_range(raw_time, raw_ppg, 0.0, float(segment.motion_start_s))
                 rest_end_idx = int(round(float(segment.motion_start_s) * int(ds.fs)))
                 rest_ppg = np.asarray(ds.ppg_green[: max(0, rest_end_idx)], dtype=float)
+                rest_accz = np.asarray(ds.accz[: max(0, rest_end_idx)], dtype=float)
                 ppg_hr = extract_rest_ppg_hr_tracked(
                     rest_ppg,
                     ds.fs,
@@ -391,6 +392,7 @@ def plot_raw_ppg_and_unaligned_hr_by_motion_type(
                     slew_step_bpm=float(slew_step_bpm),
                     smooth_method="median",
                     smooth_win=int(smooth_win),
+                    penalty_signal=rest_accz,
                 )
                 raw_line = ax_left.plot(
                     raw_time,

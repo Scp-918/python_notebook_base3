@@ -60,6 +60,12 @@ class ProtocolTrialParams:
     Rest_HR_Slew_Step_BPM: float = 4.0
     Rest_HR_Smooth_Method: str = "median"
     Rest_HR_Smooth_Win: int = 3
+    # 中文说明：以下参数只控制静息段 PPG-HR 的参考式频谱后处理，不进入 Optuna 搜索空间。
+    # 运动惩罚默认开启以贴近参考仓库；只有调用方同时传入运动参考信号时才会真正生效。
+    Rest_HR_Peak_Percent: float = 0.3
+    Rest_HR_Spec_Penalty_Enable: bool = True
+    Rest_HR_Spec_Penalty_Weight: float = 0.2
+    Rest_HR_Spec_Penalty_Width_Hz: float = 0.2
     alpha_u: float = 0.1
     M2: int = 3
     rff_D: int = 100

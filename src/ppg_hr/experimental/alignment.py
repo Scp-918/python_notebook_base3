@@ -17,8 +17,10 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.signal import find_peaks
 from scipy.signal.windows import hamming
 
+from ..core.find_near_biggest import find_near_biggest
 from ..preprocess.utils import smoothdata_movmedian
 from .preprocess_protocol import ProtocolDataset
 from .segmentation import SegmentInfo
@@ -48,6 +50,10 @@ DEFAULT_REST_HR_SLEW_LIMIT_BPM = 6.0
 DEFAULT_REST_HR_SLEW_STEP_BPM = 4.0
 DEFAULT_REST_HR_SMOOTH_METHOD = "median"
 DEFAULT_REST_HR_SMOOTH_WIN = 3
+DEFAULT_REST_HR_PEAK_PERCENT = 0.3
+DEFAULT_REST_SPEC_PENALTY_ENABLE = True
+DEFAULT_REST_SPEC_PENALTY_WEIGHT = 0.2
+DEFAULT_REST_SPEC_PENALTY_WIDTH_HZ = 0.2
 
 
 @dataclass(frozen=True)
@@ -198,13 +204,25 @@ def extract_rest_ppg_hr_tracked(
     slew_step_bpm: float = DEFAULT_REST_HR_SLEW_STEP_BPM,
     smooth_method: str = DEFAULT_REST_HR_SMOOTH_METHOD,
     smooth_win: int = DEFAULT_REST_HR_SMOOTH_WIN,
+    peak_percent: float = DEFAULT_REST_HR_PEAK_PERCENT,
+    penalty_signal: np.ndarray | None = None,
+    spec_penalty_enable: bool = DEFAULT_REST_SPEC_PENALTY_ENABLE,
+    spec_penalty_weight: float = DEFAULT_REST_SPEC_PENALTY_WEIGHT,
+    spec_penalty_width_hz: float = DEFAULT_REST_SPEC_PENALTY_WIDTH_HZ,
     return_debug: bool = False,
 ) -> RestHrResult:
-    """Extract a tracked rest-segment PPG HR curve with Hamming FFT windows.
+    """Extract a reference-style tracked rest-segment PPG HR curve.
 
-    中文说明：该函数专用于全局 Tdelay 估计阶段。它使用固定 ``alignment_TW``
-    滑窗提取静息段 PPG HR，并参考旧 solver 的思路：首窗取最大峰，后续窗口优先
-    在上一 HR 附近追踪候选峰，再用 slew limit/step 限制异常跳峰，最后轻度平滑。
+    中文说明：该函数专用于全局 Tdelay 估计和静息段诊断。它复刻参考仓库
+    ``Helper_Process_Spectrum`` 的静息 FFT 后处理思路：每个窗口先做去均值 +
+    Hamming，再找超过主峰一定比例的局部谱峰；谱峰按幅值排序后，只在前 5 个
+    候选中寻找靠近上一 HR 的峰，随后用 slew limit/step 限制异常跳变，最后做
+    moving median 平滑。
+
+    运动惩罚说明：参考仓库的谱惩罚依赖独立的运动参考通道。本项目默认开启
+    ``spec_penalty_enable`` 以贴近参考实现，但只有调用方传入 ``penalty_signal``
+    时才会真正生效；生效后会把运动主频及二倍频附近的 PPG 候选谱峰幅值乘以
+    ``spec_penalty_weight``。
     """
 
     fs = float(fs)
@@ -220,27 +238,52 @@ def extract_rest_ppg_hr_tracked(
     raw_hr = np.full(starts.size, np.nan, dtype=float)
     tracked_hr = np.full(starts.size, np.nan, dtype=float)
     peak_amp = np.full(starts.size, np.nan, dtype=float)
+    which_peak = np.zeros(starts.size, dtype=int)
     used_fallback = np.zeros(starts.size, dtype=bool)
     slew_limited = np.zeros(starts.size, dtype=bool)
+    penalty_applied = np.zeros(starts.size, dtype=bool)
+    penalty_freq_hz = np.full(starts.size, np.nan, dtype=float)
+    penalty_arr = None if penalty_signal is None else np.asarray(penalty_signal, dtype=float).ravel()
 
     prev_hr: float | None = None
     for row, start in enumerate(starts):
-        freq_bpm, amp = _window_fft_hr_spectrum(sig[start : start + win_len], int(round(fs)), hr_band_bpm)
-        if freq_bpm.size == 0:
+        penalty_window = None
+        if penalty_arr is not None and start + win_len <= penalty_arr.size:
+            penalty_window = penalty_arr[start : start + win_len]
+        peak_info = _rest_spectrum_candidates_like_reference(
+            sig[start : start + win_len],
+            int(round(fs)),
+            hr_band_bpm,
+            peak_percent=float(peak_percent),
+            penalty_window=penalty_window,
+            spec_penalty_enable=bool(spec_penalty_enable),
+            spec_penalty_weight=float(spec_penalty_weight),
+            spec_penalty_width_hz=float(spec_penalty_width_hz),
+        )
+        fre_hz = peak_info["freq_hz"]
+        amp = peak_info["amp"]
+        if fre_hz.size == 0:
             continue
-        raw_idx = int(np.argmax(amp))
-        raw = float(freq_bpm[raw_idx])
+        raw = float(fre_hz[0] * 60.0)
         raw_hr[row] = raw
-        peak_amp[row] = float(amp[raw_idx])
+        peak_amp[row] = float(amp[0])
+        penalty_applied[row] = bool(peak_info["penalty_applied"])
+        penalty_freq_hz[row] = float(peak_info["penalty_freq_hz"])
         if prev_hr is None or not np.isfinite(prev_hr):
             candidate = raw if init_strategy == "max_peak" else raw
+            which_peak[row] = 1
         else:
-            near = np.abs(freq_bpm - prev_hr) <= float(track_band_bpm)
-            if near.any():
-                near_indices = np.flatnonzero(near)
-                candidate = float(freq_bpm[near_indices[int(np.argmax(amp[near_indices]))]])
-            else:
-                candidate = raw
+            # 中文说明：参考实现的 find_near_biggest 只检查按幅值排序后的前 5 个峰；
+            # 找不到邻近峰时保持上一 HR，比直接回退全局最大峰更不容易被倍频带走。
+            candidate_hz, which = find_near_biggest(
+                fre_hz,
+                float(prev_hr) / 60.0,
+                float(track_band_bpm) / 60.0,
+                -float(track_band_bpm) / 60.0,
+            )
+            candidate = float(candidate_hz * 60.0)
+            which_peak[row] = int(which)
+            if which == 0:
                 used_fallback[row] = True
         limited = _limit_hr_transition(prev_hr, candidate, slew_limit_bpm, slew_step_bpm)
         slew_limited[row] = bool(prev_hr is not None and np.isfinite(prev_hr) and abs(candidate - prev_hr) > slew_limit_bpm)
@@ -252,12 +295,19 @@ def extract_rest_ppg_hr_tracked(
     if return_debug:
         quality = {
             "peak_amp": peak_amp,
+            "which_peak": which_peak,
             "used_fallback": used_fallback,
             "slew_limited": slew_limited,
+            "penalty_applied": penalty_applied,
+            "penalty_freq_hz": penalty_freq_hz,
             "tw_s": float(tw_s),
             "step_s": float(step_s),
             "hr_band_bpm": tuple(float(x) for x in hr_band_bpm),
             "track_band_bpm": float(track_band_bpm),
+            "peak_percent": float(peak_percent),
+            "spec_penalty_enable": bool(spec_penalty_enable),
+            "spec_penalty_weight": float(spec_penalty_weight),
+            "spec_penalty_width_hz": float(spec_penalty_width_hz),
         }
     return RestHrResult(
         times_s=times_s,
@@ -364,6 +414,7 @@ def estimate_global_tdelay_from_rest(
             motion_start_s=float(segment.motion_start_s),
             score_start_s=_REST_ALIGNMENT_SCORE_START_S,
             rest_hr_kwargs=kwargs,
+            penalty_signal=ds.accz,
         )
         ref_hr = _reference_hr_for_alignment_times(ds, rest.times_s, align_tw)
         ppg_hr = np.asarray(rest.hr_bpm_smooth, dtype=float)
@@ -554,6 +605,121 @@ def _limit_hr_transition(
     return float(prev_hr) + float(np.sign(diff)) * float(slew_step_bpm)
 
 
+def _rest_spectrum_candidates_like_reference(
+    x: np.ndarray,
+    fs: int,
+    hr_band_bpm: tuple[float, float],
+    *,
+    peak_percent: float,
+    penalty_window: np.ndarray | None,
+    spec_penalty_enable: bool,
+    spec_penalty_weight: float,
+    spec_penalty_width_hz: float,
+) -> dict[str, Any]:
+    """Return reference-style sorted spectral peak candidates for one rest window.
+
+    中文说明：参考仓库先通过 ``fft_peaks(..., percent=0.3)`` 找局部谱峰，再用
+    ``find_maxpeak`` 按幅值降序排列候选频率。这里保留同样的后处理口径，同时
+    允许静息段 HR 频带继续由本项目的 ``hr_band_bpm`` 控制。
+    """
+
+    sig = _prepare_rest_fft_window(x)
+    fre_hz, amp = _fft_peak_candidates(sig, fs, hr_band_bpm, peak_percent)
+    amp = amp.astype(float, copy=True)
+    penalty_applied = False
+    penalty_freq_hz = float("nan")
+
+    if spec_penalty_enable and penalty_window is not None and fre_hz.size:
+        # 中文说明：运动惩罚需要独立参考通道；若传入 ACC 参考，就按参考实现
+        # 压低运动主频和二倍频附近的 PPG 候选峰幅值。
+        ref_sig = _prepare_penalty_fft_window(penalty_window)
+        ref_freq, ref_amp = _fft_peak_candidates(ref_sig, fs, hr_band_bpm, peak_percent)
+        if ref_freq.size:
+            penalty_freq_hz = float(ref_freq[int(np.argmax(ref_amp))])
+            mask = (np.abs(fre_hz - penalty_freq_hz) < float(spec_penalty_width_hz)) | (
+                np.abs(fre_hz - 2.0 * penalty_freq_hz) < float(spec_penalty_width_hz)
+            )
+            if mask.any():
+                amp[mask] *= float(spec_penalty_weight)
+                penalty_applied = True
+
+    if fre_hz.size:
+        order = np.argsort(-amp, kind="stable")
+        fre_hz = fre_hz[order]
+        amp = amp[order]
+
+    return {
+        "freq_hz": fre_hz,
+        "amp": amp,
+        "penalty_applied": penalty_applied,
+        "penalty_freq_hz": penalty_freq_hz,
+    }
+
+
+def _prepare_rest_fft_window(x: np.ndarray) -> np.ndarray:
+    """Demean and Hamming-window one PPG segment before reference-style peak search."""
+
+    sig = np.asarray(x, dtype=float).ravel()
+    if sig.size == 0:
+        return sig.copy()
+    sig = sig.copy()
+    sig[~np.isfinite(sig)] = 0.0
+    sig = sig - float(np.mean(sig))
+    # 中文说明：参考仓库在进入频谱后处理前使用 scipy 的默认对称 Hamming 窗。
+    return sig * hamming(sig.size)
+
+
+def _prepare_penalty_fft_window(x: np.ndarray) -> np.ndarray:
+    """Prepare an optional motion-penalty reference window for peak extraction."""
+
+    sig = np.asarray(x, dtype=float).ravel()
+    if sig.size == 0:
+        return sig.copy()
+    sig = sig.copy()
+    sig[~np.isfinite(sig)] = 0.0
+    return sig - float(np.mean(sig))
+
+
+def _fft_peak_candidates(
+    signal: np.ndarray,
+    fs: int,
+    hr_band_bpm: tuple[float, float],
+    percent: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Find local FFT peaks above a relative amplitude threshold.
+
+    中文说明：这是参考仓库 ``fft_peaks`` 的项目化版本。不同之处是心率频带由
+    ``hr_band_bpm`` 控制，而不是写死 0.7-4 Hz，便于静息诊断继续使用 0.5-2 Hz
+    或 40-180 BPM 等配置。
+    """
+
+    sig = np.asarray(signal, dtype=float).ravel()
+    if sig.size == 0:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+    nfft = 1 << 13
+    spectrum = np.fft.fft(sig, nfft)
+    amp_full = np.abs(spectrum) / max(sig.size, 1)
+    half = nfft // 2
+    amp = amp_full[:half].copy()
+    amp[1:] *= 2.0
+    freq = float(fs) * np.arange(half, dtype=float) / float(nfft)
+    peaks_idx, _ = find_peaks(amp)
+    if peaks_idx.size == 0:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+
+    low_hz = float(hr_band_bpm[0]) / 60.0
+    high_hz = float(hr_band_bpm[1]) / 60.0
+    valid = (freq[peaks_idx] >= low_hz) & (freq[peaks_idx] <= high_hz)
+    valid_idx = peaks_idx[valid]
+    if valid_idx.size == 0:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+    threshold = float(np.max(amp[valid_idx])) * float(percent)
+    keep_idx = valid_idx[amp[valid_idx] > threshold]
+    if keep_idx.size == 0:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+    return freq[keep_idx], amp[keep_idx]
+
+
 def _window_fft_hr_spectrum(
     x: np.ndarray,
     fs: int,
@@ -587,6 +753,7 @@ def _rest_ppg_hr_tracked_for_delay(
     motion_start_s: float,
     score_start_s: float,
     rest_hr_kwargs: dict[str, Any],
+    penalty_signal: np.ndarray | None = None,
 ) -> RestHrResult:
     """Shift PPG by candidate Tdelay and extract comparable tracked rest HR."""
 
@@ -603,9 +770,17 @@ def _rest_ppg_hr_tracked_for_delay(
         return RestHrResult(empty, empty, empty, empty, {"reason": "no comparable rest window"})
     max_end = max_start + win_len
     segment = shifted[min_start:max_end]
+    penalty_segment = None
+    if penalty_signal is not None:
+        shifted_penalty = _shift_channel_for_delay(penalty_signal, delay_s, fs)
+        penalty_segment = shifted_penalty[min_start:max_end]
     kwargs = dict(rest_hr_kwargs)
     kwargs["tw_s"] = tw_s
     kwargs["step_s"] = step_s
+    # 中文说明：参考实现的纯 FFT 路径使用 ACC 作为谱惩罚参考；这里传入同一
+    # 时间片的 ACC 窗口，只有 spec_penalty_enable=True 时才会压低运动频率峰。
+    if penalty_segment is not None:
+        kwargs["penalty_signal"] = penalty_segment
     result = extract_rest_ppg_hr_tracked(segment, fs, **kwargs)
     absolute_times = result.times_s + min_start / float(fs)
     return RestHrResult(
@@ -660,6 +835,7 @@ def compute_rest_alignment_diagnostic_curve(
         motion_start_s=float(segment_info.motion_start_s),
         score_start_s=score_start_s,
         rest_hr_kwargs={"tw_s": alignment_tw, "step_s": DEFAULT_ALIGNMENT_STEP_S},
+        penalty_signal=dataset.accz,
     )
     ref_hr = _reference_hr_for_alignment_times(dataset, rest.times_s, alignment_tw)
     ppg_hr = np.asarray(rest.hr_bpm_smooth, dtype=float)

@@ -104,6 +104,8 @@ def test_global_tdelay_cache_key_excludes_train_tw() -> None:
     p6 = ProtocolTrialParams(Fs_Target=50, TW=6.0, Alignment_TW=8.0)
     p10 = ProtocolTrialParams(Fs_Target=50, TW=10.0, Alignment_TW=8.0)
     assert _global_tdelay_cache_key(ds, p6) == _global_tdelay_cache_key(ds, p10)
+    changed_peak_rule = ProtocolTrialParams(Fs_Target=50, TW=6.0, Alignment_TW=8.0, Rest_HR_Peak_Percent=0.5)
+    assert _global_tdelay_cache_key(ds, p6) != _global_tdelay_cache_key(ds, changed_peak_rule)
 
 
 def test_rest_hr_tracking_and_slew_limit_suppress_jump_peak() -> None:
@@ -135,6 +137,41 @@ def test_rest_hr_tracking_and_slew_limit_suppress_jump_peak() -> None:
 
     limited = apply_rest_hr_slew_limit(np.asarray([72.0, 150.0]), slew_limit_bpm=6.0, slew_step_bpm=4.0)
     np.testing.assert_allclose(limited, np.asarray([72.0, 76.0]))
+
+
+def test_rest_hr_reference_style_penalty_is_optional_and_recorded() -> None:
+    fs = 100
+    tw_s = 8.0
+    t = np.arange(int(fs * tw_s), dtype=float) / fs
+    ppg = np.sin(2.0 * np.pi * 1.2 * t)
+    motion_ref = np.sin(2.0 * np.pi * 1.2 * t)
+
+    no_penalty = extract_rest_ppg_hr_tracked(
+        ppg,
+        fs,
+        tw_s=tw_s,
+        step_s=tw_s,
+        hr_band_bpm=(40.0, 120.0),
+        smooth_method="none",
+        return_debug=True,
+    )
+    with_penalty = extract_rest_ppg_hr_tracked(
+        ppg,
+        fs,
+        tw_s=tw_s,
+        step_s=tw_s,
+        hr_band_bpm=(40.0, 120.0),
+        smooth_method="none",
+        penalty_signal=motion_ref,
+        spec_penalty_enable=True,
+        return_debug=True,
+    )
+
+    assert no_penalty.quality is not None
+    assert with_penalty.quality is not None
+    assert not bool(no_penalty.quality["penalty_applied"][0])
+    assert bool(with_penalty.quality["penalty_applied"][0])
+    assert np.isfinite(with_penalty.quality["penalty_freq_hz"][0])
 
 
 def test_rest_hr_moving_median_smoothing_handles_spikes_and_short_arrays() -> None:
