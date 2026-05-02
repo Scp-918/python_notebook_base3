@@ -126,6 +126,9 @@ def plot_rest_alignment_diagnostics_by_motion_type(
     output_dir: str | Path,
     fs_target: int = 100,
     TW: int = 8,
+    alignment_TW: float | None = None,
+    alignment_step_s: float = 1.0,
+    rest_hr_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Path]:
     """Plot rest-segment alignment diagnostics grouped by motion type.
 
@@ -162,8 +165,24 @@ def plot_rest_alignment_diagnostics_by_motion_type(
                 segment = _detect_segments_for_alignment_plot(ds, TW)
                 if not segment.is_valid:
                     raise RuntimeError(segment.reason)
-                aligned = align_ppg_to_ref_hr(ds, segment, TW, int(fs_target), alignment_TW=float(TW))
-                curve = compute_rest_alignment_diagnostic_curve(ds, segment, aligned, TW, int(fs_target))
+                align_tw = float(TW) if alignment_TW is None else float(alignment_TW)
+                aligned = align_ppg_to_ref_hr(
+                    ds,
+                    segment,
+                    TW,
+                    int(fs_target),
+                    alignment_TW=align_tw,
+                    alignment_step_s=float(alignment_step_s),
+                    rest_hr_kwargs=rest_hr_kwargs,
+                )
+                curve = compute_rest_alignment_diagnostic_curve(
+                    ds,
+                    segment,
+                    aligned,
+                    align_tw,
+                    int(fs_target),
+                    rest_hr_kwargs=rest_hr_kwargs,
+                )
                 title = f"{pair.motion_id} | Tdelay={aligned.alignment_info.best_tdelay_s:.2f}s"
                 if curve.empty:
                     ax.text(0.5, 0.5, "no comparable rest windows", ha="center", va="center", transform=ax.transAxes)
@@ -208,7 +227,12 @@ def plot_unaligned_fullfield_ppg_hr_by_motion_type(
     track_band_bpm: float = 30.0,
     slew_limit_bpm: float = 6.0,
     slew_step_bpm: float = 4.0,
+    smooth_method: str = "median",
     smooth_win: int = 3,
+    peak_percent: float = 0.3,
+    spec_penalty_enable: bool = True,
+    spec_penalty_weight: float = 0.2,
+    spec_penalty_width_hz: float = 0.2,
 ) -> dict[str, Path]:
     """按运动类型绘制原始 PPG 全段未对齐 HR 测试图。
 
@@ -256,8 +280,13 @@ def plot_unaligned_fullfield_ppg_hr_by_motion_type(
                     track_band_bpm=float(track_band_bpm),
                     slew_limit_bpm=float(slew_limit_bpm),
                     slew_step_bpm=float(slew_step_bpm),
-                    smooth_method="median",
+                    smooth_method=str(smooth_method),
                     smooth_win=int(smooth_win),
+                    peak_percent=float(peak_percent),
+                    penalty_signal=ds.accz,
+                    spec_penalty_enable=bool(spec_penalty_enable),
+                    spec_penalty_weight=float(spec_penalty_weight),
+                    spec_penalty_width_hz=float(spec_penalty_width_hz),
                 )
                 ax.plot(
                     ds.ref_time_s,
@@ -335,7 +364,12 @@ def plot_raw_ppg_and_unaligned_hr_by_motion_type(
     track_band_bpm: float = 30.0,
     slew_limit_bpm: float = 6.0,
     slew_step_bpm: float = 4.0,
+    smooth_method: str = "median",
     smooth_win: int = 3,
+    peak_percent: float = 0.3,
+    spec_penalty_enable: bool = True,
+    spec_penalty_weight: float = 0.2,
+    spec_penalty_width_hz: float = 0.2,
 ) -> dict[str, Path]:
     """绘制静息段原始 PPG 绿光信号和静息段 PPG 解算 HR 的双 y 轴诊断图。
 
@@ -390,9 +424,13 @@ def plot_raw_ppg_and_unaligned_hr_by_motion_type(
                     track_band_bpm=float(track_band_bpm),
                     slew_limit_bpm=float(slew_limit_bpm),
                     slew_step_bpm=float(slew_step_bpm),
-                    smooth_method="median",
+                    smooth_method=str(smooth_method),
                     smooth_win=int(smooth_win),
+                    peak_percent=float(peak_percent),
                     penalty_signal=rest_accz,
+                    spec_penalty_enable=bool(spec_penalty_enable),
+                    spec_penalty_weight=float(spec_penalty_weight),
+                    spec_penalty_width_hz=float(spec_penalty_width_hz),
                 )
                 raw_line = ax_left.plot(
                     raw_time,

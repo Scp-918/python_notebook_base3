@@ -817,6 +817,7 @@ def compute_rest_alignment_diagnostic_curve(
     aligned: AlignedDataset,
     TW: float,
     fs_target: int,
+    rest_hr_kwargs: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Return comparable rest-window reference HR and PPG FFT HR curves.
 
@@ -828,13 +829,17 @@ def compute_rest_alignment_diagnostic_curve(
     delay_s = float(aligned.alignment_info.best_tdelay_s)
     alignment_tw = float(getattr(aligned.alignment_info, "alignment_tw_s", TW) or TW)
     score_start_s = _REST_ALIGNMENT_SCORE_START_S
+    kwargs = {"tw_s": alignment_tw, "step_s": DEFAULT_ALIGNMENT_STEP_S}
+    kwargs.update(rest_hr_kwargs or {})
+    kwargs["tw_s"] = alignment_tw
+    kwargs.setdefault("step_s", DEFAULT_ALIGNMENT_STEP_S)
     rest = _rest_ppg_hr_tracked_for_delay(
         dataset.ppg_green,
         int(fs_target),
         delay_s=delay_s,
         motion_start_s=float(segment_info.motion_start_s),
         score_start_s=score_start_s,
-        rest_hr_kwargs={"tw_s": alignment_tw, "step_s": DEFAULT_ALIGNMENT_STEP_S},
+        rest_hr_kwargs=kwargs,
         penalty_signal=dataset.accz,
     )
     ref_hr = _reference_hr_for_alignment_times(dataset, rest.times_s, alignment_tw)

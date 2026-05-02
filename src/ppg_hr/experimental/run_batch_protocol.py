@@ -188,6 +188,7 @@ def run_batch_adaptive_protocol(
     n_jobs: int | None = 1,
     debug_mode: bool = False,
     search_space: ProtocolSearchSpace | None = None,
+    trial_param_overrides: dict[str, Any] | None = None,
     target_scopes: list[TargetScope | str] | None = None,
     cascade_schemes: list[CascadeScheme | str] | None = None,
     adaptive_filters: list[str] | None = None,
@@ -262,6 +263,7 @@ def run_batch_adaptive_protocol(
         debug_mode=bool(debug_mode),
     )
     space = search_space or default_protocol_search_space()
+    trial_overrides = _normalise_trial_param_overrides(trial_param_overrides)
 
     def _log(message: str) -> None:
         if on_log is not None:
@@ -420,6 +422,7 @@ def run_batch_adaptive_protocol(
                             space=space,
                             n_trials=budget["n_trials"],
                             n_repeats=budget["n_repeats"],
+                            trial_param_overrides=trial_overrides,
                             reason=reason,
                         )
                     elif data_split_mode == "leave_one_group_out":
@@ -441,6 +444,7 @@ def run_batch_adaptive_protocol(
                                 delay_estimation_mode=delay_estimation_mode,
                                 cfg=cfg,
                                 space=space,
+                                trial_param_overrides=trial_overrides,
                                 n_trials=budget["n_trials"],
                                 n_repeats=budget["n_repeats"],
                                 trial_cache=fold_trial_cache,
@@ -489,6 +493,7 @@ def run_batch_adaptive_protocol(
                             delay_estimation_mode=delay_estimation_mode,
                             cfg=cfg,
                             space=space,
+                            trial_param_overrides=trial_overrides,
                             n_trials=budget["n_trials"],
                             n_repeats=budget["n_repeats"],
                             trial_cache=shared_trial_cache,
@@ -712,6 +717,7 @@ def _optimise_group_mode(
     delay_estimation_mode: str,
     cfg: ProtocolParams,
     space: ProtocolSearchSpace,
+    trial_param_overrides: dict[str, Any] | None,
     n_trials: int,
     n_repeats: int,
     trial_cache: dict[tuple[Any, ...], ProtocolRunResult],
@@ -733,6 +739,7 @@ def _optimise_group_mode(
         adaptive_filter,
         objective_mode,
         delay_estimation_mode=delay_estimation_mode,
+        trial_param_overrides=trial_param_overrides,
     )
     best_repeat_idx = 0
     best_trial_idx = 0
@@ -821,6 +828,7 @@ def _optimise_group_mode(
                     mode_key=f"{scope.value}__{scheme.value}__{adaptive_filter}",
                     repeat_idx=repeat_idx,
                     random_state=random_state,
+                    trial_param_overrides=trial_param_overrides,
                 )
                 objective_metrics = _evaluate_objective_params(params)
                 value = _objective_value(objective_metrics, objective_mode, penalty_value)
@@ -882,6 +890,7 @@ def _optimise_group_mode(
                     mode_key=f"{scope.value}__{scheme.value}__{adaptive_filter}",
                     repeat_idx=repeat_idx,
                     random_state=random_state,
+                    trial_param_overrides=trial_param_overrides,
                 )
                 objective_metrics = _evaluate_objective_params(params)
                 value = _objective_value(objective_metrics, objective_mode, penalty_value)
@@ -955,12 +964,30 @@ def _optimise_group_mode(
     )
 
 
+def _normalise_trial_param_overrides(overrides: dict[str, Any] | None) -> dict[str, Any]:
+    """Validate fixed ProtocolTrialParams overrides that are not sampled by Optuna.
+
+    中文说明：Notebook 可以把静息段 HR 提取参数放在第一个初始化代码块里统一维护。
+    这些参数会覆盖每个 trial 的默认值，但不会进入 Optuna 搜索空间；未知字段直接报错，
+    避免因为拼写错误导致配置看似生效、实际被忽略。
+    """
+
+    if not overrides:
+        return {}
+    valid_names = {item.name for item in fields(ProtocolTrialParams)}
+    unknown = sorted(set(overrides) - valid_names)
+    if unknown:
+        raise ValueError(f"Unknown ProtocolTrialParams overrides: {unknown}")
+    return dict(overrides)
+
+
 def _default_params_for_filter(
     space: ProtocolSearchSpace,
     adaptive_filter: str,
     objective_mode: str,
     *,
     delay_estimation_mode: str = "envelope",
+    trial_param_overrides: dict[str, Any] | None = None,
 ) -> ProtocolTrialParams:
     values = {}
     for name in space.names_for_filter(adaptive_filter):
@@ -972,6 +999,7 @@ def _default_params_for_filter(
     values["adaptive_filter"] = adaptive_filter
     values["objective_mode"] = objective_mode
     values["delay_estimation_mode"] = str(delay_estimation_mode)
+    values.update(_normalise_trial_param_overrides(trial_param_overrides))
     return ProtocolTrialParams(**values)
 
 
@@ -985,6 +1013,7 @@ def _decode_with_seed(
     mode_key: str,
     repeat_idx: int,
     random_state: int,
+    trial_param_overrides: dict[str, Any] | None = None,
 ) -> ProtocolTrialParams:
     params = decode_protocol_search_space(
         space,
@@ -994,6 +1023,9 @@ def _decode_with_seed(
         rff_seed=0,
     )
     params = replace(params, delay_estimation_mode=str(delay_estimation_mode))
+    overrides = _normalise_trial_param_overrides(trial_param_overrides)
+    if overrides:
+        params = replace(params, **overrides)
     if adaptive_filter == "rff_lms":
         seed_payload = {
             **{k: v for k, v in params.to_dict().items() if k != "rff_seed"},
@@ -1018,6 +1050,7 @@ def _failed_mode_optimisation(
     n_trials: int,
     n_repeats: int,
     reason: str,
+    trial_param_overrides: dict[str, Any] | None = None,
 ) -> _ModeOptimisation:
     """Build a stable failed mode result without stopping the batch.
 
@@ -1038,6 +1071,7 @@ def _failed_mode_optimisation(
             adaptive_filter,
             objective_mode,
             delay_estimation_mode=delay_estimation_mode,
+            trial_param_overrides=trial_param_overrides,
         ),
         best_repeat_idx=0,
         best_trial_idx=0,
