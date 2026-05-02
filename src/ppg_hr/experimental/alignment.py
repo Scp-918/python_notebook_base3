@@ -17,13 +17,12 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy.signal import find_peaks
-from scipy.signal.windows import hamming
 
 from ..core.find_near_biggest import find_near_biggest
 from ..preprocess.utils import smoothdata_movmedian
 from .preprocess_protocol import ProtocolDataset
 from .segmentation import SegmentInfo
+from .spectral_utils import compute_power_spectrum, fft_peak_candidates, prepare_fft_window
 
 __all__ = [
     "AlignedDataset",
@@ -659,25 +658,14 @@ def _rest_spectrum_candidates_like_reference(
 def _prepare_rest_fft_window(x: np.ndarray) -> np.ndarray:
     """Demean and Hamming-window one PPG segment before reference-style peak search."""
 
-    sig = np.asarray(x, dtype=float).ravel()
-    if sig.size == 0:
-        return sig.copy()
-    sig = sig.copy()
-    sig[~np.isfinite(sig)] = 0.0
-    sig = sig - float(np.mean(sig))
     # 中文说明：参考仓库在进入频谱后处理前使用 scipy 的默认对称 Hamming 窗。
-    return sig * hamming(sig.size)
+    return prepare_fft_window(x, apply_hamming=True, demean=True, hamming_sym=True)
 
 
 def _prepare_penalty_fft_window(x: np.ndarray) -> np.ndarray:
     """Prepare an optional motion-penalty reference window for peak extraction."""
 
-    sig = np.asarray(x, dtype=float).ravel()
-    if sig.size == 0:
-        return sig.copy()
-    sig = sig.copy()
-    sig[~np.isfinite(sig)] = 0.0
-    return sig - float(np.mean(sig))
+    return prepare_fft_window(x, apply_hamming=False, demean=True)
 
 
 def _fft_peak_candidates(
@@ -693,31 +681,7 @@ def _fft_peak_candidates(
     或 40-180 BPM 等配置。
     """
 
-    sig = np.asarray(signal, dtype=float).ravel()
-    if sig.size == 0:
-        return np.asarray([], dtype=float), np.asarray([], dtype=float)
-    nfft = 1 << 13
-    spectrum = np.fft.fft(sig, nfft)
-    amp_full = np.abs(spectrum) / max(sig.size, 1)
-    half = nfft // 2
-    amp = amp_full[:half].copy()
-    amp[1:] *= 2.0
-    freq = float(fs) * np.arange(half, dtype=float) / float(nfft)
-    peaks_idx, _ = find_peaks(amp)
-    if peaks_idx.size == 0:
-        return np.asarray([], dtype=float), np.asarray([], dtype=float)
-
-    low_hz = float(hr_band_bpm[0]) / 60.0
-    high_hz = float(hr_band_bpm[1]) / 60.0
-    valid = (freq[peaks_idx] >= low_hz) & (freq[peaks_idx] <= high_hz)
-    valid_idx = peaks_idx[valid]
-    if valid_idx.size == 0:
-        return np.asarray([], dtype=float), np.asarray([], dtype=float)
-    threshold = float(np.max(amp[valid_idx])) * float(percent)
-    keep_idx = valid_idx[amp[valid_idx] > threshold]
-    if keep_idx.size == 0:
-        return np.asarray([], dtype=float), np.asarray([], dtype=float)
-    return freq[keep_idx], amp[keep_idx]
+    return fft_peak_candidates(signal, fs, hr_band_bpm, percent, nfft=1 << 13)
 
 
 def _window_fft_hr_spectrum(
@@ -730,13 +694,7 @@ def _window_fft_hr_spectrum(
     sig = np.asarray(x, dtype=float)
     if sig.size < 4 or not np.isfinite(sig).any():
         return np.asarray([], dtype=float), np.asarray([], dtype=float)
-    sig = sig.copy()
-    sig[~np.isfinite(sig)] = 0.0
-    sig = sig - float(np.mean(sig))
-    sig = sig * hamming(sig.size, sym=False)
-    nfft = max(8192, 1 << int(np.ceil(np.log2(max(sig.size, 1)))))
-    freq = np.fft.rfftfreq(nfft, d=1.0 / fs)
-    amp = np.abs(np.fft.rfft(sig, n=nfft))
+    freq, amp = compute_power_spectrum(sig, fs, apply_hamming=True, demean=True)
     low_hz = float(hr_band_bpm[0]) / 60.0
     high_hz = float(hr_band_bpm[1]) / 60.0
     mask = (freq >= low_hz) & (freq <= high_hz)
@@ -982,11 +940,7 @@ def _window_fft_hr(x: np.ndarray, fs: int, low_hz: float, high_hz: float) -> flo
     sig = np.asarray(x, dtype=float)
     if sig.size < 4 or not np.isfinite(sig).any():
         return float("nan")
-    sig = sig - np.nanmean(sig)
-    sig = sig * hamming(sig.size, sym=False)
-    nfft = max(8192, 1 << int(np.ceil(np.log2(max(sig.size, 1)))))
-    freq = np.fft.rfftfreq(nfft, d=1.0 / fs)
-    amp = np.abs(np.fft.rfft(sig, n=nfft))
+    freq, amp = compute_power_spectrum(sig, fs, apply_hamming=True, demean=True)
     mask = (freq >= low_hz) & (freq <= high_hz)
     if not mask.any():
         return float("nan")

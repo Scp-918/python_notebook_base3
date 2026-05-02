@@ -8,7 +8,13 @@ from typing import Any
 import numpy as np
 from scipy.signal import butter, filtfilt, hilbert
 
+try:
+    from numba import njit
+except Exception:  # pragma: no cover - exercised only without numba
+    njit = None
+
 __all__ = ["ChannelDelay", "DelayEstimate", "estimate_envelope_delays"]
+NUMBA_AVAILABLE = njit is not None
 
 # 中文说明：本文件按 HF/CF/ACC 三类补偿信号分别估计相对 PPG 的包络时延。
 # D_opt_samples > 0 表示补偿信号超前 PPG，可用因果 LMS；D_opt_samples < 0
@@ -161,6 +167,17 @@ def _direct_signal(x: np.ndarray) -> np.ndarray:
 
 
 def _best_delay(ppg_env: np.ndarray, comp_env: np.ndarray, max_lag: int) -> tuple[int, float]:
+    if NUMBA_AVAILABLE:
+        try:
+            a = np.ascontiguousarray(np.asarray(ppg_env, dtype=np.float64).ravel())
+            b = np.ascontiguousarray(np.asarray(comp_env, dtype=np.float64).ravel())
+            return _best_delay_numba(a, b, int(max_lag))
+        except Exception:
+            return _best_delay_python_reference(ppg_env, comp_env, max_lag)
+    return _best_delay_python_reference(ppg_env, comp_env, max_lag)
+
+
+def _best_delay_python_reference(ppg_env: np.ndarray, comp_env: np.ndarray, max_lag: int) -> tuple[int, float]:
     best_delay = 0
     best_corr = 0.0
     for delay in range(-max_lag, max_lag + 1):
@@ -172,6 +189,75 @@ def _best_delay(ppg_env: np.ndarray, comp_env: np.ndarray, max_lag: int) -> tupl
             best_delay = delay
             best_corr = corr
     return best_delay, best_corr
+
+
+if NUMBA_AVAILABLE:
+
+    @njit(cache=True)
+    def _best_delay_numba_impl(ppg_env: np.ndarray, comp_env: np.ndarray, max_lag: int) -> tuple[int, float]:
+        n = min(ppg_env.size, comp_env.size)
+        best_delay = 0
+        best_corr = 0.0
+        for delay in range(-max_lag, max_lag + 1):
+            if delay > 0:
+                start_a = delay
+                start_b = 0
+                size = n - delay
+            elif delay < 0:
+                k = -delay
+                start_a = 0
+                start_b = k
+                size = n - k
+            else:
+                start_a = 0
+                start_b = 0
+                size = n
+            if size < 3:
+                continue
+
+            sum_a = 0.0
+            sum_b = 0.0
+            valid = True
+            for i in range(size):
+                av = ppg_env[start_a + i]
+                bv = comp_env[start_b + i]
+                if not np.isfinite(av) or not np.isfinite(bv):
+                    valid = False
+                    break
+                sum_a += av
+                sum_b += bv
+            if not valid:
+                corr = 0.0
+            else:
+                mean_a = sum_a / size
+                mean_b = sum_b / size
+                dot_ab = 0.0
+                dot_aa = 0.0
+                dot_bb = 0.0
+                for i in range(size):
+                    aa = ppg_env[start_a + i] - mean_a
+                    bb = comp_env[start_b + i] - mean_b
+                    dot_ab += aa * bb
+                    dot_aa += aa * aa
+                    dot_bb += bb * bb
+                denom = np.sqrt(dot_aa) * np.sqrt(dot_bb)
+                if denom <= 1e-12 or not np.isfinite(denom):
+                    corr = 0.0
+                else:
+                    corr = dot_ab / denom
+            if abs(corr) > abs(best_corr):
+                best_delay = delay
+                best_corr = corr
+        return best_delay, best_corr
+
+
+    def _best_delay_numba(ppg_env: np.ndarray, comp_env: np.ndarray, max_lag: int) -> tuple[int, float]:
+        return _best_delay_numba_impl(ppg_env, comp_env, int(max_lag))
+
+else:
+
+    def _best_delay_numba(ppg_env: np.ndarray, comp_env: np.ndarray, max_lag: int) -> tuple[int, float]:
+        return _best_delay_python_reference(ppg_env, comp_env, max_lag)
 
 
 def _aligned_for_delay(

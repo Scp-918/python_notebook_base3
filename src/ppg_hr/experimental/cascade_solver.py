@@ -9,13 +9,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy.signal import find_peaks
-from scipy.signal.windows import hamming
 
 from ..core.find_near_biggest import find_near_biggest
 from ..params import CascadeScheme, TargetScope
@@ -34,13 +31,16 @@ from .preprocess_protocol import PROTOCOL_CHANNELS, ProtocolDataset, resample_pr
 from .protocol_search_space import ProtocolTrialParams
 from .rff_lms import noncausal_rff_lms_filter
 from .segmentation import SegmentInfo, detect_activity_segments
+from .spectral_utils import compute_power_spectrum, dominant_frequency_in_band
 from .volterra import noncausal_volterra_filter
 
 __all__ = [
     "MetricArrays",
     "ProtocolRunResult",
     "aggregate_metric_arrays",
+    "clear_all_caches",
     "clear_trial_caches",
+    "clear_trial_heavy_caches",
     "extract_hr_with_penalty",
     "extract_plain_fft_hr",
     "run_protocol_trial",
@@ -525,19 +525,37 @@ def _store_trial_base(cache: dict[Any, _TrialBase], key: Any, base: _TrialBase) 
         cache.pop(next(iter(cache)))
 
 
-def clear_trial_caches(dataset: ProtocolDataset) -> None:
-    """Clear per-dataset TrialBase/global-alignment caches created by this module.
+def clear_trial_heavy_caches(dataset: ProtocolDataset) -> None:
+    """Clear trial/window caches while preserving global Tdelay alignment.
 
-    中文说明：LOGO 每个 fold 完成后会调用它释放归一化窗口、频谱和 delay estimate
-    小缓存，避免长时间 Notebook 运行时内存随 trial/fold 持续增长。
+    This releases the heavy TrialBase objects and their normalized windows,
+    per-window delay estimates, and spectra. It intentionally keeps
+    ``_global_tdelay_cache`` so LOGO folds can reuse sample/Fs/Alignment_TW
+    alignment results.
     """
 
     cache = getattr(dataset, "_trial_base_cache", None)
     if isinstance(cache, dict):
         cache.clear()
+
+
+def clear_all_caches(dataset: ProtocolDataset) -> None:
+    """Clear all dataset-level caches created by this module."""
+
+    clear_trial_heavy_caches(dataset)
     align_cache = getattr(dataset, "_global_tdelay_cache", None)
     if isinstance(align_cache, dict):
         align_cache.clear()
+
+
+def clear_trial_caches(dataset: ProtocolDataset) -> None:
+    """Backward-compatible full cache clear.
+
+    New LOGO batch code uses :func:`clear_trial_heavy_caches` after each fold
+    and :func:`clear_all_caches` at motion_type boundaries.
+    """
+
+    clear_all_caches(dataset)
 
 
 def extract_hr_with_penalty(
@@ -657,7 +675,7 @@ def _run_windows(
         adaptive_out.append(float(adaptive_hr))
 
         if collect_frame:
-            stages_json = json.dumps(adaptive_stages, ensure_ascii=False) if collect_stages else "[]"
+            stages_json = json.dumps(adaptive_stages, ensure_ascii=False) if collect_stages else ""
             rows.append(
                 {
                     "sample": ds.sample_stem,
@@ -954,58 +972,13 @@ def _extract_hr(
 def _spectrum(signal: np.ndarray, fs: int) -> tuple[np.ndarray, np.ndarray]:
     """Return Hamming-windowed FFT amplitude spectrum."""
 
-    sig = np.asarray(signal, dtype=float)
-    sig = sig.copy()
-    sig[~np.isfinite(sig)] = 0.0
-    if sig.size == 0:
-        return np.asarray([], dtype=float), np.asarray([], dtype=float)
-    sig = sig - float(np.mean(sig))
-    sig = sig * _cached_hamming(sig.size)
-    nfft = max(8192, 1 << int(np.ceil(np.log2(max(sig.size, 1)))))
-    freq = _cached_rfftfreq(int(fs), int(nfft))
-    amp = np.abs(np.fft.rfft(sig, n=nfft))
-    return freq, amp
-
-
-@lru_cache(maxsize=32)
-def _cached_hamming(signal_len: int) -> np.ndarray:
-    """Return a cached read-only Hamming window.
-
-    中文说明：FFT HR 提取会反复使用同长度 Hamming 窗，缓存只读数组可以减少
-    小对象分配，调用方不得原地修改。
-    """
-
-    win = hamming(int(signal_len), sym=False)
-    win.setflags(write=False)
-    return win
-
-
-@lru_cache(maxsize=32)
-def _cached_rfftfreq(fs: int, nfft: int) -> np.ndarray:
-    """Return a cached read-only FFT frequency axis.
-
-    中文说明：频率轴只由采样率和 nfft 决定，适合小型 LRU 缓存复用。
-    """
-
-    freq = np.fft.rfftfreq(int(nfft), d=1.0 / int(fs))
-    freq.setflags(write=False)
-    return freq
+    return compute_power_spectrum(signal, fs, apply_hamming=True, demean=True)
 
 
 def _dominant_frequency(signal: np.ndarray, fs: int, low_hz: float, high_hz: float) -> float:
     """Find the dominant spectral peak in a frequency band."""
 
-    freq, amp = _spectrum(signal, fs)
-    mask = (freq >= low_hz) & (freq <= high_hz)
-    if not mask.any():
-        return float("nan")
-    peaks, _ = find_peaks(amp[mask])
-    valid_idx = np.flatnonzero(mask)
-    if peaks.size:
-        idx = valid_idx[peaks[int(np.argmax(amp[valid_idx][peaks]))]]
-    else:
-        idx = valid_idx[int(np.argmax(amp[valid_idx]))]
-    return float(freq[idx])
+    return dominant_frequency_in_band(signal, fs, low_hz, high_hz)
 
 
 def _normalise_window(window: dict[str, np.ndarray]) -> dict[str, np.ndarray]:

@@ -14,7 +14,9 @@ import json
 import math
 import os
 import shutil
+from collections import OrderedDict
 from dataclasses import dataclass, field, fields, replace
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
@@ -36,7 +38,9 @@ from .cascade_solver import (
     ProtocolRunResult,
     _get_trial_base,
     aggregate_metric_arrays,
+    clear_all_caches,
     clear_trial_caches,
+    clear_trial_heavy_caches,
     run_protocol_trial,
 )
 from .preprocess_protocol import ProtocolDataset, load_and_preprocess_protocol
@@ -64,6 +68,7 @@ if optuna is not None:
 _VALID_FILTERS = ("lms", "volterra", "rff_lms")
 _VALID_OBJECTIVES = ("aae", "accuracy")
 _VALID_SPLIT_MODES = ("split", "all_train", "leave_one_group_out")
+_DEFAULT_TRIAL_CACHE_MAX_ENTRIES = 128
 
 
 @dataclass
@@ -116,6 +121,11 @@ class _ModeOptimisation:
     test_group_id: str = ""
     fold_results: list["_ModeOptimisation"] = field(default_factory=list, repr=False)
     metric_arrays_by_split: dict[str, MetricArrays] = field(default_factory=dict, repr=False)
+    result_level: str = "fold"
+    aggregation: str = ""
+    params_semantics: str = ""
+    representative_fold_id: int | None = None
+    representative_heldout_group_id: str = ""
 
     @property
     def mode_key(self) -> str:
@@ -186,6 +196,8 @@ def run_batch_adaptive_protocol(
     penalty_value: float = 999.0,
     parallel_repeats: int = 1,
     n_jobs: int | None = 1,
+    trial_cache_max_entries: int = _DEFAULT_TRIAL_CACHE_MAX_ENTRIES,
+    save_stage_json: bool = False,
     debug_mode: bool = False,
     search_space: ProtocolSearchSpace | None = None,
     trial_param_overrides: dict[str, Any] | None = None,
@@ -262,6 +274,8 @@ def run_batch_adaptive_protocol(
         parallel_repeats=int(n_jobs if n_jobs is not None else parallel_repeats),
         debug_mode=bool(debug_mode),
     )
+    save_stage_json = bool(save_stage_json or debug_mode)
+    trial_cache_max_entries = max(1, int(trial_cache_max_entries))
     space = search_space or default_protocol_search_space()
     trial_overrides = _normalise_trial_param_overrides(trial_param_overrides)
 
@@ -390,7 +404,7 @@ def run_batch_adaptive_protocol(
         all_ids = _unique_ids_from_folds(folds)
 
         mode_results: list[_ModeOptimisation] = []
-        shared_trial_cache: dict[tuple[Any, ...], ProtocolRunResult] = {}
+        shared_trial_cache: OrderedDict[tuple[Any, ...], ProtocolRunResult] = OrderedDict()
         for scope in scopes:
             for scheme in schemes:
                 budget = _budget_for_scheme(cascade_train_budgets, scheme, cfg)
@@ -428,7 +442,7 @@ def run_batch_adaptive_protocol(
                     elif data_split_mode == "leave_one_group_out":
                         fold_results: list[_ModeOptimisation] = []
                         for fold in valid_folds:
-                            fold_trial_cache: dict[tuple[Any, ...], ProtocolRunResult] = {}
+                            fold_trial_cache: OrderedDict[tuple[Any, ...], ProtocolRunResult] = OrderedDict()
                             train_ids = list(fold["train"])
                             test_ids = list(fold["test"])
                             result_fold = _optimise_group_mode(
@@ -452,6 +466,9 @@ def run_batch_adaptive_protocol(
                                 mode_idx=mode_counter,
                                 mode_total=total_modes,
                                 random_state=int(random_state),
+                                n_jobs=int(cfg.parallel_repeats),
+                                trial_cache_max_entries=trial_cache_max_entries,
+                                save_stage_json=save_stage_json,
                                 on_progress=_progress,
                                 fold_id=int(fold["fold_id"]),
                                 heldout_group_id=str(fold["heldout_group_id"]),
@@ -461,7 +478,7 @@ def run_batch_adaptive_protocol(
                             fold_results.append(result_fold)
                             fold_trial_cache.clear()
                             for gid in train_ids + test_ids:
-                                clear_trial_caches(datasets[gid])
+                                clear_trial_heavy_caches(datasets[gid])
                             del fold_trial_cache
                             gc.collect()
                         result = _aggregate_logo_fold_results(
@@ -501,6 +518,9 @@ def run_batch_adaptive_protocol(
                             mode_idx=mode_counter,
                             mode_total=total_modes,
                             random_state=int(random_state),
+                            n_jobs=int(cfg.parallel_repeats),
+                            trial_cache_max_entries=trial_cache_max_entries,
+                            save_stage_json=save_stage_json,
                             on_progress=_progress,
                             fold_id=0,
                             heldout_group_id="",
@@ -515,7 +535,7 @@ def run_batch_adaptive_protocol(
         bayes_tables[motion_type] = bayes_path
         shared_trial_cache.clear()
         for gid in all_ids:
-            clear_trial_caches(datasets[gid])
+            clear_all_caches(datasets[gid])
         batch_rows.append(
             {
                 "motion_type": motion_type,
@@ -703,6 +723,171 @@ def _budget_for_scheme(
     }
 
 
+def _run_one_optuna_repeat(
+    *,
+    repeat_idx: int,
+    motion_type: str,
+    objective_sets: dict[str, ProtocolDataset],
+    objective_split: str,
+    scope: TargetScope,
+    scheme: CascadeScheme,
+    adaptive_filter: str,
+    objective_mode: str,
+    delay_estimation_mode: str,
+    space: ProtocolSearchSpace,
+    trial_param_overrides: dict[str, Any] | None,
+    n_trials: int,
+    num_seed_points: int,
+    penalty_value: float,
+    random_state: int,
+    fold_id: int | None,
+    heldout_group_id: str,
+    trial_cache_max_entries: int,
+) -> dict[str, Any]:
+    """Run one independent Optuna/random repeat for repeat-level parallelism."""
+
+    trial_cache: OrderedDict[tuple[Any, ...], ProtocolRunResult] = OrderedDict()
+    best_value = float("inf")
+    best_params = _default_params_for_filter(
+        space,
+        adaptive_filter,
+        objective_mode,
+        delay_estimation_mode=delay_estimation_mode,
+        trial_param_overrides=trial_param_overrides,
+    )
+    best_trial_idx = 0
+    history: list[dict[str, Any]] = []
+    best_so_far = float("inf")
+
+    def _evaluate(params: ProtocolTrialParams) -> dict[str, Any]:
+        metrics, _, _ = _evaluate_dataset_map(
+            objective_sets,
+            scope,
+            scheme,
+            params,
+            objective_split,
+            trial_cache,
+            eval_mode="light",
+            save_stage_json=False,
+            trial_cache_max_entries=trial_cache_max_entries,
+            fold_id=fold_id,
+            heldout_group_id=heldout_group_id,
+        )
+        return metrics
+
+    try:
+        if optuna is not None and TPESampler is not None:
+            sampler = TPESampler(
+                seed=int(random_state) + int(repeat_idx),
+                n_startup_trials=min(int(num_seed_points), int(n_trials)),
+            )
+            study = optuna.create_study(direction="minimize", sampler=sampler)
+
+            def _objective(trial: optuna.trial.Trial) -> float:
+                nonlocal best_value, best_params, best_trial_idx, best_so_far
+
+                idx_map = {
+                    name: trial.suggest_int(name, 0, len(space.options(name)) - 1)
+                    for name in space.names_for_filter(adaptive_filter)
+                }
+                params = _decode_with_seed(
+                    space,
+                    idx_map,
+                    adaptive_filter=adaptive_filter,
+                    objective_mode=objective_mode,
+                    delay_estimation_mode=delay_estimation_mode,
+                    mode_key=f"{scope.value}__{scheme.value}__{adaptive_filter}",
+                    repeat_idx=repeat_idx,
+                    random_state=random_state,
+                    trial_param_overrides=trial_param_overrides,
+                )
+                metrics = _evaluate(params)
+                value = _objective_value(metrics, objective_mode, penalty_value)
+                best_so_far = min(best_so_far, value)
+                if value < best_value:
+                    best_value = value
+                    best_params = params
+                    best_trial_idx = int(trial.number)
+                _append_history(
+                    history,
+                    motion_type,
+                    scope,
+                    scheme,
+                    adaptive_filter,
+                    params,
+                    repeat_idx,
+                    int(trial.number),
+                    value,
+                    metrics,
+                    best_so_far,
+                    fold_id=fold_id,
+                    heldout_group_id=heldout_group_id,
+                )
+                return value
+
+            study.optimize(_objective, n_trials=int(n_trials), show_progress_bar=False)
+        else:
+            rng = np.random.default_rng(int(random_state) + int(repeat_idx))
+            for trial_idx in range(int(n_trials)):
+                idx_map = {
+                    name: int(rng.integers(0, len(space.options(name))))
+                    for name in space.names_for_filter(adaptive_filter)
+                }
+                params = _decode_with_seed(
+                    space,
+                    idx_map,
+                    adaptive_filter=adaptive_filter,
+                    objective_mode=objective_mode,
+                    delay_estimation_mode=delay_estimation_mode,
+                    mode_key=f"{scope.value}__{scheme.value}__{adaptive_filter}",
+                    repeat_idx=repeat_idx,
+                    random_state=random_state,
+                    trial_param_overrides=trial_param_overrides,
+                )
+                metrics = _evaluate(params)
+                value = _objective_value(metrics, objective_mode, penalty_value)
+                best_so_far = min(best_so_far, value)
+                if value < best_value:
+                    best_value = value
+                    best_params = params
+                    best_trial_idx = int(trial_idx)
+                _append_history(
+                    history,
+                    motion_type,
+                    scope,
+                    scheme,
+                    adaptive_filter,
+                    params,
+                    repeat_idx,
+                    int(trial_idx),
+                    value,
+                    metrics,
+                    best_so_far,
+                    fold_id=fold_id,
+                    heldout_group_id=heldout_group_id,
+                )
+    finally:
+        trial_cache.clear()
+        for dataset in objective_sets.values():
+            clear_trial_heavy_caches(dataset)
+
+    return {
+        "repeat_idx": int(repeat_idx),
+        "best_value": float(best_value),
+        "best_params": best_params,
+        "best_trial_idx": int(best_trial_idx),
+        "history": history,
+    }
+
+
+def _recompute_history_best_so_far(history: list[dict[str, Any]]) -> None:
+    best = float("inf")
+    for row in history:
+        value = float(row.get("objective_value", float("inf")))
+        best = min(best, value)
+        row["best_so_far"] = float(best)
+
+
 def _optimise_group_mode(
     *,
     motion_type: str,
@@ -720,12 +905,15 @@ def _optimise_group_mode(
     trial_param_overrides: dict[str, Any] | None,
     n_trials: int,
     n_repeats: int,
-    trial_cache: dict[tuple[Any, ...], ProtocolRunResult],
+    trial_cache: OrderedDict[tuple[Any, ...], ProtocolRunResult] | dict[tuple[Any, ...], ProtocolRunResult],
     penalty_value: float,
     mode_idx: int,
     mode_total: int,
     random_state: int,
     on_progress: Callable[[dict[str, Any]], None],
+    n_jobs: int = 1,
+    trial_cache_max_entries: int = _DEFAULT_TRIAL_CACHE_MAX_ENTRIES,
+    save_stage_json: bool = False,
     fold_id: int | None = None,
     heldout_group_id: str = "",
     train_group_ids: list[str] | None = None,
@@ -747,6 +935,7 @@ def _optimise_group_mode(
     best_so_far = float("inf")
     objective_sets = val_sets if data_split_mode == "split" else train_sets
     objective_split = "val" if data_split_mode == "split" else "train"
+    actual_n_jobs = min(max(1, int(n_jobs or 1)), int(n_repeats))
 
     def _evaluate_objective_params(params: ProtocolTrialParams) -> dict[str, Any]:
         metrics, _, _ = _evaluate_dataset_map(
@@ -757,6 +946,8 @@ def _optimise_group_mode(
             objective_split,
             trial_cache,
             eval_mode="light",
+            save_stage_json=False,
+            trial_cache_max_entries=trial_cache_max_entries,
             fold_id=fold_id,
             heldout_group_id=heldout_group_id,
         )
@@ -773,6 +964,8 @@ def _optimise_group_mode(
             "train",
             trial_cache,
             eval_mode="full",
+            save_stage_json=save_stage_json,
+            trial_cache_max_entries=trial_cache_max_entries,
             fold_id=fold_id,
             heldout_group_id=heldout_group_id,
         )
@@ -785,6 +978,8 @@ def _optimise_group_mode(
                 "val",
                 trial_cache,
                 eval_mode="full",
+                save_stage_json=save_stage_json,
+                trial_cache_max_entries=trial_cache_max_entries,
                 fold_id=fold_id,
                 heldout_group_id=heldout_group_id,
             )
@@ -798,13 +993,95 @@ def _optimise_group_mode(
             "test",
             trial_cache,
             eval_mode="full",
+            save_stage_json=save_stage_json,
+            trial_cache_max_entries=trial_cache_max_entries,
             fold_id=fold_id,
             heldout_group_id=heldout_group_id,
         )
         arrays_by_split = {"train": train_arrays, "val": val_arrays, "test": test_arrays}
         return train_metrics, val_metrics, test_metrics, [*train_rows, *val_rows, *test_rows], arrays_by_split
 
-    for repeat_idx in range(int(n_repeats)):
+    if actual_n_jobs > 1 and int(n_repeats) > 1:
+        on_progress(
+            {
+                "stage": "optimization_parallel_repeats_start",
+                "parallel_level": "repeat",
+                "motion_type": motion_type,
+                "mode_idx": mode_idx,
+                "mode_total": mode_total,
+                "target_scope": scope.name,
+                "target_scope_value": scope.value,
+                "cascade_scheme": scheme.value,
+                "adaptive_filter": adaptive_filter,
+                "fold_id": "" if fold_id is None else int(fold_id),
+                "heldout_group_id": heldout_group_id,
+                "repeat_total": int(n_repeats),
+                "repeat_done": 0,
+                "n_jobs": int(actual_n_jobs),
+            }
+        )
+        futures = []
+        with ProcessPoolExecutor(max_workers=int(actual_n_jobs)) as executor:
+            for repeat_idx in range(int(n_repeats)):
+                futures.append(
+                    executor.submit(
+                        _run_one_optuna_repeat,
+                        repeat_idx=repeat_idx,
+                        motion_type=motion_type,
+                        objective_sets=objective_sets,
+                        objective_split=objective_split,
+                        scope=scope,
+                        scheme=scheme,
+                        adaptive_filter=adaptive_filter,
+                        objective_mode=objective_mode,
+                        delay_estimation_mode=delay_estimation_mode,
+                        space=space,
+                        trial_param_overrides=trial_param_overrides,
+                        n_trials=int(n_trials),
+                        num_seed_points=int(cfg.num_seed_points),
+                        penalty_value=float(penalty_value),
+                        random_state=int(random_state),
+                        fold_id=fold_id,
+                        heldout_group_id=heldout_group_id,
+                        trial_cache_max_entries=int(trial_cache_max_entries),
+                    )
+                )
+            done_count = 0
+            for future in as_completed(futures):
+                item = future.result()
+                done_count += 1
+                history.extend(item["history"])
+                value = float(item["best_value"])
+                if value < best_value:
+                    best_value = value
+                    best_params = item["best_params"]
+                    best_repeat_idx = int(item["repeat_idx"])
+                    best_trial_idx = int(item["best_trial_idx"])
+                on_progress(
+                    {
+                        "stage": "optimization_parallel_repeat_done",
+                        "parallel_level": "repeat",
+                        "motion_type": motion_type,
+                        "mode_idx": mode_idx,
+                        "mode_total": mode_total,
+                        "target_scope": scope.name,
+                        "target_scope_value": scope.value,
+                        "cascade_scheme": scheme.value,
+                        "adaptive_filter": adaptive_filter,
+                        "fold_id": "" if fold_id is None else int(fold_id),
+                        "heldout_group_id": heldout_group_id,
+                        "repeat_current": int(item["repeat_idx"]) + 1,
+                        "repeat_total": int(n_repeats),
+                        "repeat_done": int(done_count),
+                        "n_jobs": int(actual_n_jobs),
+                        "best_value": float(value),
+                        "global_best_value": float(best_value),
+                    }
+                )
+        history.sort(key=lambda row: (int(row.get("repeat_idx", 0)), int(row.get("trial_idx", 0))))
+        _recompute_history_best_so_far(history)
+
+    for repeat_idx in ([] if actual_n_jobs > 1 and int(n_repeats) > 1 else range(int(n_repeats))):
         if optuna is not None and TPESampler is not None:
             sampler = TPESampler(
                 seed=int(random_state) + repeat_idx,
@@ -961,6 +1238,8 @@ def _optimise_group_mode(
         train_group_ids=list(train_group_ids or train_sets.keys()),
         test_group_id=str(test_group_id),
         metric_arrays_by_split=arrays_by_split,
+        result_level="fold" if data_split_mode == "leave_one_group_out" else "single_split",
+        params_semantics="fold_best_params" if data_split_mode == "leave_one_group_out" else "best_params_for_this_split",
     )
 
 
@@ -1084,6 +1363,13 @@ def _failed_mode_optimisation(
         history=[],
         success=False,
         reason=reason,
+        result_level="aggregate" if data_split_mode == "leave_one_group_out" else "single_split",
+        aggregation="logo_window_concat" if data_split_mode == "leave_one_group_out" else "",
+        params_semantics=(
+            "representative_fold_best_params_not_global"
+            if data_split_mode == "leave_one_group_out"
+            else "best_params_for_this_split"
+        ),
     )
 
 
@@ -1126,6 +1412,9 @@ def _aggregate_logo_fold_results(
             history=[],
             success=False,
             reason=reason,
+            result_level="aggregate",
+            aggregation="logo_window_concat",
+            params_semantics="representative_fold_best_params_not_global",
         )
 
     test_arrays = _concat_metric_arrays([r.metric_arrays_by_split.get("test", {}) for r in fold_results])
@@ -1168,6 +1457,11 @@ def _aggregate_logo_fold_results(
         success=success,
         reason=reason,
         fold_results=fold_results,
+        result_level="aggregate",
+        aggregation="logo_window_concat",
+        params_semantics="representative_fold_best_params_not_global",
+        representative_fold_id=best_fold.fold_id,
+        representative_heldout_group_id=best_fold.heldout_group_id,
     )
 
 
@@ -1177,9 +1471,11 @@ def _evaluate_dataset_map(
     scheme: CascadeScheme,
     params: ProtocolTrialParams,
     split_name: str,
-    trial_cache: dict[tuple[Any, ...], ProtocolRunResult],
+    trial_cache: OrderedDict[tuple[Any, ...], ProtocolRunResult] | dict[tuple[Any, ...], ProtocolRunResult],
     *,
     eval_mode: str = "full",
+    save_stage_json: bool = False,
+    trial_cache_max_entries: int = _DEFAULT_TRIAL_CACHE_MAX_ENTRIES,
     fold_id: int | None = None,
     heldout_group_id: str = "",
 ) -> tuple[dict[str, Any], list[dict[str, Any]], MetricArrays]:
@@ -1207,6 +1503,8 @@ def _evaluate_dataset_map(
             params.cache_key(),
         )
         run = trial_cache.get(cache_key)
+        if run is not None and isinstance(trial_cache, OrderedDict):
+            trial_cache.move_to_end(cache_key)
         if run is None:
             run = run_protocol_trial(
                 dataset,
@@ -1214,9 +1512,9 @@ def _evaluate_dataset_map(
                 scope,
                 params,
                 collect_frame=eval_mode == "full",
-                collect_stages=eval_mode == "full",
+                collect_stages=bool(save_stage_json and eval_mode == "full"),
             )
-            trial_cache[cache_key] = run
+            _store_trial_cache_entry(trial_cache, cache_key, run, trial_cache_max_entries)
         runs.append(run)
         if eval_mode == "full":
             rows.append(
@@ -1230,6 +1528,25 @@ def _evaluate_dataset_map(
             )
     arrays = _concat_metric_arrays([r.metric_arrays for r in runs if r.success])
     return _aggregate_runs(runs, split_name, arrays), rows, arrays
+
+
+def _store_trial_cache_entry(
+    trial_cache: OrderedDict[tuple[Any, ...], ProtocolRunResult] | dict[tuple[Any, ...], ProtocolRunResult],
+    key: tuple[Any, ...],
+    run: ProtocolRunResult,
+    max_entries: int,
+) -> None:
+    """Store one run in a bounded insertion-ordered cache."""
+
+    if isinstance(trial_cache, OrderedDict):
+        trial_cache[key] = run
+        trial_cache.move_to_end(key)
+        while len(trial_cache) > int(max_entries):
+            trial_cache.popitem(last=False)
+        return
+    trial_cache[key] = run
+    while len(trial_cache) > int(max_entries):
+        trial_cache.pop(next(iter(trial_cache)))
 
 
 def _aggregate_runs(
@@ -1297,6 +1614,9 @@ def _per_group_row(
     return {
         "fold_id": "" if fold_id is None else int(fold_id),
         "heldout_group_id": str(heldout_group_id),
+        "result_level": "fold" if str(heldout_group_id) else "single_split",
+        "aggregation": "",
+        "params_semantics": "fold_best_params" if str(heldout_group_id) else "best_params_for_this_split",
         "split": split_name,
         "group_id": group_id,
         "target_scope": run.target_scope.value,
@@ -1443,11 +1763,19 @@ def _write_motion_type_outputs(
             "adaptive_filter": r.adaptive_filter,
             "objective_mode": r.objective_mode,
             "data_split_mode": r.data_split_mode,
+            "result_level": r.result_level,
+            "aggregation": r.aggregation,
+            "params_semantics": r.params_semantics,
+            "representative_fold_id": r.representative_fold_id,
+            "representative_heldout_group_id": r.representative_heldout_group_id,
             "best_repeat_idx": r.best_repeat_idx,
             "best_trial_idx": r.best_trial_idx,
             "n_trials": r.n_trials,
             "n_repeats": r.n_repeats,
             "best_params": r.best_params.to_dict(),
+            "representative_best_params": (
+                r.best_params.to_dict() if r.result_level == "aggregate" else None
+            ),
             "train_metrics": r.train_metrics,
             "val_metrics": r.val_metrics,
             "test_metrics": r.test_metrics,
@@ -1455,6 +1783,9 @@ def _write_motion_type_outputs(
                 {
                     "fold_id": fold.fold_id,
                     "heldout_group_id": fold.heldout_group_id,
+                    "result_level": fold.result_level,
+                    "aggregation": fold.aggregation,
+                    "params_semantics": fold.params_semantics,
                     "train_group_ids": fold.train_group_ids,
                     "test_group_id": fold.test_group_id,
                     "best_repeat_idx": fold.best_repeat_idx,
@@ -1494,6 +1825,11 @@ def _summary_row(result: _ModeOptimisation) -> dict[str, Any]:
         "adaptive_filter": result.adaptive_filter,
         "objective_mode": result.objective_mode,
         "data_split_mode": result.data_split_mode,
+        "result_level": result.result_level,
+        "aggregation": result.aggregation,
+        "params_semantics": result.params_semantics,
+        "representative_fold_id": "" if result.representative_fold_id is None else result.representative_fold_id,
+        "representative_heldout_group_id": result.representative_heldout_group_id,
         "fold_id": "" if result.fold_id is None else result.fold_id,
         "heldout_group_id": result.heldout_group_id,
         "train_group_ids": ",".join(result.train_group_ids),
@@ -1544,6 +1880,11 @@ def _summary_columns() -> list[str]:
         "adaptive_filter",
         "objective_mode",
         "data_split_mode",
+        "result_level",
+        "aggregation",
+        "params_semantics",
+        "representative_fold_id",
+        "representative_heldout_group_id",
         "fold_id",
         "heldout_group_id",
         "train_group_ids",
@@ -1631,6 +1972,9 @@ def _write_final_summary(
         "target_scope",
         "cascade_scheme",
         "adaptive_filter",
+        "result_level",
+        "aggregation",
+        "params_semantics",
         "metric_value",
         "objective_mode",
         "data_split_mode",
@@ -1657,6 +2001,9 @@ def _write_final_summary(
                                 "target_scope": scope.value,
                                 "cascade_scheme": result.cascade_scheme.value,
                                 "adaptive_filter": result.adaptive_filter,
+                                "result_level": result.result_level,
+                                "aggregation": result.aggregation,
+                                "params_semantics": result.params_semantics,
                                 "metric_value": result.test_metrics.get(column),
                                 "objective_mode": objective_mode,
                                 "data_split_mode": data_split_mode,

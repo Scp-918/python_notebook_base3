@@ -421,3 +421,50 @@ rff_seed
 ```
 
 默认 `n_jobs=1`，避免 Windows/Jupyter 下过度并行导致内存压力。大数组不会写入 JSON，trial 结束后只保留必要 CSV/JSON/PNG。
+
+## 2026-05 有限修复后的协议与工程说明
+
+### LOGO 输出语义
+
+`data_split_mode="leave_one_group_out"` 时，每个 `motion_type` 内按 group 逐一留一：
+
+- 每个 fold 的 `test` 是当前 held-out group；
+- 每个 fold 的 `train` 是同一 `motion_type` 下除 held-out group 外的所有 group；
+- 每个 fold 独立运行 Optuna 并得到自己的 `best_params`；
+- LOGO aggregate 指标不是 fold AAE/accuracy 的简单平均，而是拼接所有 held-out test windows 的 `adaptive_hr_bpm` 与 `ref_hr_bpm` 后重新计算。
+
+输出中新增以下字段用于区分语义：
+
+- `result_level`: `fold`、`aggregate` 或 `single_split`；
+- `aggregation`: LOGO aggregate 行为 `logo_window_concat`；
+- `params_semantics`: fold 行为 `fold_best_params`，普通 split 行为 `best_params_for_this_split`，LOGO aggregate 行为 `representative_fold_best_params_not_global`；
+- `representative_fold_id` / `representative_heldout_group_id`: LOGO aggregate 行中用于说明 `best_params` 仅来自哪个代表 fold，兼容旧输出，不表示 motion_type 级统一全局最优参数。
+
+### test Tdelay 协议
+
+当前 test 阶段仍允许使用该样本的参考 HR 估计 global Tdelay。该步骤被视为每个样本的 alignment/label 对齐预处理。本轮修改没有把 test Tdelay 改成训练集统计值，也不声明为部署式无参考泛化。
+
+### 缓存生命周期
+
+缓存分为两层：
+
+- global alignment/global Tdelay cache：挂在 dataset 的 `_global_tdelay_cache`，key 包含 sample、`Fs_Target`、`Alignment_TW`、`Alignment_Step` 与静息 HR 提取参数，不包含 adaptive `TW`；
+- TrialBase/heavy cache：挂在 `_trial_base_cache` 以及 TrialBase 内部的 `norm_window_cache`、`delay_estimate_cache`、`spectral_cache`，依赖 adaptive `TW`、窗口和 trial 过程。
+
+LOGO 中每个 fold 后调用 `clear_trial_heavy_caches()`，只清重缓存并保留 `_global_tdelay_cache`，避免同一 group 在多个 fold 中重复估计 global Tdelay。每个 motion_type 结束后调用 `clear_all_caches()` 清理全部 dataset 级缓存，避免跨 motion_type 长期保留内存。旧的 `clear_trial_caches()` 保留为兼容入口，语义等同 full clear。
+
+### delay search
+
+窗口内 envelope/direct delay search 仍是逐 lag 的有效重叠区 Pearson correlation，不是 FFT cross-correlation。默认优先使用 numba JIT 加速；numba 不可用或 JIT 调用失败时自动 fallback 到 Python reference。delay sign convention 与原实现保持一致。
+
+### 并行
+
+`n_jobs > 1` 且 `num_repeats > 1` 时，从 Optuna repeat 级并行：每个 repeat 独立创建 sampler/study 和本地 bounded trial cache，完成后由主进程合并 history 与 best params。不做 window 级并行，因为窗口 HR tracking 依赖 `previous_hr` 顺序状态。并行进度以 repeat 粒度报告，字段包含 `parallel_level="repeat"`、`repeat_done`、`repeat_total`、`n_jobs` 和当前 best。
+
+### stage JSON
+
+正式 batch full eval 默认 `save_stage_json=False`，因此 `adaptive_stages_json` / `lms_stages_json` 默认保留为空字符串列，不生成每窗口每级详细 JSON。light eval 永不生成 stage JSON。需要 debug、redraw 或抽查时，可显式传 `save_stage_json=True`；`debug_mode=True` 也会开启。
+
+### spectral_utils
+
+Hamming window、rFFT 频率轴、FFT magnitude spectrum、dominant frequency 和参考式 peak candidates 已集中到 `src/ppg_hr/experimental/spectral_utils.py`。alignment 与 cascade 模块复用该工具，以减少重复实现并统一缓存 key。
