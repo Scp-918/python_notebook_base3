@@ -223,7 +223,7 @@ def plot_unaligned_fullfield_ppg_hr_by_motion_type(
     fs_target: int = 100,
     TW: int | float = 8,
     step_s: float = 1.0,
-    hr_band_hz: tuple[float, float] = (0.5, 2.0),
+    hr_band_hz: tuple[float, float] = ( (40.0 / 60.0, 180.0 / 60.0)),
     track_band_bpm: float = 30.0,
     slew_limit_bpm: float = 6.0,
     slew_step_bpm: float = 4.0,
@@ -238,7 +238,7 @@ def plot_unaligned_fullfield_ppg_hr_by_motion_type(
 
     中文说明：该图只用于测试和人工检查，不参与 Tdelay 搜索、Optuna objective 或
     自适应滤波训练。PPG_Green 不做全局对齐，直接在原始时间轴上按 ``TW`` 秒滑窗，
-    每 1 秒一步，用 Hamming+FFT 提取 0.5-2 Hz 主频，再做上一 HR 邻域追踪、
+    每 1 秒一步，用 Hamming+FFT 提取 2/3-3 Hz 主频，再做上一 HR 邻域追踪、
     slew limit/step 防跳峰和 moving median 平滑。背景色按同一未对齐时间轴上的
     静息、运动、运动恢复三段标注。
     """
@@ -360,7 +360,7 @@ def plot_raw_ppg_and_unaligned_hr_by_motion_type(
     fs_origin: int = 100,
     TW: int | float = 8,
     step_s: float = 1.0,
-    hr_band_hz: tuple[float, float] = (0.5, 2.0),
+    hr_band_hz: tuple[float, float] = (40.0 / 60.0, 180.0 / 60.0),
     track_band_bpm: float = 30.0,
     slew_limit_bpm: float = 6.0,
     slew_step_bpm: float = 4.0,
