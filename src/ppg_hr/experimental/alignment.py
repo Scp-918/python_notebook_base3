@@ -11,7 +11,7 @@ delay_s < 0 时用首样本补头并右移；delay_s == 0 时不移动。
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from threading import Lock
 from typing import Any
 
@@ -29,12 +29,14 @@ __all__ = [
     "AlignmentInfo",
     "RestHrResult",
     "TDelayEstimateResult",
+    "TimeBiasAfterResult",
     "align_ppg_to_ref_hr",
     "apply_rest_hr_slew_limit",
     "build_aligned_training_windows",
     "compute_rest_alignment_diagnostic_curve",
     "estimate_global_tdelay_from_rest",
     "extract_rest_ppg_hr_tracked",
+    "search_time_bias_after",
     "smooth_rest_hr_sequence",
 ]
 
@@ -75,7 +77,74 @@ class TDelayEstimateResult:
     best_score: float
     score_table: pd.DataFrame
     rest_ppg_hr: RestHrResult
+    alignment_score_mode: str = "aae"
+    best_score_aae: float = float("nan")
+    best_score_std: float = float("nan")
+    best_rmse: float = float("nan")
     debug: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class TimeBiasAfterResult:
+    """Post-filter curve-level time-bias result used only for diagnostics.
+
+    中文说明：``time_bias_after_s = b`` 的符号约定固定为：
+    对预测时间点 ``t_pred_s``，从原始参考心率曲线的
+    ``t_pred_s + b`` 位置取样，即 ``np.interp(pred_time_s + b,
+    ref_time_s, ref_hr_bpm)``。因此 ``b > 0`` 表示预测 HR 与更晚的
+    参考 HR 比较；画图时等价于把参考曲线向左移动 ``b`` 秒。
+
+    该结果是自适应滤波已经完成之后的评价/可视化层参数，不能回写到
+    原始 PPG、补偿信号、窗口切分或滤波器运行流程中。
+    """
+
+    time_bias_after_s: float
+    best_aae_bpm: float
+    best_std_bpm: float
+    best_rmse_bpm: float
+    n_valid: int
+    score_table: pd.DataFrame
+    ref_hr_after_bpm: np.ndarray
+    status: str = "ok"
+    reason: str = ""
+    mode: str = "posthoc_oracle_alignment"
+    search_range_s: tuple[float, float] = (-5.0, 5.0)
+    search_step_s: float = 1.0
+
+    def to_dict(self, *, include_score_table: bool = True) -> dict[str, Any]:
+        """Return a JSON-friendly representation of the post-hoc alignment."""
+
+        def finite_or_none(value: Any) -> float | None:
+            value_f = float(value)
+            return value_f if np.isfinite(value_f) else None
+
+        payload: dict[str, Any] = {
+            "time_bias_after_s": finite_or_none(self.time_bias_after_s),
+            "best_aae_bpm": finite_or_none(self.best_aae_bpm),
+            "best_std_bpm": finite_or_none(self.best_std_bpm),
+            "best_rmse_bpm": finite_or_none(self.best_rmse_bpm),
+            "n_valid": int(self.n_valid),
+            "status": self.status,
+            "reason": self.reason,
+            "mode": self.mode,
+            "search_range_s": [float(x) for x in self.search_range_s],
+            "search_step_s": float(self.search_step_s),
+        }
+        if include_score_table:
+            records = self.score_table.to_dict(orient="records")
+            payload["score_table"] = [
+                {
+                    str(key): (
+                        finite_or_none(value)
+                        if not isinstance(value, (bool, np.bool_))
+                        and isinstance(value, (int, float, np.integer, np.floating))
+                        else value
+                    )
+                    for key, value in row.items()
+                }
+                for row in records
+            ]
+        return payload
 
 
 @dataclass(frozen=True)
@@ -92,6 +161,12 @@ class AlignmentInfo:
     train_tw_s: float = 0.0
     best_score: float = float("nan")
     n_valid_score_windows: int = 0
+    aae_by_delay: dict[float, float] = field(default_factory=dict)
+    rmse_by_delay: dict[float, float] = field(default_factory=dict)
+    alignment_score_mode: str = "aae"
+    best_score_aae: float = float("nan")
+    best_score_std: float = float("nan")
+    best_rmse: float = float("nan")
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly representation."""
@@ -99,13 +174,19 @@ class AlignmentInfo:
         return {
             "best_tdelay_s": float(self.best_tdelay_s),
             "std_by_delay": {str(k): float(v) for k, v in self.std_by_delay.items()},
+            "aae_by_delay": {str(k): float(v) for k, v in self.aae_by_delay.items()},
+            "rmse_by_delay": {str(k): float(v) for k, v in self.rmse_by_delay.items()},
             "ref_shift_s": float(self.ref_shift_s),
             "num_windows": int(self.num_windows),
             "status": self.status,
             "reason": self.reason,
             "alignment_tw_s": float(self.alignment_tw_s),
             "train_tw_s": float(self.train_tw_s),
+            "alignment_score_mode": str(self.alignment_score_mode),
             "best_score": float(self.best_score),
+            "best_score_aae": float(self.best_score_aae),
+            "best_score_std": float(self.best_score_std),
+            "best_rmse": float(self.best_rmse),
             "n_valid_score_windows": int(self.n_valid_score_windows),
         }
 
@@ -137,6 +218,164 @@ class AlignedDataset:
         }
 
 
+def search_time_bias_after(
+    pred_time_s: np.ndarray,
+    pred_hr_bpm: np.ndarray,
+    ref_time_s: np.ndarray,
+    ref_hr_bpm: np.ndarray,
+    *,
+    search_range_s: tuple[float, float] = (-5.0, 5.0),
+    search_step_s: float = 1.0,
+    min_valid: int = 2,
+    mode: str = "posthoc_oracle_alignment",
+) -> TimeBiasAfterResult:
+    """Search a post-filter HR-curve time bias for diagnostics only.
+
+    Sign convention is intentionally fixed here and in tests:
+    ``time_bias_after_s = b`` means that each predicted HR sample at
+    ``t_pred_s`` is compared with the reference HR sampled at
+    ``t_pred_s + b``::
+
+        ref_shifted = np.interp(
+            pred_time_s + b,
+            ref_time_s,
+            ref_hr_bpm,
+            left=np.nan,
+            right=np.nan,
+        )
+
+    Positive ``b`` compares the prediction with a later reference HR value;
+    on a plot this is equivalent to moving the reference curve left by
+    ``b`` seconds.
+
+    中文说明：这个搜索只能发生在 HR 序列已经生成之后，用于 post-hoc
+    评价和可视化诊断。它不允许改变 PPG、补偿信号、自适应滤波输入、
+    窗口划分、滤波器输出，也不参与 Optuna objective。
+    """
+
+    pred_time = np.asarray(pred_time_s, dtype=float).ravel()
+    pred_hr = np.asarray(pred_hr_bpm, dtype=float).ravel()
+    ref_time = np.asarray(ref_time_s, dtype=float).ravel()
+    ref_hr = np.asarray(ref_hr_bpm, dtype=float).ravel()
+
+    if pred_time.size != pred_hr.size:
+        raise ValueError("pred_time_s and pred_hr_bpm must have the same length")
+    if ref_time.size != ref_hr.size:
+        raise ValueError("ref_time_s and ref_hr_bpm must have the same length")
+
+    step = float(search_step_s)
+    if not np.isfinite(step) or step <= 0:
+        raise ValueError("search_step_s must be a positive finite value")
+    lo, hi = (float(search_range_s[0]), float(search_range_s[1]))
+    if lo > hi:
+        raise ValueError("search_range_s must be ordered as (min_s, max_s)")
+
+    # 中文说明：候选偏置表保持稳定列名，便于 CSV/JSON 输出和后续审计。
+    bias_grid = np.round(np.arange(lo, hi + step * 0.5, step), 10)
+    bias_grid = bias_grid[bias_grid <= hi + 1e-9]
+    rows: list[dict[str, Any]] = []
+    best_idx: int | None = None
+    best_key: tuple[float, float, float, float] | None = None
+
+    for idx, bias_s in enumerate(bias_grid):
+        ref_shifted = np.interp(pred_time + float(bias_s), ref_time, ref_hr, left=np.nan, right=np.nan)
+        valid = np.isfinite(pred_hr) & np.isfinite(ref_shifted)
+        n_valid = int(valid.sum())
+        if n_valid < int(min_valid):
+            aae = std = rmse = float("inf")
+        else:
+            diff = pred_hr[valid] - ref_shifted[valid]
+            aae = float(np.nanmean(np.abs(diff)))
+            std = float(np.nanstd(diff))
+            rmse = float(np.sqrt(np.nanmean(diff**2)))
+            # 中文说明：主评分是 AAE；并列时按“更小绝对偏置、RMSE、STD”的顺序裁决。
+            key = (aae, abs(float(bias_s)), rmse, std)
+            if best_key is None or _time_bias_after_key_is_better(key, best_key):
+                best_key = key
+                best_idx = idx
+        rows.append(
+            {
+                "time_bias_after_s": float(bias_s),
+                "aae_bpm": aae,
+                "std_bpm": std,
+                "rmse_bpm": rmse,
+                "n_valid": n_valid,
+                "selected": False,
+            }
+        )
+
+    score_table = pd.DataFrame(
+        rows,
+        columns=["time_bias_after_s", "aae_bpm", "std_bpm", "rmse_bpm", "n_valid", "selected"],
+    )
+    if best_idx is None:
+        ref_after = np.interp(pred_time, ref_time, ref_hr, left=np.nan, right=np.nan)
+        reason = "no candidate has enough finite overlapping HR samples"
+        return TimeBiasAfterResult(
+            time_bias_after_s=0.0,
+            best_aae_bpm=float("nan"),
+            best_std_bpm=float("nan"),
+            best_rmse_bpm=float("nan"),
+            n_valid=0,
+            score_table=score_table,
+            ref_hr_after_bpm=ref_after,
+            status="failed",
+            reason=reason,
+            mode=str(mode),
+            search_range_s=(lo, hi),
+            search_step_s=step,
+        )
+
+    score_table.loc[int(best_idx), "selected"] = True
+    best_row = score_table.iloc[int(best_idx)]
+    best_bias = float(best_row["time_bias_after_s"])
+    ref_after = np.interp(pred_time + best_bias, ref_time, ref_hr, left=np.nan, right=np.nan)
+    return TimeBiasAfterResult(
+        time_bias_after_s=best_bias,
+        best_aae_bpm=float(best_row["aae_bpm"]),
+        best_std_bpm=float(best_row["std_bpm"]),
+        best_rmse_bpm=float(best_row["rmse_bpm"]),
+        n_valid=int(best_row["n_valid"]),
+        score_table=score_table,
+        ref_hr_after_bpm=ref_after,
+        status="ok",
+        reason="",
+        mode=str(mode),
+        search_range_s=(lo, hi),
+        search_step_s=step,
+    )
+
+
+def _time_bias_after_key_is_better(
+    candidate: tuple[float, float, float, float],
+    best: tuple[float, float, float, float],
+) -> bool:
+    """Return whether one post-hoc bias tie-break key beats another."""
+
+    for cand_value, best_value in zip(candidate, best, strict=True):
+        if np.isclose(cand_value, best_value, rtol=0.0, atol=1e-9):
+            continue
+        return bool(cand_value < best_value)
+    return False
+
+
+def _tdelay_score_key_is_better(
+    candidate: tuple[float, float, float, float],
+    best: tuple[float, float, float, float],
+) -> bool:
+    """Return whether a Tdelay candidate wins under the configured score mode.
+
+    中文说明：key 的顺序是“主评分、绝对 delay、RMSE、非主评分”。主评分
+    可以是 AAE 或 STD；并列时优先选择更小的绝对延迟，避免无意义的大偏移。
+    """
+
+    for cand_value, best_value in zip(candidate, best, strict=True):
+        if np.isclose(cand_value, best_value, rtol=0.0, atol=1e-9):
+            continue
+        return bool(cand_value < best_value)
+    return False
+
+
 def align_ppg_to_ref_hr(
     dataset: ProtocolDataset,
     segment_info: SegmentInfo,
@@ -149,6 +388,7 @@ def align_ppg_to_ref_hr(
     delay_step_s: float | None = None,
     rest_hr_kwargs: dict[str, Any] | None = None,
     use_tracked_rest_hr: bool = True,
+    alignment_score_mode: str = "aae",
     return_debug: bool = False,
 ) -> AlignedDataset:
     """Find global signed PPG delay and build training-window metadata.
@@ -175,6 +415,7 @@ def align_ppg_to_ref_hr(
         delay_range_s=delay_range_s,
         delay_step_s=delay_step_s,
         rest_hr_kwargs=rest_hr_kwargs,
+        alignment_score_mode=alignment_score_mode,
         return_debug=return_debug,
     )
     _print_alignment_once(
@@ -378,6 +619,7 @@ def estimate_global_tdelay_from_rest(
     delay_range_s: tuple[float, float] | None = None,
     delay_step_s: float | None = None,
     rest_hr_kwargs: dict[str, Any] | None = None,
+    alignment_score_mode: str = "aae",
     return_debug: bool = False,
 ) -> TDelayEstimateResult:
     """Estimate global signed Tdelay from tracked rest-segment PPG HR.
@@ -389,6 +631,11 @@ def estimate_global_tdelay_from_rest(
 
     if not segment.is_valid:
         raise ValueError(f"Cannot estimate Tdelay for invalid segment info: {segment.reason}")
+    score_mode = str(alignment_score_mode).lower()
+    if score_mode == "mae":
+        score_mode = "aae"
+    if score_mode not in {"aae", "std"}:
+        raise ValueError("alignment_score_mode must be 'aae', 'mae', or 'std'")
     fs_i = int(round(float(fs)))
     align_tw = float(alignment_TW)
     neg_limit = min(5.0, align_tw / 2.0)
@@ -404,8 +651,12 @@ def estimate_global_tdelay_from_rest(
     rows: list[dict[str, Any]] = []
     best_delay = 0.0
     best_score = float("inf")
+    best_score_aae = float("inf")
+    best_score_std = float("inf")
+    best_rmse = float("inf")
     best_rest: RestHrResult | None = None
     best_ref = np.asarray([], dtype=float)
+    best_key: tuple[float, float, float, float] | None = None
     for delay_s in delay_grid:
         rest = _rest_ppg_hr_tracked_for_delay(
             ds.ppg_green,
@@ -421,39 +672,58 @@ def estimate_global_tdelay_from_rest(
         valid = np.isfinite(ppg_hr) & np.isfinite(ref_hr)
         n_valid = int(valid.sum())
         if n_valid < 2:
-            score = mae = rmse = float("inf")
+            score_std = score_aae = mae = rmse = selected_score = float("inf")
         else:
             diff = ppg_hr[valid] - ref_hr[valid]
-            score = float(np.nanstd(diff))
-            mae = float(np.nanmean(np.abs(diff)))
+            score_std = float(np.nanstd(diff))
+            score_aae = float(np.nanmean(np.abs(diff)))
+            mae = score_aae
             rmse = float(np.sqrt(np.nanmean(diff**2)))
+            selected_score = score_aae if score_mode == "aae" else score_std
         rows.append(
             {
                 "delay_s": float(delay_s),
-                "score_std": score,
+                "score_std": score_std,
+                "score_aae": score_aae,
                 "mae": mae,
                 "rmse": rmse,
                 "n_valid": n_valid,
+                "selected_score": selected_score,
+                "selected": False,
             }
         )
-        if score < best_score:
-            best_score = score
-            best_delay = float(delay_s)
-            best_rest = rest
-            best_ref = ref_hr
+        if n_valid >= 2 and np.isfinite(selected_score):
+            other_score = score_std if score_mode == "aae" else score_aae
+            candidate_key = (selected_score, abs(float(delay_s)), rmse, other_score)
+            if best_key is None or _tdelay_score_key_is_better(candidate_key, best_key):
+                best_key = candidate_key
+                best_score = selected_score
+                best_score_aae = score_aae
+                best_score_std = score_std
+                best_rmse = rmse
+                best_delay = float(delay_s)
+                best_rest = rest
+                best_ref = ref_hr
 
-    score_table = pd.DataFrame(rows, columns=["delay_s", "score_std", "mae", "rmse", "n_valid"])
+    score_table = pd.DataFrame(
+        rows,
+        columns=["delay_s", "score_std", "score_aae", "mae", "rmse", "n_valid", "selected_score", "selected"],
+    )
     if best_rest is None or not np.isfinite(best_score):
         max_valid = int(score_table["n_valid"].max()) if not score_table.empty else 0
         raise ValueError(
             "alignment failed: fewer than 2 comparable tracked rest windows "
             f"(max_valid_windows={max_valid})"
         )
+    selected_mask = np.isclose(score_table["delay_s"].to_numpy(dtype=float), float(best_delay), rtol=0.0, atol=1e-9)
+    if selected_mask.any():
+        score_table.loc[selected_mask, "selected"] = True
     debug: dict[str, Any] = {
         "alignment_TW": align_tw,
         "alignment_step_s": float(alignment_step_s),
         "delay_range_s": tuple(float(x) for x in delay_range_s),
         "delay_step_s": step,
+        "alignment_score_mode": score_mode,
     }
     if return_debug:
         debug["best_ref_hr_bpm"] = best_ref
@@ -462,6 +732,10 @@ def estimate_global_tdelay_from_rest(
         best_score=best_score,
         score_table=score_table,
         rest_ppg_hr=best_rest,
+        alignment_score_mode=score_mode,
+        best_score_aae=best_score_aae,
+        best_score_std=best_score_std,
+        best_rmse=best_rmse,
         debug=debug,
     )
 
@@ -524,7 +798,18 @@ def build_aligned_training_windows(
     score_table = tdelay_result.score_table if tdelay_result is not None else pd.DataFrame()
     std_by_delay = (
         dict(zip(score_table["delay_s"].astype(float), score_table["score_std"].astype(float)))
-        if not score_table.empty
+        if not score_table.empty and "score_std" in score_table
+        else {float(best_tdelay_s): float("nan")}
+    )
+    aae_col = "score_aae" if "score_aae" in score_table else "mae"
+    aae_by_delay = (
+        dict(zip(score_table["delay_s"].astype(float), score_table[aae_col].astype(float)))
+        if not score_table.empty and aae_col in score_table
+        else {float(best_tdelay_s): float("nan")}
+    )
+    rmse_by_delay = (
+        dict(zip(score_table["delay_s"].astype(float), score_table["rmse"].astype(float)))
+        if not score_table.empty and "rmse" in score_table
         else {float(best_tdelay_s): float("nan")}
     )
     best_row = (
@@ -533,6 +818,11 @@ def build_aligned_training_windows(
         else pd.DataFrame()
     )
     n_valid_score = int(best_row["n_valid"].iloc[0]) if not best_row.empty else 0
+    alignment_score_mode = (
+        str(tdelay_result.alignment_score_mode)
+        if tdelay_result is not None and getattr(tdelay_result, "alignment_score_mode", "")
+        else "aae"
+    )
     alignment_info = AlignmentInfo(
         best_tdelay_s=float(best_tdelay_s),
         std_by_delay=std_by_delay,
@@ -546,6 +836,24 @@ def build_aligned_training_windows(
         train_tw_s=train_tw,
         best_score=float(tdelay_result.best_score) if tdelay_result is not None else float("nan"),
         n_valid_score_windows=n_valid_score,
+        aae_by_delay=aae_by_delay,
+        rmse_by_delay=rmse_by_delay,
+        alignment_score_mode=alignment_score_mode,
+        best_score_aae=(
+            float(tdelay_result.best_score_aae)
+            if tdelay_result is not None and np.isfinite(getattr(tdelay_result, "best_score_aae", np.nan))
+            else (float(best_row[aae_col].iloc[0]) if not best_row.empty and aae_col in best_row else float("nan"))
+        ),
+        best_score_std=(
+            float(tdelay_result.best_score_std)
+            if tdelay_result is not None and np.isfinite(getattr(tdelay_result, "best_score_std", np.nan))
+            else (float(best_row["score_std"].iloc[0]) if not best_row.empty and "score_std" in best_row else float("nan"))
+        ),
+        best_rmse=(
+            float(tdelay_result.best_rmse)
+            if tdelay_result is not None and np.isfinite(getattr(tdelay_result, "best_rmse", np.nan))
+            else (float(best_row["rmse"].iloc[0]) if not best_row.empty and "rmse" in best_row else float("nan"))
+        ),
     )
     rest_idx = np.flatnonzero(labels == "rest")
     motion_idx = np.flatnonzero(labels == "motion")

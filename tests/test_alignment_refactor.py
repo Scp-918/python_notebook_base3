@@ -106,6 +106,28 @@ def test_global_tdelay_cache_key_excludes_train_tw() -> None:
     assert _global_tdelay_cache_key(ds, p6) == _global_tdelay_cache_key(ds, p10)
     changed_peak_rule = ProtocolTrialParams(Fs_Target=50, TW=6.0, Alignment_TW=8.0, Rest_HR_Peak_Percent=0.5)
     assert _global_tdelay_cache_key(ds, p6) != _global_tdelay_cache_key(ds, changed_peak_rule)
+    std_mode = ProtocolTrialParams(Fs_Target=50, TW=6.0, Alignment_TW=8.0, Rest_Alignment_Score_Mode="std")
+    assert _global_tdelay_cache_key(ds, p6) != _global_tdelay_cache_key(ds, std_mode)
+
+
+def test_rest_alignment_score_mode_outputs_aae_and_std_scores() -> None:
+    ds, segment = _synthetic_dataset()
+    estimate = estimate_global_tdelay_from_rest(
+        ds,
+        segment,
+        ds.fs,
+        alignment_TW=8.0,
+        alignment_step_s=1.0,
+        delay_range_s=(-0.5, 0.5),
+        delay_step_s=0.5,
+        alignment_score_mode="aae",
+    )
+
+    assert estimate.alignment_score_mode == "aae"
+    assert {"score_aae", "score_std", "mae", "rmse", "selected_score"}.issubset(estimate.score_table.columns)
+    selected = estimate.score_table.loc[estimate.score_table["selected"]].iloc[0]
+    assert selected["selected_score"] == selected["score_aae"]
+    assert selected["mae"] == selected["score_aae"]
 
 
 def test_rest_hr_tracking_and_slew_limit_suppress_jump_peak() -> None:

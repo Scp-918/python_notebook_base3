@@ -32,7 +32,7 @@ except ModuleNotFoundError:  # pragma: no cover - only used in lean environments
 
 from ..params import CascadeScheme, ProtocolParams, TargetScope
 from .batch_pairing import PairDiscovery, SamplePair, discover_sample_pairs_with_unpaired
-from .alignment import _window_fft_hr
+from .alignment import _window_fft_hr, search_time_bias_after
 from .cascade_solver import (
     MetricArrays,
     ProtocolRunResult,
@@ -1568,6 +1568,7 @@ def _aggregate_runs(
             "baseline_acc_pct": float("nan"),
             "adaptive_acc_pct": float("nan"),
             "num_windows": 0,
+            **_empty_posthoc_metrics(),
         }
     metrics = aggregate_metric_arrays(arrays, split_name=split_name)
     return {
@@ -1579,6 +1580,7 @@ def _aggregate_runs(
         "baseline_acc_pct": metrics["baseline_acc_pct"],
         "adaptive_acc_pct": metrics["adaptive_acc_pct"],
         "num_windows": metrics["num_windows"],
+        **_posthoc_metrics_from(metrics),
     }
 
 
@@ -1628,6 +1630,29 @@ def _per_group_row(
         "adaptive_aae_bpm": run.adaptive_aae_bpm,
         "baseline_acc_pct": run.baseline_acc_pct,
         "adaptive_acc_pct": run.adaptive_acc_pct,
+        "time_bias_after_s": (
+            float(run.time_bias_after.time_bias_after_s) if run.time_bias_after is not None else float("nan")
+        ),
+        "time_bias_after_mode": (
+            str(run.time_bias_after.mode) if run.time_bias_after is not None else ""
+        ),
+        "time_bias_after_range_s": (
+            f"({run.time_bias_after.search_range_s[0]:.1f}, {run.time_bias_after.search_range_s[1]:.1f})"
+            if run.time_bias_after is not None
+            else ""
+        ),
+        "time_bias_after_step_s": (
+            float(run.time_bias_after.search_step_s) if run.time_bias_after is not None else float("nan")
+        ),
+        "time_bias_after_n_valid": (
+            int(run.time_bias_after.n_valid) if run.time_bias_after is not None else 0
+        ),
+        "posthoc_adaptive_aae_bpm": run.posthoc_adaptive_aae_bpm,
+        "posthoc_adaptive_acc_pct": run.posthoc_adaptive_acc_pct,
+        "posthoc_adaptive_hit_rate_5bpm": run.posthoc_adaptive_hit_rate_5bpm,
+        "posthoc_baseline_aae_bpm": run.posthoc_baseline_aae_bpm,
+        "posthoc_baseline_acc_pct": run.posthoc_baseline_acc_pct,
+        "posthoc_n_valid_windows": run.posthoc_n_valid_windows,
     }
 
 
@@ -1851,6 +1876,21 @@ def _summary_row(result: _ModeOptimisation) -> dict[str, Any]:
         row[f"{prefix}_baseline_aae_bpm"] = metrics.get("baseline_aae_bpm")
         row[f"{prefix}_baseline_accuracy_pct"] = metrics.get("baseline_acc_pct")
         row[f"{prefix}_num_windows"] = metrics.get("num_windows")
+        row[f"{prefix}_time_bias_after_s"] = metrics.get("time_bias_after_s")
+        row[f"{prefix}_time_bias_after_mode"] = metrics.get("time_bias_after_mode")
+        row[f"{prefix}_time_bias_after_range_s"] = metrics.get("time_bias_after_range_s")
+        row[f"{prefix}_time_bias_after_step_s"] = metrics.get("time_bias_after_step_s")
+        row[f"{prefix}_time_bias_after_n_valid"] = metrics.get("time_bias_after_n_valid")
+        row[f"{prefix}_posthoc_adaptive_aae_bpm"] = metrics.get("posthoc_adaptive_aae_bpm")
+        row[f"{prefix}_posthoc_adaptive_acc_pct"] = metrics.get("posthoc_adaptive_acc_pct")
+        row[f"{prefix}_posthoc_adaptive_hit_rate_5bpm"] = metrics.get("posthoc_adaptive_hit_rate_5bpm")
+        row[f"{prefix}_posthoc_baseline_aae_bpm"] = metrics.get("posthoc_baseline_aae_bpm")
+        row[f"{prefix}_posthoc_baseline_acc_pct"] = metrics.get("posthoc_baseline_acc_pct")
+        row[f"{prefix}_posthoc_n_valid_windows"] = metrics.get("posthoc_n_valid_windows")
+    # 中文说明：不带 split 前缀的字段用于 best_params CSV 和手动重画优先读取；
+    # 对多样本聚合若不存在唯一 bias，聚合函数会保留 NaN，避免伪装成全局泛化参数。
+    for key, value in _posthoc_metrics_from(result.test_metrics).items():
+        row[key] = value
     return row
 
 
@@ -1910,6 +1950,50 @@ def _summary_columns() -> list[str]:
         "test_baseline_aae_bpm",
         "test_baseline_accuracy_pct",
         "test_num_windows",
+        "time_bias_after_s",
+        "time_bias_after_mode",
+        "time_bias_after_range_s",
+        "time_bias_after_step_s",
+        "time_bias_after_n_valid",
+        "posthoc_adaptive_aae_bpm",
+        "posthoc_adaptive_acc_pct",
+        "posthoc_adaptive_hit_rate_5bpm",
+        "posthoc_baseline_aae_bpm",
+        "posthoc_baseline_acc_pct",
+        "posthoc_n_valid_windows",
+        "train_time_bias_after_s",
+        "train_time_bias_after_mode",
+        "train_time_bias_after_range_s",
+        "train_time_bias_after_step_s",
+        "train_time_bias_after_n_valid",
+        "train_posthoc_adaptive_aae_bpm",
+        "train_posthoc_adaptive_acc_pct",
+        "train_posthoc_adaptive_hit_rate_5bpm",
+        "train_posthoc_baseline_aae_bpm",
+        "train_posthoc_baseline_acc_pct",
+        "train_posthoc_n_valid_windows",
+        "val_time_bias_after_s",
+        "val_time_bias_after_mode",
+        "val_time_bias_after_range_s",
+        "val_time_bias_after_step_s",
+        "val_time_bias_after_n_valid",
+        "val_posthoc_adaptive_aae_bpm",
+        "val_posthoc_adaptive_acc_pct",
+        "val_posthoc_adaptive_hit_rate_5bpm",
+        "val_posthoc_baseline_aae_bpm",
+        "val_posthoc_baseline_acc_pct",
+        "val_posthoc_n_valid_windows",
+        "test_time_bias_after_s",
+        "test_time_bias_after_mode",
+        "test_time_bias_after_range_s",
+        "test_time_bias_after_step_s",
+        "test_time_bias_after_n_valid",
+        "test_posthoc_adaptive_aae_bpm",
+        "test_posthoc_adaptive_acc_pct",
+        "test_posthoc_adaptive_hit_rate_5bpm",
+        "test_posthoc_baseline_aae_bpm",
+        "test_posthoc_baseline_acc_pct",
+        "test_posthoc_n_valid_windows",
     ]
 
 
@@ -1965,7 +2049,7 @@ def _write_final_summary(
     objective_mode: str,
     data_split_mode: str,
 ) -> dict[str, Path]:
-    """Write six final cross-motion-type summary CSV files."""
+    """Write strict and post-hoc cross-motion-type summary CSV files."""
 
     header = [
         "motion_type",
@@ -1988,6 +2072,8 @@ def _write_final_summary(
         for metric_name, column, filename in (
             ("aae", "adaptive_aae_bpm", f"{scope.value}_test_aae.csv"),
             ("accuracy", "adaptive_acc_pct", f"{scope.value}_test_accuracy.csv"),
+            ("posthoc_aae", "posthoc_adaptive_aae_bpm", f"{scope.value}_test_posthoc_aae.csv"),
+            ("posthoc_accuracy", "posthoc_adaptive_acc_pct", f"{scope.value}_test_posthoc_accuracy.csv"),
         ):
             rows: list[dict[str, Any]] = []
             if scope in active_scopes:
@@ -2040,16 +2126,29 @@ def redraw_best_param_hr_curves(
     fs_origin: int = 100,
     fold_id: int | None = None,
     heldout_group_id: str | None = None,
+    enable_time_bias_after: bool | None = None,
+    time_bias_after_range_s: tuple[float, float] | None = None,
+    time_bias_after_step_s: float | None = None,
+    time_bias_after_mode: str | None = None,
 ) -> dict[str, Path]:
     """Re-run one sample with one best-param row and draw HR curves.
 
     中文说明：这是 Notebook 手动重画单元格使用的函数。主训练流程不会调用它。
-    图 A 只画训练段；图 B 画全局曲线，非训练段使用 Hamming + FFT、0.5-2 Hz 主频。
+    图 A 只画训练段；图 B 画全局曲线，非目标段使用普通 PPG FFT HR，目标段使用
+    adaptive HR，并只保留这一条合并后的 ``ppg_hr_bpm`` 与后对齐参考曲线。
     """
 
     scope = TargetScope(target_scope)
     scheme = CascadeScheme(cascade_scheme)
     adaptive_filter = str(adaptive_filter)
+    best_row = _best_param_row_from_csv(
+        best_param_csv_path,
+        scope,
+        scheme,
+        adaptive_filter,
+        fold_id=fold_id,
+        heldout_group_id=heldout_group_id,
+    )
     params = _params_from_best_csv(
         best_param_csv_path,
         scope,
@@ -2069,6 +2168,7 @@ def redraw_best_param_hr_curves(
     group_id = Path(sensor_csv_path).stem.removeprefix("multi_")
     train_path = out / f"manual_training_hr_{group_id}_{scope.value}_{scheme.value}_{adaptive_filter}.png"
     global_path = out / f"manual_global_hr_{group_id}_{scope.value}_{scheme.value}_{adaptive_filter}.png"
+    global_csv_path = out / f"manual_global_hr_{group_id}_{scope.value}_{scheme.value}_{adaptive_filter}.csv"
 
     frame = run.frame.copy()
     train_frame = frame.loc[frame["is_filtered_segment"].astype(bool)].copy()
@@ -2084,18 +2184,162 @@ def redraw_best_param_hr_curves(
     )
 
     combined = _global_combined_hr(dataset, params, frame)
-    frame["manual_global_hr_bpm"] = combined
-    global_abs_err = np.abs(frame["manual_global_hr_bpm"].to_numpy(dtype=float) - frame["ref_hr_bpm"].to_numpy(dtype=float))
-    global_aae = _nanmean(global_abs_err)
-    global_acc = _accuracy_from_abs_err(global_abs_err)
-    _plot_hr_frame(
-        plt,
-        frame.rename(columns={"manual_global_hr_bpm": "adaptive_hr_bpm"}),
-        global_path,
-        title=f"{group_id} global HR ({scope.value} / {scheme.value} / {adaptive_filter})",
-        adaptive_label=f"adaptive + FFT HR AAE={global_aae:.2f} bpm, accuracy={global_acc:.1f}%",
+    bias, bias_source, bias_mode = _time_bias_after_for_redraw(
+        best_row,
+        dataset,
+        frame,
+        combined,
+        params,
+        enable_time_bias_after=enable_time_bias_after,
+        time_bias_after_range_s=time_bias_after_range_s,
+        time_bias_after_step_s=time_bias_after_step_s,
+        time_bias_after_mode=time_bias_after_mode,
     )
-    return {"training_scope": train_path, "global": global_path}
+    time_s = frame["time_s"].to_numpy(dtype=float)
+    ref_after = np.interp(
+        time_s + float(bias),
+        np.asarray(dataset.ref_time_s, dtype=float),
+        np.asarray(dataset.ref_hr_bpm, dtype=float),
+        left=np.nan,
+        right=np.nan,
+    )
+    valid = np.isfinite(combined) & np.isfinite(ref_after)
+    global_frame = frame.loc[valid].copy()
+    global_frame["ppg_hr_bpm"] = np.asarray(combined, dtype=float)[valid]
+    global_frame["ref_hr_after_bpm"] = ref_after[valid]
+    global_frame["time_bias_after_s"] = float(bias)
+    global_frame["time_bias_after_source"] = bias_source
+    global_frame["time_bias_after_mode"] = bias_mode
+    global_frame["abs_err_after_bpm"] = np.abs(
+        global_frame["ppg_hr_bpm"].to_numpy(dtype=float) - global_frame["ref_hr_after_bpm"].to_numpy(dtype=float)
+    )
+    filtered_valid = global_frame["is_filtered_segment"].astype(bool).to_numpy()
+    target_abs_err = global_frame["abs_err_after_bpm"].to_numpy(dtype=float)[filtered_valid]
+    posthoc_aae = _nanmean(target_abs_err)
+    posthoc_acc = _accuracy_from_abs_err(target_abs_err)
+    tdelay = float(run.alignment_info.best_tdelay_s) if run.alignment_info is not None else float("nan")
+    _plot_manual_global_hr_frame(
+        plt,
+        global_frame,
+        global_path,
+        title=(
+            f"{group_id} global HR ({scope.value} / {scheme.value} / {adaptive_filter}) | "
+            f"Tdelay={tdelay:.2f}s, time_bias_after={float(bias):.2f}s, "
+            f"posthoc AAE={posthoc_aae:.2f} bpm, hit-rate={posthoc_acc:.1f}%"
+        ),
+    )
+    _write_manual_global_hr_csv(global_frame, global_csv_path)
+    return {"training_scope": train_path, "global": global_path, "global_csv": global_csv_path}
+
+
+def _time_bias_after_for_redraw(
+    best_row: pd.Series,
+    dataset: ProtocolDataset,
+    frame: pd.DataFrame,
+    combined_hr_bpm: np.ndarray,
+    params: ProtocolTrialParams,
+    *,
+    enable_time_bias_after: bool | None,
+    time_bias_after_range_s: tuple[float, float] | None,
+    time_bias_after_step_s: float | None,
+    time_bias_after_mode: str | None,
+) -> tuple[float, str, str]:
+    """Return the post-hoc bias used by manual redraw.
+
+    中文说明：手动重画优先复用 best_params CSV 中已保存的
+    ``time_bias_after_s``。若旧 CSV 没有该列且启用了后对齐，才在本次重画中
+    对已经生成的 HR 曲线重新做 post-hoc 搜索，并标记来源为
+    ``computed_during_redraw``。
+    """
+
+    mode = str(time_bias_after_mode or getattr(params, "Time_Bias_After_Mode", "posthoc_oracle_alignment"))
+    if "time_bias_after_s" in best_row and pd.notna(best_row["time_bias_after_s"]):
+        try:
+            value = float(best_row["time_bias_after_s"])
+            if np.isfinite(value):
+                saved_mode = str(best_row.get("time_bias_after_mode", mode) or mode)
+                return value, "saved_best_params", saved_mode
+        except (TypeError, ValueError):
+            pass
+
+    enabled = bool(getattr(params, "Enable_Time_Bias_After", True)) if enable_time_bias_after is None else bool(
+        enable_time_bias_after
+    )
+    if not enabled:
+        return 0.0, "disabled", mode
+
+    search_range = (
+        tuple(float(x) for x in time_bias_after_range_s)
+        if time_bias_after_range_s is not None
+        else tuple(float(x) for x in getattr(params, "Time_Bias_After_Range_S", (-5.0, 5.0)))
+    )
+    if len(search_range) != 2:
+        raise ValueError("time_bias_after_range_s must contain exactly two values")
+    search_step = (
+        float(time_bias_after_step_s)
+        if time_bias_after_step_s is not None
+        else float(getattr(params, "Time_Bias_After_Step_S", 1.0))
+    )
+    mask = frame["is_filtered_segment"].astype(bool).to_numpy() if "is_filtered_segment" in frame else np.ones(
+        len(frame),
+        dtype=bool,
+    )
+    adaptive = (
+        frame["adaptive_hr_bpm"].to_numpy(dtype=float)
+        if "adaptive_hr_bpm" in frame
+        else np.asarray(combined_hr_bpm, dtype=float)
+    )
+    result = search_time_bias_after(
+        frame["time_s"].to_numpy(dtype=float)[mask],
+        adaptive[mask],
+        np.asarray(dataset.ref_time_s, dtype=float),
+        np.asarray(dataset.ref_hr_bpm, dtype=float),
+        search_range_s=(float(search_range[0]), float(search_range[1])),
+        search_step_s=search_step,
+        min_valid=2,
+        mode=mode,
+    )
+    return float(result.time_bias_after_s), "computed_during_redraw", str(result.mode)
+
+
+def _write_manual_global_hr_csv(frame: pd.DataFrame, path: Path) -> None:
+    """Write the redraw global HR curve with stable post-hoc columns."""
+
+    columns = [
+        "time_s",
+        "segment_label",
+        "is_filtered_segment",
+        "ppg_hr_bpm",
+        "ref_hr_after_bpm",
+        "time_bias_after_s",
+        "abs_err_after_bpm",
+        "time_bias_after_source",
+        "time_bias_after_mode",
+    ]
+    frame.loc[:, [c for c in columns if c in frame.columns]].to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def _plot_manual_global_hr_frame(
+    plt: Any,
+    frame: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str,
+) -> None:
+    """Plot one merged PPG-derived HR curve against the shifted reference HR."""
+
+    fig, ax = plt.subplots(1, 1, figsize=(12, 4.8))
+    x = frame["time_s"].to_numpy(dtype=float)
+    ax.plot(x, frame["ref_hr_after_bpm"].to_numpy(dtype=float), color="black", linewidth=1.6, label="ref HR after")
+    ax.plot(x, frame["ppg_hr_bpm"].to_numpy(dtype=float), color="#1f77b4", linewidth=1.4, label="PPG HR")
+    ax.set_title(title)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("HR (bpm)")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 def _params_from_best_csv(
@@ -2107,6 +2351,58 @@ def _params_from_best_csv(
     fold_id: int | None = None,
     heldout_group_id: str | None = None,
 ) -> ProtocolTrialParams:
+    row = _best_param_row_from_csv(
+        best_param_csv_path,
+        scope,
+        scheme,
+        adaptive_filter,
+        fold_id=fold_id,
+        heldout_group_id=heldout_group_id,
+    )
+
+    values: dict[str, Any] = {}
+    for item in fields(ProtocolTrialParams):
+        if item.name not in row or pd.isna(row[item.name]):
+            continue
+        default = item.default
+        value = row[item.name]
+        if isinstance(default, bool):
+            values[item.name] = _parse_bool_param(value)
+        elif isinstance(default, int):
+            values[item.name] = int(value)
+        elif isinstance(default, float):
+            values[item.name] = float(value)
+        elif isinstance(default, tuple):
+            values[item.name] = _parse_tuple_param(value, default)
+        else:
+            values[item.name] = str(value)
+    values["adaptive_filter"] = adaptive_filter
+    return ProtocolTrialParams(**values)
+
+
+def _parse_bool_param(value: Any) -> bool:
+    """Parse bool-ish CSV values without treating the string 'False' as True."""
+
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "1", "yes", "y"}:
+            return True
+        if text in {"false", "0", "no", "n", ""}:
+            return False
+    return bool(value)
+
+
+def _best_param_row_from_csv(
+    best_param_csv_path: str | Path,
+    scope: TargetScope,
+    scheme: CascadeScheme,
+    adaptive_filter: str,
+    *,
+    fold_id: int | None = None,
+    heldout_group_id: str | None = None,
+) -> pd.Series:
+    """Select the best-params row used by manual redraw and params decoding."""
+
     df = pd.read_csv(best_param_csv_path)
     mask = pd.Series(True, index=df.index)
     for column, value in (
@@ -2127,25 +2423,7 @@ def _params_from_best_csv(
         row = df.iloc[0]
     else:
         raise ValueError(f"best param CSV is empty: {best_param_csv_path}")
-
-    values: dict[str, Any] = {}
-    for item in fields(ProtocolTrialParams):
-        if item.name not in row or pd.isna(row[item.name]):
-            continue
-        default = item.default
-        value = row[item.name]
-        if isinstance(default, bool):
-            values[item.name] = bool(value)
-        elif isinstance(default, int):
-            values[item.name] = int(value)
-        elif isinstance(default, float):
-            values[item.name] = float(value)
-        elif isinstance(default, tuple):
-            values[item.name] = _parse_tuple_param(value, default)
-        else:
-            values[item.name] = str(value)
-    values["adaptive_filter"] = adaptive_filter
-    return ProtocolTrialParams(**values)
+    return row
 
 
 def _parse_tuple_param(value: Any, default: tuple[Any, ...]) -> tuple[Any, ...]:
@@ -2263,6 +2541,7 @@ def _empty_metrics(split_name: str) -> dict[str, Any]:
         "baseline_acc_pct": float("nan"),
         "adaptive_acc_pct": float("nan"),
         "num_windows": 0,
+        **_empty_posthoc_metrics(),
     }
 
 
@@ -2276,7 +2555,36 @@ def _failed_metrics(split_name: str, reason: str) -> dict[str, Any]:
         "baseline_acc_pct": float("nan"),
         "adaptive_acc_pct": float("nan"),
         "num_windows": 0,
+        **_empty_posthoc_metrics(),
     }
+
+
+def _empty_posthoc_metrics() -> dict[str, Any]:
+    """Return stable empty fields for time_bias_after/posthoc CSV output."""
+
+    return {
+        "time_bias_after_s": float("nan"),
+        "time_bias_after_mode": "",
+        "time_bias_after_range_s": "",
+        "time_bias_after_step_s": float("nan"),
+        "time_bias_after_n_valid": 0,
+        "posthoc_adaptive_aae_bpm": float("nan"),
+        "posthoc_adaptive_acc_pct": float("nan"),
+        "posthoc_adaptive_hit_rate_5bpm": float("nan"),
+        "posthoc_baseline_aae_bpm": float("nan"),
+        "posthoc_baseline_acc_pct": float("nan"),
+        "posthoc_n_valid_windows": 0,
+    }
+
+
+def _posthoc_metrics_from(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Pick only the explicit post-hoc fields from an aggregate metric dict."""
+
+    out = _empty_posthoc_metrics()
+    for key in out:
+        if key in metrics:
+            out[key] = metrics[key]
+    return out
 
 
 def _metrics_from_arrays_with_status(

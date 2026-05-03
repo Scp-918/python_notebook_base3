@@ -21,8 +21,10 @@ from .alignment import (
     AlignedDataset,
     AlignmentInfo,
     TDelayEstimateResult,
+    TimeBiasAfterResult,
     build_aligned_training_windows,
     estimate_global_tdelay_from_rest,
+    search_time_bias_after,
 )
 from .envelope_delay import DelayEstimate, estimate_envelope_delays
 from .motion_frequency import estimate_motion_frequency
@@ -70,6 +72,13 @@ class ProtocolRunResult:
     alignment_info: AlignmentInfo | None
     motion_frequency: float | None
     metric_arrays: MetricArrays = field(default_factory=dict)
+    posthoc_adaptive_aae_bpm: float = float("nan")
+    posthoc_adaptive_acc_pct: float = float("nan")
+    posthoc_adaptive_hit_rate_5bpm: float = float("nan")
+    posthoc_baseline_aae_bpm: float = float("nan")
+    posthoc_baseline_acc_pct: float = float("nan")
+    posthoc_n_valid_windows: int = 0
+    time_bias_after: TimeBiasAfterResult | None = None
 
 
 @dataclass
@@ -200,6 +209,12 @@ def run_protocol_trial(
             "adaptive_abs_err_bpm": adaptive_abs_err,
             "filtered_mask": filtered_mask,
         }
+        time_bias_after = _attach_time_bias_after_metrics(
+            metric_arrays,
+            base.dataset,
+            params,
+            filtered_mask,
+        )
 
         metrics = aggregate_metric_arrays(metric_arrays, split_name="")
         baseline_aae = float(metrics["baseline_aae_bpm"])
@@ -217,6 +232,20 @@ def run_protocol_trial(
             frame["baseline_acc_pct"] = baseline_acc
             frame["adaptive_aae_bpm"] = adaptive_aae
             frame["adaptive_acc_pct"] = adaptive_acc
+            if "ref_hr_after_bpm" in metric_arrays:
+                frame["ref_hr_after_bpm"] = metric_arrays["ref_hr_after_bpm"]
+                frame["adaptive_abs_err_after_bpm"] = metric_arrays["adaptive_abs_err_after_bpm"]
+                frame["baseline_abs_err_after_bpm"] = metric_arrays["baseline_abs_err_after_bpm"]
+                frame["time_bias_after_s"] = metric_arrays["time_bias_after_s"]
+                frame["posthoc_alignment_mode"] = str(
+                    time_bias_after.mode if time_bias_after is not None else ""
+                )
+                frame["posthoc_adaptive_aae_bpm"] = metrics.get("posthoc_adaptive_aae_bpm", float("nan"))
+                frame["posthoc_adaptive_acc_pct"] = metrics.get("posthoc_adaptive_acc_pct", float("nan"))
+                frame["posthoc_adaptive_hit_rate_5bpm"] = metrics.get(
+                    "posthoc_adaptive_hit_rate_5bpm",
+                    float("nan"),
+                )
 
         return ProtocolRunResult(
             success=True,
@@ -235,6 +264,15 @@ def run_protocol_trial(
             alignment_info=base.aligned.alignment_info,
             motion_frequency=base.motion_frequency,
             metric_arrays=metric_arrays,
+            posthoc_adaptive_aae_bpm=float(metrics.get("posthoc_adaptive_aae_bpm", float("nan"))),
+            posthoc_adaptive_acc_pct=float(metrics.get("posthoc_adaptive_acc_pct", float("nan"))),
+            posthoc_adaptive_hit_rate_5bpm=float(
+                metrics.get("posthoc_adaptive_hit_rate_5bpm", float("nan"))
+            ),
+            posthoc_baseline_aae_bpm=float(metrics.get("posthoc_baseline_aae_bpm", float("nan"))),
+            posthoc_baseline_acc_pct=float(metrics.get("posthoc_baseline_acc_pct", float("nan"))),
+            posthoc_n_valid_windows=int(metrics.get("posthoc_n_valid_windows", 0) or 0),
+            time_bias_after=time_bias_after,
         )
     except Exception as exc:
         return ProtocolRunResult(
@@ -255,6 +293,70 @@ def run_protocol_trial(
             motion_frequency=None,
             metric_arrays={},
         )
+
+
+def _attach_time_bias_after_metrics(
+    metric_arrays: MetricArrays,
+    dataset: ProtocolDataset,
+    params: ProtocolTrialParams,
+    filtered_mask: np.ndarray,
+) -> TimeBiasAfterResult | None:
+    """Attach post-hoc curve-level alignment arrays to one completed run.
+
+    中文说明：这里的后对齐只读取已经生成的 ``adaptive_hr_bpm`` 和
+    ``baseline_hr_bpm``，然后在原始参考 HR 曲线上按 ``time_s + bias``
+    取样。它不会重新切窗、不会改写 PPG/补偿信号，也不会重新运行自适应滤波。
+    """
+
+    if not bool(getattr(params, "Enable_Time_Bias_After", True)):
+        return None
+    time_s = np.asarray(metric_arrays.get("time_s", []), dtype=float)
+    adaptive = np.asarray(metric_arrays.get("adaptive_hr_bpm", []), dtype=float)
+    baseline = np.asarray(metric_arrays.get("baseline_hr_bpm", []), dtype=float)
+    mask = np.asarray(filtered_mask, dtype=bool)
+    n = min(time_s.size, adaptive.size, baseline.size, mask.size)
+    if n == 0:
+        return None
+    time_s = time_s[:n]
+    adaptive = adaptive[:n]
+    baseline = baseline[:n]
+    mask = mask[:n]
+    search_range = tuple(float(x) for x in getattr(params, "Time_Bias_After_Range_S", (-5.0, 5.0)))
+    if len(search_range) != 2:
+        raise ValueError("Time_Bias_After_Range_S must contain exactly two values")
+    result = search_time_bias_after(
+        time_s[mask],
+        adaptive[mask],
+        np.asarray(dataset.ref_time_s, dtype=float),
+        np.asarray(dataset.ref_hr_bpm, dtype=float),
+        search_range_s=(float(search_range[0]), float(search_range[1])),
+        search_step_s=float(getattr(params, "Time_Bias_After_Step_S", 1.0)),
+        min_valid=2,
+        mode=str(getattr(params, "Time_Bias_After_Mode", "posthoc_oracle_alignment")),
+    )
+    bias = float(result.time_bias_after_s)
+    ref_after = np.interp(
+        time_s + bias,
+        np.asarray(dataset.ref_time_s, dtype=float),
+        np.asarray(dataset.ref_hr_bpm, dtype=float),
+        left=np.nan,
+        right=np.nan,
+    )
+    # 中文说明：将标量 bias 重复成窗口等长数组，方便 LOGO/多样本聚合时逐窗拼接；
+    # 聚合函数只聚合已应用各自样本 bias 后的误差，不会重新搜索全局 bias。
+    metric_arrays["ref_hr_after_bpm"] = ref_after
+    metric_arrays["adaptive_abs_err_after_bpm"] = np.abs(adaptive - ref_after)
+    metric_arrays["baseline_abs_err_after_bpm"] = np.abs(baseline - ref_after)
+    metric_arrays["time_bias_after_s"] = np.full(n, bias, dtype=float)
+    metric_arrays["time_bias_after_n_valid"] = np.full(n, int(result.n_valid), dtype=float)
+    metric_arrays["time_bias_after_step_s"] = np.full(n, float(result.search_step_s), dtype=float)
+    metric_arrays["time_bias_after_range_s"] = np.full(
+        n,
+        f"({result.search_range_s[0]:.1f}, {result.search_range_s[1]:.1f})",
+        dtype=object,
+    )
+    metric_arrays["time_bias_after_mode"] = np.full(n, str(result.mode), dtype=object)
+    return result
 
 
 def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _TrialBase:
@@ -391,6 +493,7 @@ def _get_global_alignment_base(dataset: ProtocolDataset, params: ProtocolTrialPa
             delay_range_s=None,
             delay_step_s=0.1,
             rest_hr_kwargs=_rest_hr_kwargs_from_params(params),
+            alignment_score_mode=str(getattr(params, "Rest_Alignment_Score_Mode", "aae")),
             return_debug=False,
         )
     except Exception as exc:
@@ -445,7 +548,8 @@ def _global_tdelay_cache_key(dataset: ProtocolDataset, params: ProtocolTrialPara
         bool(getattr(params, "Rest_HR_Spec_Penalty_Enable", True)),
         round(float(getattr(params, "Rest_HR_Spec_Penalty_Weight", 0.2)), 8),
         round(float(getattr(params, "Rest_HR_Spec_Penalty_Width_Hz", 0.2)), 8),
-        "tracked_rest_hr_tdelay_v2",
+        _normalise_alignment_score_mode(getattr(params, "Rest_Alignment_Score_Mode", "aae")),
+        "tracked_rest_hr_tdelay_v3",
     )
 
 
@@ -466,6 +570,17 @@ def _rest_hr_kwargs_from_params(params: ProtocolTrialParams) -> dict[str, Any]:
     }
 
 
+def _normalise_alignment_score_mode(value: Any) -> str:
+    """Normalise the rest-alignment score mode used in cache keys and logs."""
+
+    mode = str(value).lower()
+    if mode == "mae":
+        mode = "aae"
+    if mode not in {"aae", "std"}:
+        raise ValueError("Rest_Alignment_Score_Mode must be 'aae', 'mae', or 'std'")
+    return mode
+
+
 def _log_global_alignment_once(
     dataset: ProtocolDataset,
     params: ProtocolTrialParams,
@@ -483,6 +598,7 @@ def _log_global_alignment_once(
         int(params.Fs_Target),
         round(alignment_tw, 3),
         round(float(train_tw), 3),
+        _normalise_alignment_score_mode(getattr(params, "Rest_Alignment_Score_Mode", "aae")),
         bool(cache_hit),
     )
     if key in _PRINTED_GLOBAL_ALIGNMENT_KEYS:
@@ -496,6 +612,10 @@ def _log_global_alignment_once(
         else pd.DataFrame()
     )
     n_valid = int(best_row["n_valid"].iloc[0]) if not best_row.empty else 0
+    score_mode = str(getattr(tdelay, "alignment_score_mode", "aae"))
+    score_aae = float(getattr(tdelay, "best_score_aae", float("nan")))
+    score_std = float(getattr(tdelay, "best_score_std", float("nan")))
+    score_rmse = float(getattr(tdelay, "best_rmse", float("nan")))
     print(
         f"[全局对齐] group={dataset.sample_stem}, Fs={int(params.Fs_Target)}, "
         f"alignment_TW={alignment_tw:.1f}s, train_TW={float(train_tw):.1f}s, "
@@ -504,8 +624,9 @@ def _log_global_alignment_once(
     )
     print(
         f"[全局对齐] 使用静息段 tracked PPG-HR 估计 Tdelay: "
-        f"best_tdelay={tdelay.best_tdelay_s:.2f}s, score_std={tdelay.best_score:.3f} BPM, "
-        f"n_valid={n_valid}"
+        f"best_tdelay={tdelay.best_tdelay_s:.2f}s, score_mode={score_mode}, "
+        f"best_score={tdelay.best_score:.3f} BPM, score_aae={score_aae:.3f} BPM, "
+        f"score_std={score_std:.3f} BPM, rmse={score_rmse:.3f} BPM, n_valid={n_valid}"
     )
     print(
         f"[全局对齐] 后续训练窗口使用 train_TW={float(train_tw):.1f}s，"
@@ -1070,6 +1191,17 @@ def aggregate_metric_arrays(metric_arrays: MetricArrays, split_name: str = "") -
             "adaptive_aae_bpm": float("nan"),
             "baseline_acc_pct": float("nan"),
             "adaptive_acc_pct": float("nan"),
+            "time_bias_after_s": float("nan"),
+            "time_bias_after_mode": "",
+            "time_bias_after_range_s": "",
+            "time_bias_after_step_s": float("nan"),
+            "time_bias_after_n_valid": 0,
+            "posthoc_adaptive_aae_bpm": float("nan"),
+            "posthoc_adaptive_acc_pct": float("nan"),
+            "posthoc_adaptive_hit_rate_5bpm": float("nan"),
+            "posthoc_baseline_aae_bpm": float("nan"),
+            "posthoc_baseline_acc_pct": float("nan"),
+            "posthoc_n_valid_windows": 0,
             "num_windows": 0,
         }
     mask = np.asarray(metric_arrays.get("filtered_mask", np.ones(ref.size, dtype=bool)), dtype=bool)
@@ -1084,13 +1216,82 @@ def aggregate_metric_arrays(metric_arrays: MetricArrays, split_name: str = "") -
     mask = mask[: min(mask.size, baseline_err.size, adaptive_err.size)]
     baseline_target = baseline_err[: mask.size][mask]
     adaptive_target = adaptive_err[: mask.size][mask]
+    posthoc = _aggregate_posthoc_metric_arrays(metric_arrays, mask)
     return {
         "split": split_name,
         "baseline_aae_bpm": _mean(baseline_target),
         "adaptive_aae_bpm": _mean(adaptive_target),
         "baseline_acc_pct": _accuracy(baseline_target),
         "adaptive_acc_pct": _accuracy(adaptive_target),
+        **posthoc,
         "num_windows": int(np.isfinite(adaptive_target).sum()),
+    }
+
+
+def _aggregate_posthoc_metric_arrays(metric_arrays: MetricArrays, mask: np.ndarray) -> dict[str, Any]:
+    """Aggregate post-hoc errors that already include per-run time bias.
+
+    中文说明：这里不重新搜索 ``time_bias_after_s``。多样本/LOGO 聚合只是把每个
+    run 已经按自身 bias 计算好的窗口级误差拼接后求指标，避免把 oracle 后对齐
+    混同成一个全测试集共享的泛化参数。
+    """
+
+    adaptive_after = metric_arrays.get("adaptive_abs_err_after_bpm")
+    baseline_after = metric_arrays.get("baseline_abs_err_after_bpm")
+    if adaptive_after is None or baseline_after is None:
+        return {
+            "time_bias_after_s": float("nan"),
+            "time_bias_after_mode": "",
+            "time_bias_after_range_s": "",
+            "time_bias_after_step_s": float("nan"),
+            "time_bias_after_n_valid": 0,
+            "posthoc_adaptive_aae_bpm": float("nan"),
+            "posthoc_adaptive_acc_pct": float("nan"),
+            "posthoc_adaptive_hit_rate_5bpm": float("nan"),
+            "posthoc_baseline_aae_bpm": float("nan"),
+            "posthoc_baseline_acc_pct": float("nan"),
+            "posthoc_n_valid_windows": 0,
+        }
+    adaptive_arr = np.asarray(adaptive_after, dtype=float)
+    baseline_arr = np.asarray(baseline_after, dtype=float)
+    n = min(mask.size, adaptive_arr.size, baseline_arr.size)
+    target_adaptive = adaptive_arr[:n][mask[:n]]
+    target_baseline = baseline_arr[:n][mask[:n]]
+    time_bias = np.asarray(metric_arrays.get("time_bias_after_s", []), dtype=float)
+    finite_bias = np.unique(np.round(time_bias[np.isfinite(time_bias)], 10)) if time_bias.size else np.asarray([])
+    bias_value = float(finite_bias[0]) if finite_bias.size == 1 else float("nan")
+    if finite_bias.size == 0:
+        mode_value = ""
+    elif finite_bias.size == 1:
+        mode_values = np.asarray(metric_arrays.get("time_bias_after_mode", []), dtype=object)
+        finite_modes = [str(x) for x in mode_values.ravel().tolist() if str(x)]
+        unique_modes = sorted(set(finite_modes))
+        mode_value = unique_modes[0] if len(unique_modes) == 1 else "posthoc_oracle_alignment"
+    else:
+        mode_value = "per_run_posthoc_oracle_alignment"
+    range_values = np.asarray(metric_arrays.get("time_bias_after_range_s", []), dtype=object)
+    finite_ranges = [str(x) for x in range_values.ravel().tolist() if str(x)]
+    unique_ranges = sorted(set(finite_ranges))
+    step_values = np.asarray(metric_arrays.get("time_bias_after_step_s", []), dtype=float)
+    finite_steps = np.unique(np.round(step_values[np.isfinite(step_values)], 10)) if step_values.size else np.asarray([])
+    n_valid_arr = np.asarray(metric_arrays.get("time_bias_after_n_valid", []), dtype=float)
+    finite_n_valid = n_valid_arr[np.isfinite(n_valid_arr)]
+    n_valid = int(np.nanmax(finite_n_valid)) if finite_n_valid.size and finite_bias.size == 1 else int(
+        np.isfinite(target_adaptive).sum()
+    )
+    hit_rate = _accuracy(target_adaptive)
+    return {
+        "time_bias_after_s": bias_value,
+        "time_bias_after_mode": mode_value,
+        "time_bias_after_range_s": unique_ranges[0] if len(unique_ranges) == 1 else "",
+        "time_bias_after_step_s": float(finite_steps[0]) if finite_steps.size == 1 else float("nan"),
+        "time_bias_after_n_valid": n_valid,
+        "posthoc_adaptive_aae_bpm": _mean(target_adaptive),
+        "posthoc_adaptive_acc_pct": hit_rate,
+        "posthoc_adaptive_hit_rate_5bpm": hit_rate,
+        "posthoc_baseline_aae_bpm": _mean(target_baseline),
+        "posthoc_baseline_acc_pct": _accuracy(target_baseline),
+        "posthoc_n_valid_windows": int(np.isfinite(target_adaptive).sum()),
     }
 
 

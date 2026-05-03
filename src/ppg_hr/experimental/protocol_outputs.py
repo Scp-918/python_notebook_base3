@@ -129,6 +129,7 @@ def plot_rest_alignment_diagnostics_by_motion_type(
     alignment_TW: float | None = None,
     alignment_step_s: float = 1.0,
     rest_hr_kwargs: dict[str, Any] | None = None,
+    alignment_score_mode: str = "aae",
 ) -> dict[str, Path]:
     """Plot rest-segment alignment diagnostics grouped by motion type.
 
@@ -174,6 +175,7 @@ def plot_rest_alignment_diagnostics_by_motion_type(
                     alignment_TW=align_tw,
                     alignment_step_s=float(alignment_step_s),
                     rest_hr_kwargs=rest_hr_kwargs,
+                    alignment_score_mode=alignment_score_mode,
                 )
                 curve = compute_rest_alignment_diagnostic_curve(
                     ds,
@@ -183,7 +185,12 @@ def plot_rest_alignment_diagnostics_by_motion_type(
                     int(fs_target),
                     rest_hr_kwargs=rest_hr_kwargs,
                 )
-                title = f"{pair.motion_id} | Tdelay={aligned.alignment_info.best_tdelay_s:.2f}s"
+                info = aligned.alignment_info
+                title = (
+                    f"{pair.motion_id} | mode={info.alignment_score_mode}, "
+                    f"Tdelay={info.best_tdelay_s:.2f}s, "
+                    f"AAE={info.best_score_aae:.2f}, STD={info.best_score_std:.2f}"
+                )
                 if curve.empty:
                     ax.text(0.5, 0.5, "no comparable rest windows", ha="center", va="center", transform=ax.transAxes)
                 else:
@@ -207,7 +214,10 @@ def plot_rest_alignment_diagnostics_by_motion_type(
                 ax.text(0.5, 0.5, f"alignment failed\n{exc}", ha="center", va="center", transform=ax.transAxes)
             ax.set_title(title)
 
-        fig.suptitle(f"{motion_type} Rest alignment diagnostics, TW={int(TW)}", fontsize=14)
+        fig.suptitle(
+            f"{motion_type} Rest alignment diagnostics, TW={int(TW)}, score_mode={alignment_score_mode}",
+            fontsize=14,
+        )
         fig.tight_layout(rect=(0, 0, 1, 0.95))
         path = out / f"{motion_type}_rest_alignment_TW{int(TW)}.png"
         fig.savefig(path, dpi=150)

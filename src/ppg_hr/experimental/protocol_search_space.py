@@ -66,6 +66,15 @@ class ProtocolTrialParams:
     Rest_HR_Spec_Penalty_Enable: bool = True
     Rest_HR_Spec_Penalty_Weight: float = 0.2
     Rest_HR_Spec_Penalty_Width_Hz: float = 0.2
+    # 中文说明：静息段全局 Tdelay 搜索的主评分。AAE 更贴近最终误差指标；
+    # ``std`` 保留旧逻辑用于复现实验，``mae`` 作为 ``aae`` 的兼容别名。
+    Rest_Alignment_Score_Mode: str = "aae"
+    # 中文说明：以下 time_bias_after_* 是自适应滤波后 HR 曲线的 post-hoc
+    # 诊断对齐参数，只影响新增 posthoc 指标和手动重画，不进入 Optuna 搜索空间。
+    Enable_Time_Bias_After: bool = True
+    Time_Bias_After_Range_S: tuple[float, float] = (-5.0, 5.0)
+    Time_Bias_After_Step_S: float = 1.0
+    Time_Bias_After_Mode: str = "posthoc_oracle_alignment"
     alpha_u: float = 0.1
     M2: int = 3
     rff_D: int = 100
