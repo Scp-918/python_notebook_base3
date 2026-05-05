@@ -408,13 +408,6 @@ def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _T
             best_tdelay_s=global_base.tdelay_result.best_tdelay_s,
             tdelay_result=global_base.tdelay_result,
         )
-        _log_global_alignment_once(
-            dataset,
-            params,
-            global_base.tdelay_result,
-            train_tw=tw,
-            cache_hit=global_base.cache_hit,
-        )
     except Exception as exc:
         base = _TrialBase(
             dataset=ds,
