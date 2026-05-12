@@ -82,6 +82,9 @@ class ProtocolTrialParams:
     Time_Bias_After_Range_S: tuple[float, float] = (-5.0, 5.0)
     Time_Bias_After_Step_S: float = 1.0
     Time_Bias_After_Mode: str = "posthoc_oracle_alignment"
+    Recovery_Grace_S: float = 10.0
+    Recovery_Diff_Bpm: float = 20.0
+    Recovery_Cross_Diff_Bpm: float = 8.0
     alpha_u: float = 0.1
     M2: int = 3
     rff_D: int = 100

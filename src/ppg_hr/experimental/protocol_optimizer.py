@@ -52,8 +52,10 @@ class ProtocolModeResult:
     best_aae_bpm: float
     baseline_aae_bpm: float
     adaptive_aae_bpm: float
+    final_aae_bpm: float
     baseline_acc_pct: float
     adaptive_acc_pct: float
+    final_acc_pct: float
     param_importance: dict[str, float]
     trial_history: list[dict[str, Any]]
     best_run: ProtocolRunResult
@@ -226,11 +228,13 @@ def optimise_protocol_mode(
         target_scope=scope,
         cascade_scheme=scheme,
         best_params=best_params,
-        best_aae_bpm=float(best_run.adaptive_aae_bpm) if best_run.success else float(final_value),
+        best_aae_bpm=float(best_run.final_aae_bpm) if best_run.success else float(final_value),
         baseline_aae_bpm=float(best_run.baseline_aae_bpm),
         adaptive_aae_bpm=float(best_run.adaptive_aae_bpm),
+        final_aae_bpm=float(best_run.final_aae_bpm),
         baseline_acc_pct=float(best_run.baseline_acc_pct),
         adaptive_acc_pct=float(best_run.adaptive_acc_pct),
+        final_acc_pct=float(best_run.final_acc_pct),
         param_importance=_parameter_importance(history, cfg),
         trial_history=history,
         best_run=best_run,
@@ -306,9 +310,9 @@ def _cached_run(
 
 def _objective_value(run: ProtocolRunResult, objective_mode: str, penalty_value: float) -> float:
     if objective_mode == "accuracy":
-        value = 100.0 - float(run.adaptive_acc_pct)
+        value = 100.0 - float(run.final_acc_pct)
     else:
-        value = float(run.adaptive_aae_bpm)
+        value = float(run.final_aae_bpm)
     return value if np.isfinite(value) else float(penalty_value)
 
 
@@ -329,6 +333,8 @@ def _append_history(
             "value": float(value),
             "aae_bpm": float(run.adaptive_aae_bpm),
             "accuracy_pct": float(run.adaptive_acc_pct),
+            "final_aae_bpm": float(run.final_aae_bpm),
+            "final_acc_pct": float(run.final_acc_pct),
             "best_so_far": float(best_seen),
             "params": params.to_dict(),
             "rff_seed": int(params.rff_seed),

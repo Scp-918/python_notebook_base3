@@ -1583,8 +1583,10 @@ def _aggregate_runs(
             "reason": "; ".join(failures) if failures else "no successful runs",
             "baseline_aae_bpm": float("nan"),
             "adaptive_aae_bpm": float("nan"),
+            "final_aae_bpm": float("nan"),
             "baseline_acc_pct": float("nan"),
             "adaptive_acc_pct": float("nan"),
+            "final_acc_pct": float("nan"),
             "num_windows": 0,
             **_empty_posthoc_metrics(),
         }
@@ -1595,8 +1597,10 @@ def _aggregate_runs(
         "reason": "; ".join(failures[:3]),
         "baseline_aae_bpm": metrics["baseline_aae_bpm"],
         "adaptive_aae_bpm": metrics["adaptive_aae_bpm"],
+        "final_aae_bpm": metrics["final_aae_bpm"],
         "baseline_acc_pct": metrics["baseline_acc_pct"],
         "adaptive_acc_pct": metrics["adaptive_acc_pct"],
+        "final_acc_pct": metrics["final_acc_pct"],
         "num_windows": metrics["num_windows"],
         **_posthoc_metrics_from(metrics),
     }
@@ -1646,8 +1650,10 @@ def _per_group_row(
         "reason": run.reason,
         "baseline_aae_bpm": run.baseline_aae_bpm,
         "adaptive_aae_bpm": run.adaptive_aae_bpm,
+        "final_aae_bpm": run.final_aae_bpm,
         "baseline_acc_pct": run.baseline_acc_pct,
         "adaptive_acc_pct": run.adaptive_acc_pct,
+        "final_acc_pct": run.final_acc_pct,
         "time_bias_after_s": (
             float(run.time_bias_after.time_bias_after_s) if run.time_bias_after is not None else float("nan")
         ),
@@ -1668,6 +1674,8 @@ def _per_group_row(
         "posthoc_adaptive_aae_bpm": run.posthoc_adaptive_aae_bpm,
         "posthoc_adaptive_acc_pct": run.posthoc_adaptive_acc_pct,
         "posthoc_adaptive_hit_rate_5bpm": run.posthoc_adaptive_hit_rate_5bpm,
+        "posthoc_final_aae_bpm": run.posthoc_final_aae_bpm,
+        "posthoc_final_acc_pct": run.posthoc_final_acc_pct,
         "posthoc_baseline_aae_bpm": run.posthoc_baseline_aae_bpm,
         "posthoc_baseline_acc_pct": run.posthoc_baseline_acc_pct,
         "posthoc_n_valid_windows": run.posthoc_n_valid_windows,
@@ -1676,10 +1684,10 @@ def _per_group_row(
 
 def _objective_value(metrics: dict[str, Any], objective_mode: str, penalty_value: float) -> float:
     if objective_mode == "accuracy":
-        acc = float(metrics.get("adaptive_acc_pct", float("nan")))
+        acc = float(metrics.get("final_acc_pct", metrics.get("adaptive_acc_pct", float("nan"))))
         value = 100.0 - acc
     else:
-        value = float(metrics.get("adaptive_aae_bpm", float("nan")))
+        value = float(metrics.get("final_aae_bpm", metrics.get("adaptive_aae_bpm", float("nan"))))
     return value if np.isfinite(value) else float(penalty_value)
 
 
@@ -1711,6 +1719,8 @@ def _append_history(
             "objective_value": float(objective_value),
             "aae_bpm": float(metrics.get("adaptive_aae_bpm", float("nan"))),
             "accuracy_pct": float(metrics.get("adaptive_acc_pct", float("nan"))),
+            "final_aae_bpm": float(metrics.get("final_aae_bpm", float("nan"))),
+            "final_acc_pct": float(metrics.get("final_acc_pct", float("nan"))),
             "best_so_far": float(best_so_far),
             "success": bool(metrics.get("success", False)),
             "reason": str(metrics.get("reason", "")),
@@ -1752,6 +1762,8 @@ def _emit_trial_progress(
             "objective_value": float(objective_value),
             "aae_bpm": metrics.get("adaptive_aae_bpm"),
             "accuracy_pct": metrics.get("adaptive_acc_pct"),
+            "final_aae_bpm": metrics.get("final_aae_bpm"),
+            "final_acc_pct": metrics.get("final_acc_pct"),
             "best_so_far": float(best_so_far),
             "repeat_idx": int(repeat_idx) + 1,
             "repeat_total": int(n_repeats),
@@ -1893,6 +1905,10 @@ def _summary_row(result: _ModeOptimisation) -> dict[str, Any]:
         row[f"{prefix}_accuracy_pct"] = metrics.get("adaptive_acc_pct")
         row[f"{prefix}_baseline_aae_bpm"] = metrics.get("baseline_aae_bpm")
         row[f"{prefix}_baseline_accuracy_pct"] = metrics.get("baseline_acc_pct")
+        row[f"{prefix}_adaptive_aae_bpm"] = metrics.get("adaptive_aae_bpm")
+        row[f"{prefix}_adaptive_accuracy_pct"] = metrics.get("adaptive_acc_pct")
+        row[f"{prefix}_final_aae_bpm"] = metrics.get("final_aae_bpm")
+        row[f"{prefix}_final_accuracy_pct"] = metrics.get("final_acc_pct")
         row[f"{prefix}_num_windows"] = metrics.get("num_windows")
         row[f"{prefix}_time_bias_after_s"] = metrics.get("time_bias_after_s")
         row[f"{prefix}_time_bias_after_mode"] = metrics.get("time_bias_after_mode")
@@ -1902,6 +1918,8 @@ def _summary_row(result: _ModeOptimisation) -> dict[str, Any]:
         row[f"{prefix}_posthoc_adaptive_aae_bpm"] = metrics.get("posthoc_adaptive_aae_bpm")
         row[f"{prefix}_posthoc_adaptive_acc_pct"] = metrics.get("posthoc_adaptive_acc_pct")
         row[f"{prefix}_posthoc_adaptive_hit_rate_5bpm"] = metrics.get("posthoc_adaptive_hit_rate_5bpm")
+        row[f"{prefix}_posthoc_final_aae_bpm"] = metrics.get("posthoc_final_aae_bpm")
+        row[f"{prefix}_posthoc_final_acc_pct"] = metrics.get("posthoc_final_acc_pct")
         row[f"{prefix}_posthoc_baseline_aae_bpm"] = metrics.get("posthoc_baseline_aae_bpm")
         row[f"{prefix}_posthoc_baseline_acc_pct"] = metrics.get("posthoc_baseline_acc_pct")
         row[f"{prefix}_posthoc_n_valid_windows"] = metrics.get("posthoc_n_valid_windows")
@@ -1957,16 +1975,28 @@ def _summary_columns() -> list[str]:
         "train_accuracy_pct",
         "train_baseline_aae_bpm",
         "train_baseline_accuracy_pct",
+        "train_adaptive_aae_bpm",
+        "train_adaptive_accuracy_pct",
+        "train_final_aae_bpm",
+        "train_final_accuracy_pct",
         "train_num_windows",
         "val_aae_bpm",
         "val_accuracy_pct",
         "val_baseline_aae_bpm",
         "val_baseline_accuracy_pct",
+        "val_adaptive_aae_bpm",
+        "val_adaptive_accuracy_pct",
+        "val_final_aae_bpm",
+        "val_final_accuracy_pct",
         "val_num_windows",
         "test_aae_bpm",
         "test_accuracy_pct",
         "test_baseline_aae_bpm",
         "test_baseline_accuracy_pct",
+        "test_adaptive_aae_bpm",
+        "test_adaptive_accuracy_pct",
+        "test_final_aae_bpm",
+        "test_final_accuracy_pct",
         "test_num_windows",
         "time_bias_after_s",
         "time_bias_after_mode",
@@ -1976,6 +2006,8 @@ def _summary_columns() -> list[str]:
         "posthoc_adaptive_aae_bpm",
         "posthoc_adaptive_acc_pct",
         "posthoc_adaptive_hit_rate_5bpm",
+        "posthoc_final_aae_bpm",
+        "posthoc_final_acc_pct",
         "posthoc_baseline_aae_bpm",
         "posthoc_baseline_acc_pct",
         "posthoc_n_valid_windows",
@@ -1987,6 +2019,8 @@ def _summary_columns() -> list[str]:
         "train_posthoc_adaptive_aae_bpm",
         "train_posthoc_adaptive_acc_pct",
         "train_posthoc_adaptive_hit_rate_5bpm",
+        "train_posthoc_final_aae_bpm",
+        "train_posthoc_final_acc_pct",
         "train_posthoc_baseline_aae_bpm",
         "train_posthoc_baseline_acc_pct",
         "train_posthoc_n_valid_windows",
@@ -1998,6 +2032,8 @@ def _summary_columns() -> list[str]:
         "val_posthoc_adaptive_aae_bpm",
         "val_posthoc_adaptive_acc_pct",
         "val_posthoc_adaptive_hit_rate_5bpm",
+        "val_posthoc_final_aae_bpm",
+        "val_posthoc_final_acc_pct",
         "val_posthoc_baseline_aae_bpm",
         "val_posthoc_baseline_acc_pct",
         "val_posthoc_n_valid_windows",
@@ -2009,6 +2045,8 @@ def _summary_columns() -> list[str]:
         "test_posthoc_adaptive_aae_bpm",
         "test_posthoc_adaptive_acc_pct",
         "test_posthoc_adaptive_hit_rate_5bpm",
+        "test_posthoc_final_aae_bpm",
+        "test_posthoc_final_acc_pct",
         "test_posthoc_baseline_aae_bpm",
         "test_posthoc_baseline_acc_pct",
         "test_posthoc_n_valid_windows",
@@ -2561,8 +2599,10 @@ def _empty_metrics(split_name: str) -> dict[str, Any]:
         "reason": "",
         "baseline_aae_bpm": float("nan"),
         "adaptive_aae_bpm": float("nan"),
+        "final_aae_bpm": float("nan"),
         "baseline_acc_pct": float("nan"),
         "adaptive_acc_pct": float("nan"),
+        "final_acc_pct": float("nan"),
         "num_windows": 0,
         **_empty_posthoc_metrics(),
     }
@@ -2575,8 +2615,10 @@ def _failed_metrics(split_name: str, reason: str) -> dict[str, Any]:
         "reason": str(reason),
         "baseline_aae_bpm": float("nan"),
         "adaptive_aae_bpm": float("nan"),
+        "final_aae_bpm": float("nan"),
         "baseline_acc_pct": float("nan"),
         "adaptive_acc_pct": float("nan"),
+        "final_acc_pct": float("nan"),
         "num_windows": 0,
         **_empty_posthoc_metrics(),
     }
@@ -2594,6 +2636,8 @@ def _empty_posthoc_metrics() -> dict[str, Any]:
         "posthoc_adaptive_aae_bpm": float("nan"),
         "posthoc_adaptive_acc_pct": float("nan"),
         "posthoc_adaptive_hit_rate_5bpm": float("nan"),
+        "posthoc_final_aae_bpm": float("nan"),
+        "posthoc_final_acc_pct": float("nan"),
         "posthoc_baseline_aae_bpm": float("nan"),
         "posthoc_baseline_acc_pct": float("nan"),
         "posthoc_n_valid_windows": 0,

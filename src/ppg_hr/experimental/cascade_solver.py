@@ -27,6 +27,7 @@ from .alignment import (
     search_time_bias_after,
 )
 from .envelope_delay import DelayEstimate, estimate_envelope_delays
+from .fusion import fuse_final_hr
 from .motion_frequency import estimate_motion_frequency
 from .noncausal_lms import map_delay_to_lms_params, noncausal_lms_filter
 from .preprocess_protocol import PROTOCOL_CHANNELS, ProtocolDataset, resample_protocol_dataset
@@ -65,8 +66,10 @@ class ProtocolRunResult:
     objective_aae_bpm: float
     baseline_aae_bpm: float
     adaptive_aae_bpm: float
+    final_aae_bpm: float
     baseline_acc_pct: float
     adaptive_acc_pct: float
+    final_acc_pct: float
     frame: pd.DataFrame
     segment_info: SegmentInfo | None
     alignment_info: AlignmentInfo | None
@@ -75,6 +78,8 @@ class ProtocolRunResult:
     posthoc_adaptive_aae_bpm: float = float("nan")
     posthoc_adaptive_acc_pct: float = float("nan")
     posthoc_adaptive_hit_rate_5bpm: float = float("nan")
+    posthoc_final_aae_bpm: float = float("nan")
+    posthoc_final_acc_pct: float = float("nan")
     posthoc_baseline_aae_bpm: float = float("nan")
     posthoc_baseline_acc_pct: float = float("nan")
     posthoc_n_valid_windows: int = 0
@@ -207,13 +212,32 @@ def run_protocol_trial(
             adaptive[filtered_mask],
             int(params.smooth_win_len),
         )
+        fusion = fuse_final_hr(
+            time_s=arrays["time_s"].astype(float),
+            baseline_hr_bpm=arrays["baseline_hr_bpm"].astype(float),
+            adaptive_hr_bpm=adaptive,
+            segment_label=arrays["segment_label"].astype(object),
+            qc_status=arrays.get("qc_status", np.full(adaptive.size, "ok", dtype=object)),
+            adaptive_filter=adaptive_filter,
+            motion_end_s=(
+                float(base.aligned.segment_info.motion_end_s)
+                if base.aligned.segment_info is not None
+                else float("nan")
+            ),
+            params=params,
+        )
         baseline_abs_err = np.abs(arrays["baseline_hr_bpm"].astype(float) - arrays["ref_hr_bpm"].astype(float))
         adaptive_abs_err = np.abs(adaptive - arrays["ref_hr_bpm"].astype(float))
+        final_abs_err = np.abs(fusion.final_hr_bpm - arrays["ref_hr_bpm"].astype(float))
         metric_arrays: MetricArrays = {
             **arrays,
             "adaptive_hr_bpm": adaptive,
+            "final_hr_bpm": fusion.final_hr_bpm,
+            "final_source": fusion.final_source,
+            "fusion_reason": fusion.fusion_reason,
             "baseline_abs_err_bpm": baseline_abs_err,
             "adaptive_abs_err_bpm": adaptive_abs_err,
+            "final_abs_err_bpm": final_abs_err,
             "filtered_mask": filtered_mask,
         }
         time_bias_after = _attach_time_bias_after_metrics(
@@ -226,21 +250,37 @@ def run_protocol_trial(
         metrics = aggregate_metric_arrays(metric_arrays, split_name="")
         baseline_aae = float(metrics["baseline_aae_bpm"])
         adaptive_aae = float(metrics["adaptive_aae_bpm"])
+        final_aae = float(metrics["final_aae_bpm"])
         baseline_acc = float(metrics["baseline_acc_pct"])
         adaptive_acc = float(metrics["adaptive_acc_pct"])
+        final_acc = float(metrics["final_acc_pct"])
 
         frame = payload.frame
         if collect_frame:
             frame["is_filtered_segment"] = filtered_mask
             frame["adaptive_hr_bpm"] = adaptive
+            frame["baseline_hr_bpm"] = arrays["baseline_hr_bpm"].astype(float)
+            frame["final_hr_bpm"] = fusion.final_hr_bpm
+            frame["final_source"] = fusion.final_source
+            frame["fusion_reason"] = fusion.fusion_reason
+            frame["is_recovery"] = frame["segment_label"].astype(str) == "recovery"
             frame["baseline_abs_err_bpm"] = baseline_abs_err
             frame["adaptive_abs_err_bpm"] = adaptive_abs_err
+            frame["final_abs_err_bpm"] = final_abs_err
             frame["baseline_aae_bpm"] = baseline_aae
             frame["baseline_acc_pct"] = baseline_acc
             frame["adaptive_aae_bpm"] = adaptive_aae
             frame["adaptive_acc_pct"] = adaptive_acc
+            frame["final_aae_bpm"] = final_aae
+            frame["final_acc_pct"] = final_acc
+            frame["best_tdelay_s"] = (
+                float(base.aligned.alignment_info.best_tdelay_s)
+                if base.aligned.alignment_info is not None
+                else float("nan")
+            )
             if "ref_hr_after_bpm" in metric_arrays:
                 frame["ref_hr_after_bpm"] = metric_arrays["ref_hr_after_bpm"]
+                frame["final_abs_err_after_bpm"] = metric_arrays["final_abs_err_after_bpm"]
                 frame["adaptive_abs_err_after_bpm"] = metric_arrays["adaptive_abs_err_after_bpm"]
                 frame["baseline_abs_err_after_bpm"] = metric_arrays["baseline_abs_err_after_bpm"]
                 frame["time_bias_after_s"] = metric_arrays["time_bias_after_s"]
@@ -253,6 +293,8 @@ def run_protocol_trial(
                     "posthoc_adaptive_hit_rate_5bpm",
                     float("nan"),
                 )
+                frame["posthoc_final_aae_bpm"] = metrics.get("posthoc_final_aae_bpm", float("nan"))
+                frame["posthoc_final_acc_pct"] = metrics.get("posthoc_final_acc_pct", float("nan"))
 
         return ProtocolRunResult(
             success=True,
@@ -261,11 +303,13 @@ def run_protocol_trial(
             cascade_scheme=scheme,
             adaptive_filter=adaptive_filter,
             params=params,
-            objective_aae_bpm=adaptive_aae,
+            objective_aae_bpm=final_aae,
             baseline_aae_bpm=baseline_aae,
             adaptive_aae_bpm=adaptive_aae,
+            final_aae_bpm=final_aae,
             baseline_acc_pct=baseline_acc,
             adaptive_acc_pct=adaptive_acc,
+            final_acc_pct=final_acc,
             frame=frame,
             segment_info=base.aligned.segment_info,
             alignment_info=base.aligned.alignment_info,
@@ -276,6 +320,8 @@ def run_protocol_trial(
             posthoc_adaptive_hit_rate_5bpm=float(
                 metrics.get("posthoc_adaptive_hit_rate_5bpm", float("nan"))
             ),
+            posthoc_final_aae_bpm=float(metrics.get("posthoc_final_aae_bpm", float("nan"))),
+            posthoc_final_acc_pct=float(metrics.get("posthoc_final_acc_pct", float("nan"))),
             posthoc_baseline_aae_bpm=float(metrics.get("posthoc_baseline_aae_bpm", float("nan"))),
             posthoc_baseline_acc_pct=float(metrics.get("posthoc_baseline_acc_pct", float("nan"))),
             posthoc_n_valid_windows=int(metrics.get("posthoc_n_valid_windows", 0) or 0),
@@ -292,8 +338,10 @@ def run_protocol_trial(
             objective_aae_bpm=float("inf"),
             baseline_aae_bpm=float("nan"),
             adaptive_aae_bpm=float("nan"),
+            final_aae_bpm=float("nan"),
             baseline_acc_pct=float("nan"),
             adaptive_acc_pct=float("nan"),
+            final_acc_pct=float("nan"),
             frame=empty,
             segment_info=None,
             alignment_info=None,
@@ -320,20 +368,22 @@ def _attach_time_bias_after_metrics(
     time_s = np.asarray(metric_arrays.get("time_s", []), dtype=float)
     adaptive = np.asarray(metric_arrays.get("adaptive_hr_bpm", []), dtype=float)
     baseline = np.asarray(metric_arrays.get("baseline_hr_bpm", []), dtype=float)
+    final = np.asarray(metric_arrays.get("final_hr_bpm", adaptive), dtype=float)
     mask = np.asarray(filtered_mask, dtype=bool)
-    n = min(time_s.size, adaptive.size, baseline.size, mask.size)
+    n = min(time_s.size, adaptive.size, baseline.size, final.size, mask.size)
     if n == 0:
         return None
     time_s = time_s[:n]
     adaptive = adaptive[:n]
     baseline = baseline[:n]
+    final = final[:n]
     mask = mask[:n]
     search_range = tuple(float(x) for x in getattr(params, "Time_Bias_After_Range_S", (-5.0, 5.0)))
     if len(search_range) != 2:
         raise ValueError("Time_Bias_After_Range_S must contain exactly two values")
     result = search_time_bias_after(
         time_s[mask],
-        adaptive[mask],
+        final[mask],
         np.asarray(dataset.ref_time_s, dtype=float),
         np.asarray(dataset.ref_hr_bpm, dtype=float),
         search_range_s=(float(search_range[0]), float(search_range[1])),
@@ -352,6 +402,7 @@ def _attach_time_bias_after_metrics(
     # 中文说明：将标量 bias 重复成窗口等长数组，方便 LOGO/多样本聚合时逐窗拼接；
     # 聚合函数只聚合已应用各自样本 bias 后的误差，不会重新搜索全局 bias。
     metric_arrays["ref_hr_after_bpm"] = ref_after
+    metric_arrays["final_abs_err_after_bpm"] = np.abs(final - ref_after)
     metric_arrays["adaptive_abs_err_after_bpm"] = np.abs(adaptive - ref_after)
     metric_arrays["baseline_abs_err_after_bpm"] = np.abs(baseline - ref_after)
     metric_arrays["time_bias_after_s"] = np.full(n, bias, dtype=float)
@@ -1472,8 +1523,10 @@ def aggregate_metric_arrays(metric_arrays: MetricArrays, split_name: str = "") -
             "split": split_name,
             "baseline_aae_bpm": float("nan"),
             "adaptive_aae_bpm": float("nan"),
+            "final_aae_bpm": float("nan"),
             "baseline_acc_pct": float("nan"),
             "adaptive_acc_pct": float("nan"),
+            "final_acc_pct": float("nan"),
             "time_bias_after_s": float("nan"),
             "time_bias_after_mode": "",
             "time_bias_after_range_s": "",
@@ -1482,6 +1535,8 @@ def aggregate_metric_arrays(metric_arrays: MetricArrays, split_name: str = "") -
             "posthoc_adaptive_aae_bpm": float("nan"),
             "posthoc_adaptive_acc_pct": float("nan"),
             "posthoc_adaptive_hit_rate_5bpm": float("nan"),
+            "posthoc_final_aae_bpm": float("nan"),
+            "posthoc_final_acc_pct": float("nan"),
             "posthoc_baseline_aae_bpm": float("nan"),
             "posthoc_baseline_acc_pct": float("nan"),
             "posthoc_n_valid_windows": 0,
@@ -1490,24 +1545,31 @@ def aggregate_metric_arrays(metric_arrays: MetricArrays, split_name: str = "") -
     mask = np.asarray(metric_arrays.get("filtered_mask", np.ones(ref.size, dtype=bool)), dtype=bool)
     baseline_err = metric_arrays.get("baseline_abs_err_bpm")
     adaptive_err = metric_arrays.get("adaptive_abs_err_bpm")
+    final_err = metric_arrays.get("final_abs_err_bpm")
     if baseline_err is None:
         baseline_err = np.abs(np.asarray(metric_arrays["baseline_hr_bpm"], dtype=float) - ref)
     if adaptive_err is None:
         adaptive_err = np.abs(np.asarray(metric_arrays["adaptive_hr_bpm"], dtype=float) - ref)
+    if final_err is None:
+        final_err = np.abs(np.asarray(metric_arrays.get("final_hr_bpm", metric_arrays["adaptive_hr_bpm"]), dtype=float) - ref)
     baseline_err = np.asarray(baseline_err, dtype=float)
     adaptive_err = np.asarray(adaptive_err, dtype=float)
-    mask = mask[: min(mask.size, baseline_err.size, adaptive_err.size)]
+    final_err = np.asarray(final_err, dtype=float)
+    mask = mask[: min(mask.size, baseline_err.size, adaptive_err.size, final_err.size)]
     baseline_target = baseline_err[: mask.size][mask]
     adaptive_target = adaptive_err[: mask.size][mask]
+    final_target = final_err[: mask.size][mask]
     posthoc = _aggregate_posthoc_metric_arrays(metric_arrays, mask)
     return {
         "split": split_name,
         "baseline_aae_bpm": _mean(baseline_target),
         "adaptive_aae_bpm": _mean(adaptive_target),
+        "final_aae_bpm": _mean(final_target),
         "baseline_acc_pct": _accuracy(baseline_target),
         "adaptive_acc_pct": _accuracy(adaptive_target),
+        "final_acc_pct": _accuracy(final_target),
         **posthoc,
-        "num_windows": int(np.isfinite(adaptive_target).sum()),
+        "num_windows": int(np.isfinite(final_target).sum()),
     }
 
 
@@ -1521,7 +1583,8 @@ def _aggregate_posthoc_metric_arrays(metric_arrays: MetricArrays, mask: np.ndarr
 
     adaptive_after = metric_arrays.get("adaptive_abs_err_after_bpm")
     baseline_after = metric_arrays.get("baseline_abs_err_after_bpm")
-    if adaptive_after is None or baseline_after is None:
+    final_after = metric_arrays.get("final_abs_err_after_bpm")
+    if adaptive_after is None or baseline_after is None or final_after is None:
         return {
             "time_bias_after_s": float("nan"),
             "time_bias_after_mode": "",
@@ -1531,15 +1594,19 @@ def _aggregate_posthoc_metric_arrays(metric_arrays: MetricArrays, mask: np.ndarr
             "posthoc_adaptive_aae_bpm": float("nan"),
             "posthoc_adaptive_acc_pct": float("nan"),
             "posthoc_adaptive_hit_rate_5bpm": float("nan"),
+            "posthoc_final_aae_bpm": float("nan"),
+            "posthoc_final_acc_pct": float("nan"),
             "posthoc_baseline_aae_bpm": float("nan"),
             "posthoc_baseline_acc_pct": float("nan"),
             "posthoc_n_valid_windows": 0,
         }
     adaptive_arr = np.asarray(adaptive_after, dtype=float)
     baseline_arr = np.asarray(baseline_after, dtype=float)
-    n = min(mask.size, adaptive_arr.size, baseline_arr.size)
+    final_arr = np.asarray(final_after, dtype=float)
+    n = min(mask.size, adaptive_arr.size, baseline_arr.size, final_arr.size)
     target_adaptive = adaptive_arr[:n][mask[:n]]
     target_baseline = baseline_arr[:n][mask[:n]]
+    target_final = final_arr[:n][mask[:n]]
     time_bias = np.asarray(metric_arrays.get("time_bias_after_s", []), dtype=float)
     finite_bias = np.unique(np.round(time_bias[np.isfinite(time_bias)], 10)) if time_bias.size else np.asarray([])
     bias_value = float(finite_bias[0]) if finite_bias.size == 1 else float("nan")
@@ -1572,6 +1639,8 @@ def _aggregate_posthoc_metric_arrays(metric_arrays: MetricArrays, mask: np.ndarr
         "posthoc_adaptive_aae_bpm": _mean(target_adaptive),
         "posthoc_adaptive_acc_pct": hit_rate,
         "posthoc_adaptive_hit_rate_5bpm": hit_rate,
+        "posthoc_final_aae_bpm": _mean(target_final),
+        "posthoc_final_acc_pct": _accuracy(target_final),
         "posthoc_baseline_aae_bpm": _mean(target_baseline),
         "posthoc_baseline_acc_pct": _accuracy(target_baseline),
         "posthoc_n_valid_windows": int(np.isfinite(target_adaptive).sum()),
@@ -1614,8 +1683,10 @@ def _failed(
         objective_aae_bpm=float("inf"),
         baseline_aae_bpm=float("nan"),
         adaptive_aae_bpm=float("nan"),
+        final_aae_bpm=float("nan"),
         baseline_acc_pct=float("nan"),
         adaptive_acc_pct=float("nan"),
+        final_acc_pct=float("nan"),
         frame=pd.DataFrame(),
         segment_info=segment_info,
         alignment_info=alignment_info,
