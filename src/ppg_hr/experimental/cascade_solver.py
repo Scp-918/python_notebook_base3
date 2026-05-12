@@ -113,13 +113,19 @@ class _NormalisedWindowCache:
     """Compact normalized-window cache for one sample/Fs_Target/TW base."""
 
     norm_by_channel: dict[str, np.ndarray]
+    adaptive_norm_by_channel: dict[str, np.ndarray]
     window_idx: np.ndarray
     start_idx: np.ndarray
+    adaptive_start_idx: np.ndarray
+    adaptive_source_start_idx: np.ndarray
+    fft_offset_idx: np.ndarray
     start_s: np.ndarray
     center_s: np.ndarray
     segment_label: np.ndarray
     ref_hr_bpm: np.ndarray
     win_len: int
+    adaptive_win_len: int
+    tw_f_context_status: np.ndarray
 
 
 @dataclass
@@ -748,12 +754,21 @@ def _run_windows(
     prev_adaptive: float | None = None
     for row_idx, window_idx in enumerate(norm_cache.window_idx):
         start_idx = int(norm_cache.start_idx[row_idx])
+        adaptive_start_idx = int(norm_cache.adaptive_start_idx[row_idx])
+        adaptive_source_start_idx = int(norm_cache.adaptive_source_start_idx[row_idx])
+        fft_offset_idx = int(norm_cache.fft_offset_idx[row_idx])
         center_s = float(norm_cache.center_s[row_idx])
+        fft_start_s = float(norm_cache.start_s[row_idx])
+        fft_end_s = fft_start_s + float(params.TW)
+        adaptive_start_s = fft_start_s - float(getattr(params, "TW_F", 0.0))
+        adaptive_source_start_s = float(adaptive_source_start_idx) / float(fs)
         label = str(norm_cache.segment_label[row_idx])
         ref_hr = float(norm_cache.ref_hr_bpm[row_idx])
         norm = {name: values[row_idx] for name, values in norm_cache.norm_by_channel.items()}
+        adaptive_norm = {name: values[row_idx] for name, values in norm_cache.adaptive_norm_by_channel.items()}
         qc_stats = _window_qc_stats(ds, start_idx, int(norm_cache.win_len))
         qc_status, qc_reason, qc_should_skip = _qc_status_for_policy(qc_stats, params)
+        penalty_ref_channel = ""
 
         spec_key = ("baseline_ppg", int(window_idx))
         baseline_spectrum = base.spectral_cache.get(spec_key)
@@ -773,8 +788,8 @@ def _run_windows(
             adaptive_hr = float("nan") if qc_status in {"dropped", "interpolate_pending"} else baseline_hr
             adaptive_stages = []
         elif _window_in_scope(str(label), scope, float(center_s), aligned.segment_info):
-            filtered, penalty_ref, adaptive_stages = _cascade_filter_window(
-                norm,
+            filtered_context, penalty_ref_context, adaptive_stages, penalty_ref_channel = _cascade_filter_window(
+                adaptive_norm,
                 scheme,
                 params,
                 fmove,
@@ -782,7 +797,13 @@ def _run_windows(
                 delay_cache=base.delay_estimate_cache,
                 window_idx=int(window_idx),
                 collect_stages=collect_stages,
+                adaptive_input_samples=int(norm_cache.adaptive_win_len),
+                fft_offset_samples=fft_offset_idx,
+                fft_input_samples=int(norm_cache.win_len),
             )
+            fft_stop_idx = fft_offset_idx + int(norm_cache.win_len)
+            filtered = np.asarray(filtered_context, dtype=float)[fft_offset_idx:fft_stop_idx]
+            penalty_ref = np.asarray(penalty_ref_context, dtype=float)[fft_offset_idx:fft_stop_idx]
             adaptive_hr = extract_hr_with_penalty(filtered, penalty_ref, prev_adaptive, params, fs)
         else:
             adaptive_hr = baseline_hr
@@ -812,10 +833,21 @@ def _run_windows(
                     "adaptive_filter": str(getattr(params, "adaptive_filter", "lms")),
                     "window_idx": int(window_idx),
                     "time_s": float(center_s),
+                    "center_s": float(center_s),
+                    "fft_start_s": float(fft_start_s),
+                    "fft_end_s": float(fft_end_s),
+                    "adaptive_start_s": float(adaptive_start_s),
+                    "adaptive_source_start_s": float(adaptive_source_start_s),
+                    "TW_F": float(getattr(params, "TW_F", 0.0)),
+                    "fft_input_samples": int(norm_cache.win_len),
+                    "adaptive_input_samples": int(norm_cache.adaptive_win_len),
+                    "fft_offset_samples": int(fft_offset_idx),
+                    "tw_f_context_status": str(norm_cache.tw_f_context_status[row_idx]),
                     "segment_label": str(label),
                     "ref_hr_bpm": float(ref_hr),
                     "baseline_ppg_hr_bpm": float(baseline_hr),
                     "adaptive_hr_bpm": float(adaptive_hr),
+                    "penalty_ref_channel": penalty_ref_channel,
                     "adaptive_stages_json": stages_json,
                     "lms_stages_json": stages_json,
                     "qc_status": qc_status,
@@ -844,6 +876,15 @@ def _run_windows(
         "ref_hr_bpm": np.asarray(ref_out, dtype=float),
         "baseline_hr_bpm": np.asarray(baseline_out, dtype=float),
         "adaptive_hr_bpm": np.asarray(adaptive_out, dtype=float),
+        "center_s": np.asarray(time_out, dtype=float),
+        "fft_start_s": norm_cache.start_s.astype(float),
+        "fft_end_s": norm_cache.start_s.astype(float) + float(params.TW),
+        "adaptive_start_s": norm_cache.start_s.astype(float) - float(getattr(params, "TW_F", 0.0)),
+        "adaptive_source_start_s": norm_cache.adaptive_source_start_idx.astype(float) / float(fs),
+        "fft_input_samples": np.full(len(time_out), int(norm_cache.win_len), dtype=int),
+        "adaptive_input_samples": np.full(len(time_out), int(norm_cache.adaptive_win_len), dtype=int),
+        "fft_offset_samples": norm_cache.fft_offset_idx.astype(int),
+        "tw_f_context_status": norm_cache.tw_f_context_status.astype(object),
         "qc_status": np.asarray(
             ["interpolated" if s == "interpolate_pending" else s for s in qc_status_out],
             dtype=object,
@@ -997,13 +1038,19 @@ def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) 
     if base.aligned is None:
         empty = _NormalisedWindowCache(
             norm_by_channel={name: np.empty((0, 0), dtype=np.float32) for name in PROTOCOL_CHANNELS},
+            adaptive_norm_by_channel={name: np.empty((0, 0), dtype=np.float32) for name in PROTOCOL_CHANNELS},
             window_idx=np.empty(0, dtype=int),
             start_idx=np.empty(0, dtype=int),
+            adaptive_start_idx=np.empty(0, dtype=int),
+            adaptive_source_start_idx=np.empty(0, dtype=int),
+            fft_offset_idx=np.empty(0, dtype=int),
             start_s=np.empty(0, dtype=float),
             center_s=np.empty(0, dtype=float),
             segment_label=np.empty(0, dtype=object),
             ref_hr_bpm=np.empty(0, dtype=float),
             win_len=0,
+            adaptive_win_len=0,
+            tw_f_context_status=np.empty(0, dtype=object),
         )
         base.norm_window_cache[key] = empty
         return empty
@@ -1012,6 +1059,8 @@ def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) 
     ds = aligned.dataset
     fs = int(ds.fs)
     win_len = int(round(float(params.TW) * fs))
+    tw_f_len = max(0, int(round(float(getattr(params, "TW_F", 0.0)) * fs)))
+    adaptive_win_len = win_len + tw_f_len
     starts = np.rint(aligned.window_starts_s.astype(float) * fs).astype(int)
     valid = starts + win_len <= len(ds.time_s)
     valid_idx = np.flatnonzero(valid)
@@ -1022,22 +1071,50 @@ def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) 
         name: np.zeros((n_windows, win_len), dtype=np.float32)
         for name in PROTOCOL_CHANNELS
     }
+    adaptive_norm_by_channel = {
+        name: np.zeros((n_windows, adaptive_win_len), dtype=np.float32)
+        for name in PROTOCOL_CHANNELS
+    }
+    adaptive_starts = starts - tw_f_len
+    adaptive_source_starts = np.maximum(0, adaptive_starts)
+    fft_offsets = starts - adaptive_starts
+    context_status = np.where(adaptive_starts < 0, "padded_left", "full").astype(object)
 
     for out_idx, start in enumerate(starts):
         end = int(start) + win_len
+        adaptive_start = int(adaptive_starts[out_idx])
+        source_start = int(adaptive_source_starts[out_idx])
+        left_pad = max(0, -adaptive_start)
         for name in PROTOCOL_CHANNELS:
             arr = np.asarray(channels[name][start:end], dtype=float)
             norm_by_channel[name][out_idx] = _normalise_array(arr, mode=mode).astype(np.float32, copy=False)
+            context = np.asarray(channels[name][source_start:end], dtype=float)
+            if left_pad:
+                pad_value = float(context[0]) if context.size else 0.0
+                context = np.concatenate([np.full(left_pad, pad_value, dtype=float), context])
+            if context.size < adaptive_win_len:
+                pad_value = float(context[-1]) if context.size else 0.0
+                context = np.concatenate([context, np.full(adaptive_win_len - context.size, pad_value, dtype=float)])
+            adaptive_norm_by_channel[name][out_idx] = _normalise_array(
+                context[:adaptive_win_len],
+                mode=mode,
+            ).astype(np.float32, copy=False)
 
     cache = _NormalisedWindowCache(
         norm_by_channel=norm_by_channel,
+        adaptive_norm_by_channel=adaptive_norm_by_channel,
         window_idx=valid_idx.astype(int),
         start_idx=starts.astype(int),
+        adaptive_start_idx=adaptive_starts.astype(int),
+        adaptive_source_start_idx=adaptive_source_starts.astype(int),
+        fft_offset_idx=fft_offsets.astype(int),
         start_s=aligned.window_starts_s[valid].astype(float),
         center_s=aligned.window_centers_s[valid].astype(float),
         segment_label=aligned.segment_labels[valid].astype(object),
         ref_hr_bpm=aligned.ref_hr_bpm[valid].astype(float),
         win_len=win_len,
+        adaptive_win_len=adaptive_win_len,
+        tw_f_context_status=context_status,
     )
     base.norm_window_cache[key] = cache
     return cache
@@ -1053,7 +1130,10 @@ def _cascade_filter_window(
     delay_cache: dict[tuple[Any, ...], DelayEstimate] | None = None,
     window_idx: int | None = None,
     collect_stages: bool = True,
-) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
+    adaptive_input_samples: int | None = None,
+    fft_offset_samples: int = 0,
+    fft_input_samples: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]], str]:
     """Run the configured adaptive-filter cascade on one normalized window."""
 
     delay_mode = str(getattr(params, "delay_estimation_mode", "envelope"))
@@ -1077,6 +1157,7 @@ def _cascade_filter_window(
             delay_cache[delay_key] = delay_est
     current = np.asarray(window["ppg_green"], dtype=float)
     stages: list[dict[str, Any]] = []
+    reference_ranking = {key: list(value) for key, value in delay_est.order_by_type.items()}
     for sensor_type, max_count in _scheme_plan(scheme):
         for channel in delay_est.order_by_type.get(sensor_type, [])[:max_count]:
             delay = delay_est.by_channel[channel]
@@ -1148,10 +1229,20 @@ def _cascade_filter_window(
                         "filter_type": filter_type,
                         "mode": design.mode,
                         "delay_estimation_mode": delay_mode,
+                        "reference_channel_ranking": reference_ranking,
+                        "adaptive_input_samples": int(
+                            adaptive_input_samples if adaptive_input_samples is not None else len(current)
+                        ),
+                        "fft_offset_samples": int(fft_offset_samples),
+                        "fft_input_samples": int(fft_input_samples if fft_input_samples is not None else len(current)),
                         **stage_extra,
                     }
                 )
-    return current, _penalty_reference(window, delay_est, scheme), stages
+    penalty_ref, penalty_ref_channel = _penalty_reference_with_channel(window, delay_est, scheme)
+    if collect_stages:
+        for stage in stages:
+            stage["penalty_ref_channel"] = penalty_ref_channel
+    return current, penalty_ref, stages, penalty_ref_channel
 
 
 def _scheme_plan(scheme: CascadeScheme) -> list[tuple[str, int]]:
@@ -1175,15 +1266,27 @@ def _penalty_reference(
 ) -> np.ndarray:
     """Choose the reference signal used for spectral motion penalties."""
 
+    ref, _ = _penalty_reference_with_channel(window, delay_est, scheme)
+    return ref
+
+
+def _penalty_reference_with_channel(
+    window: dict[str, np.ndarray],
+    delay_est: DelayEstimate,
+    scheme: CascadeScheme,
+) -> tuple[np.ndarray, str]:
+    """Choose the spectral-penalty reference and return its channel name."""
+
     if scheme in {CascadeScheme.ACC3, CascadeScheme.ACC3_HF2, CascadeScheme.HF2_ACC3}:
-        return window[_best_energy_channel(window, ("accx", "accy", "accz"))]
+        channel = _best_energy_channel(window, ("accx", "accy", "accz"))
+        return window[channel], channel
     if scheme in {CascadeScheme.HF2, CascadeScheme.HF2_CF2, CascadeScheme.CF2_HF2}:
         channel = delay_est.primary_by_type.get("HF") or "hf1"
-        return window[channel]
+        return window[channel], channel
     if scheme == CascadeScheme.CF2:
         channel = delay_est.primary_by_type.get("CF") or "cf1"
-        return window[channel]
-    return window["ppg_green"]
+        return window[channel], channel
+    return window["ppg_green"], "ppg_green"
 
 
 def _best_energy_channel(window: dict[str, np.ndarray], names: tuple[str, ...]) -> str:
