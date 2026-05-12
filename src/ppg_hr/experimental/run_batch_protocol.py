@@ -14,6 +14,7 @@ import json
 import math
 import os
 import shutil
+import subprocess
 from collections import OrderedDict
 from dataclasses import dataclass, field, fields, replace
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -1870,6 +1871,214 @@ def _write_motion_type_outputs(
 
     bayes_df = pd.DataFrame([row for r in results for row in r.history])
     bayes_df.to_csv(motion_dir / "bayes_curve_data.csv", index=False, encoding="utf-8-sig")
+    _write_stage6_record_files(motion_dir, motion_type, results)
+
+
+def _write_stage6_record_files(
+    motion_dir: Path,
+    motion_type: str,
+    results: list[_ModeOptimisation],
+) -> None:
+    """Write compact deployment-oriented result records.
+
+    中文说明：这些文件是新 replay、诊断图和跨运动汇总的稳定读取入口；旧的
+    best_params_lms.csv / mode_summary_*.csv 暂时保留，避免破坏已有 Notebook。
+    """
+
+    records = [item for result in results for item in (result.fold_results if result.fold_results else [result])]
+    pd.DataFrame(
+        [_best_params_alignment_record(item) for item in records],
+        columns=_best_params_alignment_columns(),
+    ).to_csv(motion_dir / "best_params_and_alignment.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(
+        [_best_metrics_record(item) for item in records],
+        columns=_best_metrics_columns(),
+    ).to_csv(motion_dir / "best_metrics.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(
+        [_motion_frequency_params_record(item) for item in records],
+        columns=_motion_frequency_params_columns(),
+    ).to_csv(motion_dir / "motion_frequency_and_params.csv", index=False, encoding="utf-8-sig")
+    report = {
+        "motion_type": motion_type,
+        "config": {
+            "result_files": [
+                "best_params_and_alignment.csv",
+                "best_metrics.csv",
+                "motion_frequency_and_params.csv",
+            ],
+        },
+        "search_space": {},
+        "best_trials": [_jsonify(_best_params_alignment_record(item)) for item in records],
+        "split_metrics": [_jsonify(_best_metrics_record(item)) for item in records],
+        "alignment": [
+            {
+                "motion_type": item.motion_type,
+                "target_scope": item.target_scope.value,
+                "best_tdelay_s": item.test_metrics.get("best_tdelay_s", float("nan")),
+                "time_bias_after_s": item.test_metrics.get("time_bias_after_s", float("nan")),
+            }
+            for item in records
+        ],
+        "posthoc_time_bias_after": [
+            {
+                "target_scope": item.target_scope.value,
+                "time_bias_after_s": item.test_metrics.get("time_bias_after_s", float("nan")),
+                "mode": item.test_metrics.get("time_bias_after_mode", ""),
+            }
+            for item in records
+        ],
+        "qc_summary": {
+            "n_qc_fallback": int(sum(int(item.test_metrics.get("n_qc_fallback", 0) or 0) for item in records)),
+        },
+        "fusion_source_distribution": {},
+        "version_info": {"package": "ppg_hr"},
+        "run_command": "",
+        "git_commit_hash": _git_commit_hash(),
+        "failed_samples": [item.reason for item in records if not item.success],
+    }
+    (motion_dir / "full_report.json").write_text(
+        json.dumps(_jsonify(report), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _best_params_alignment_record(result: _ModeOptimisation) -> dict[str, Any]:
+    params = result.best_params
+    metrics = result.test_metrics
+    return {
+        "motion_type": result.motion_type,
+        "split": _result_split_name(result),
+        "mode": result.data_split_mode,
+        "target_scope": result.target_scope.value,
+        "objective_mode": result.objective_mode,
+        "cascade_scheme": result.cascade_scheme.value,
+        "adaptive_filter": result.adaptive_filter,
+        "adaptive_data_type": result.cascade_scheme.value,
+        "TW": float(params.TW),
+        "TW_F": float(getattr(params, "TW_F", 0.0)),
+        "Fs_Target": int(params.Fs_Target),
+        "normalization_mode": str(getattr(params, "normalization_mode", "minmax")),
+        "best_params_json": json.dumps(_jsonify(params.to_dict()), ensure_ascii=False, sort_keys=True),
+        "best_tdelay_s": metrics.get("best_tdelay_s", float("nan")),
+        "time_bias_after_s": metrics.get("time_bias_after_s", float("nan")),
+        "alignment_score_mode": getattr(params, "Rest_Alignment_Score_Mode", "aae"),
+        "pre_align_metric_json": "{}",
+        "no_posthoc_final_aae_bpm": metrics.get("final_aae_bpm"),
+        "no_posthoc_final_acc_pct": metrics.get("final_acc_pct"),
+        "posthoc_final_aae_bpm": metrics.get("posthoc_final_aae_bpm"),
+        "posthoc_final_acc_pct": metrics.get("posthoc_final_acc_pct"),
+        "baseline_aae_bpm": metrics.get("baseline_aae_bpm"),
+        "baseline_acc_pct": metrics.get("baseline_acc_pct"),
+        "adaptive_aae_bpm": metrics.get("adaptive_aae_bpm"),
+        "adaptive_acc_pct": metrics.get("adaptive_acc_pct"),
+    }
+
+
+def _best_metrics_record(result: _ModeOptimisation) -> dict[str, Any]:
+    params = result.best_params
+    metrics = result.test_metrics
+    return {
+        "motion_type": result.motion_type,
+        "split": _result_split_name(result),
+        "mode": result.data_split_mode,
+        "target_scope": result.target_scope.value,
+        "filter_type": result.adaptive_filter,
+        "adaptive_data_type": result.cascade_scheme.value,
+        "TW": float(params.TW),
+        "TW_F": float(getattr(params, "TW_F", 0.0)),
+        "baseline_aae_bpm": metrics.get("baseline_aae_bpm"),
+        "adaptive_aae_bpm": metrics.get("adaptive_aae_bpm"),
+        "final_aae_bpm": metrics.get("final_aae_bpm"),
+        "baseline_acc_pct": metrics.get("baseline_acc_pct"),
+        "adaptive_acc_pct": metrics.get("adaptive_acc_pct"),
+        "final_acc_pct": metrics.get("final_acc_pct"),
+        "posthoc_baseline_aae_bpm": metrics.get("posthoc_baseline_aae_bpm"),
+        "posthoc_adaptive_aae_bpm": metrics.get("posthoc_adaptive_aae_bpm"),
+        "posthoc_final_aae_bpm": metrics.get("posthoc_final_aae_bpm"),
+        "posthoc_baseline_acc_pct": metrics.get("posthoc_baseline_acc_pct"),
+        "posthoc_adaptive_acc_pct": metrics.get("posthoc_adaptive_acc_pct"),
+        "posthoc_final_acc_pct": metrics.get("posthoc_final_acc_pct"),
+        "n_windows": int(metrics.get("num_windows", 0) or 0),
+        "n_valid_windows": int(metrics.get("num_windows", 0) or 0),
+        "n_qc_fallback": int(metrics.get("n_qc_fallback", 0) or 0),
+        "n_recovery_fallback": int(metrics.get("n_recovery_fallback", 0) or 0),
+    }
+
+
+def _motion_frequency_params_record(result: _ModeOptimisation) -> dict[str, Any]:
+    params = result.best_params
+    return {
+        "motion_type": result.motion_type,
+        "split": _result_split_name(result),
+        "mode": result.data_split_mode,
+        "motion_frequency_hz": result.test_metrics.get("motion_frequency_hz", float("nan")),
+        "penalty_ref_channel": result.test_metrics.get("penalty_ref_channel", ""),
+        "cascade_scheme": result.cascade_scheme.value,
+        "adaptive_filter": result.adaptive_filter,
+        "adaptive_data_type": result.cascade_scheme.value,
+        "TW": float(params.TW),
+        "TW_F": float(getattr(params, "TW_F", 0.0)),
+        "max_order": int(params.max_order),
+        "M_base": int(params.M_base),
+        "C_scale": float(params.C_scale),
+        "K_max": int(params.K_max),
+        "Spec_Penalty_Width": float(params.Spec_Penalty_Width),
+        "Spec_Penalty_Weight": float(params.Spec_Penalty_Weight),
+        "reference_channel_ranking_summary": result.test_metrics.get("reference_channel_ranking_summary", ""),
+    }
+
+
+def _best_params_alignment_columns() -> list[str]:
+    return [
+        "motion_type", "split", "mode", "target_scope", "objective_mode",
+        "cascade_scheme", "adaptive_filter", "adaptive_data_type", "TW", "TW_F",
+        "Fs_Target", "normalization_mode", "best_params_json", "best_tdelay_s",
+        "time_bias_after_s", "alignment_score_mode", "pre_align_metric_json",
+        "no_posthoc_final_aae_bpm", "no_posthoc_final_acc_pct",
+        "posthoc_final_aae_bpm", "posthoc_final_acc_pct",
+        "baseline_aae_bpm", "baseline_acc_pct", "adaptive_aae_bpm", "adaptive_acc_pct",
+    ]
+
+
+def _best_metrics_columns() -> list[str]:
+    return [
+        "motion_type", "split", "mode", "target_scope", "filter_type", "adaptive_data_type",
+        "TW", "TW_F", "baseline_aae_bpm", "adaptive_aae_bpm", "final_aae_bpm",
+        "baseline_acc_pct", "adaptive_acc_pct", "final_acc_pct",
+        "posthoc_baseline_aae_bpm", "posthoc_adaptive_aae_bpm", "posthoc_final_aae_bpm",
+        "posthoc_baseline_acc_pct", "posthoc_adaptive_acc_pct", "posthoc_final_acc_pct",
+        "n_windows", "n_valid_windows", "n_qc_fallback", "n_recovery_fallback",
+    ]
+
+
+def _motion_frequency_params_columns() -> list[str]:
+    return [
+        "motion_type", "split", "mode", "motion_frequency_hz", "penalty_ref_channel",
+        "cascade_scheme", "adaptive_filter", "adaptive_data_type", "TW", "TW_F",
+        "max_order", "M_base", "C_scale", "K_max",
+        "Spec_Penalty_Width", "Spec_Penalty_Weight", "reference_channel_ranking_summary",
+    ]
+
+
+def _result_split_name(result: _ModeOptimisation) -> str:
+    if result.fold_id is not None:
+        return f"fold_{int(result.fold_id)}"
+    return "test"
+
+
+def _git_commit_hash() -> str:
+    try:
+        root = Path(__file__).resolve().parents[3]
+        completed = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return completed.stdout.strip()
+    except Exception:
+        return ""
 
 
 def _summary_row(result: _ModeOptimisation) -> dict[str, Any]:
