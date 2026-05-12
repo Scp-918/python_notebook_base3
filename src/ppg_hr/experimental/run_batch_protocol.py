@@ -2116,6 +2116,9 @@ def _write_final_summary(
         "aggregation",
         "params_semantics",
         "metric_value",
+        "baseline_metric_value",
+        "adaptive_metric_value",
+        "final_metric_value",
         "objective_mode",
         "data_split_mode",
         "n_trials",
@@ -2130,12 +2133,29 @@ def _write_final_summary(
         TargetScope.MOTION_POST10,
         TargetScope.GLOBAL,
     ]:
-        for metric_name, column, filename in (
-            ("aae", "adaptive_aae_bpm", f"{scope.value}_test_aae.csv"),
-            ("accuracy", "adaptive_acc_pct", f"{scope.value}_test_accuracy.csv"),
-            ("posthoc_aae", "posthoc_adaptive_aae_bpm", f"{scope.value}_test_posthoc_aae.csv"),
-            ("posthoc_accuracy", "posthoc_adaptive_acc_pct", f"{scope.value}_test_posthoc_accuracy.csv"),
+        for metric_name, columns, filename in (
+            (
+                "aae",
+                ("baseline_aae_bpm", "adaptive_aae_bpm", "final_aae_bpm"),
+                f"{scope.value}_test_aae.csv",
+            ),
+            (
+                "accuracy",
+                ("baseline_acc_pct", "adaptive_acc_pct", "final_acc_pct"),
+                f"{scope.value}_test_accuracy.csv",
+            ),
+            (
+                "posthoc_aae",
+                ("posthoc_baseline_aae_bpm", "posthoc_adaptive_aae_bpm", "posthoc_final_aae_bpm"),
+                f"{scope.value}_test_posthoc_aae.csv",
+            ),
+            (
+                "posthoc_accuracy",
+                ("posthoc_baseline_acc_pct", "posthoc_adaptive_acc_pct", "posthoc_final_acc_pct"),
+                f"{scope.value}_test_posthoc_accuracy.csv",
+            ),
         ):
+            baseline_col, adaptive_col, final_col = columns
             rows: list[dict[str, Any]] = []
             if scope in active_scopes:
                 for motion_type, results in all_results.items():
@@ -2151,7 +2171,10 @@ def _write_final_summary(
                                 "result_level": result.result_level,
                                 "aggregation": result.aggregation,
                                 "params_semantics": result.params_semantics,
-                                "metric_value": result.test_metrics.get(column),
+                                "metric_value": result.test_metrics.get(final_col),
+                                "baseline_metric_value": result.test_metrics.get(baseline_col),
+                                "adaptive_metric_value": result.test_metrics.get(adaptive_col),
+                                "final_metric_value": result.test_metrics.get(final_col),
                                 "objective_mode": objective_mode,
                                 "data_split_mode": data_split_mode,
                                 "n_trials": result.n_trials,
