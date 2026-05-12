@@ -33,6 +33,10 @@ class ProtocolTrialParams:
 
     Fs_Target: int = 100
     TW: int = 8
+    # 中文说明：TW_F 是自适应滤波前置收敛上下文长度，固定实验参数，不进入
+    # Optuna/Bayes 搜索空间；0 表示沿用旧的单 TW 窗口行为。
+    TW_F: float = 0.0
+    normalization_mode: str = "minmax"
     Kstop: float = 0.3
     max_order: int = 16
     M_base: int = 2

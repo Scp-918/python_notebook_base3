@@ -989,7 +989,8 @@ def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) 
     方案、滤波器类型或 Optuna 超参数，因此可以在同一 TrialBase 下安全复用。
     """
 
-    key = "normalised_protocol_windows_v1"
+    mode = str(getattr(params, "normalization_mode", "minmax")).lower()
+    key = ("normalised_protocol_windows_v2", mode)
     cached = base.norm_window_cache.get(key)
     if isinstance(cached, _NormalisedWindowCache):
         return cached
@@ -1026,7 +1027,7 @@ def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) 
         end = int(start) + win_len
         for name in PROTOCOL_CHANNELS:
             arr = np.asarray(channels[name][start:end], dtype=float)
-            norm_by_channel[name][out_idx] = _normalise_array(arr).astype(np.float32, copy=False)
+            norm_by_channel[name][out_idx] = _normalise_array(arr, mode=mode).astype(np.float32, copy=False)
 
     cache = _NormalisedWindowCache(
         norm_by_channel=norm_by_channel,
@@ -1260,23 +1261,40 @@ def _dominant_frequency(signal: np.ndarray, fs: int, low_hz: float, high_hz: flo
     return dominant_frequency_in_band(signal, fs, low_hz, high_hz)
 
 
-def _normalise_window(window: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Min-max normalize all 13 protocol channels inside one window."""
+def _normalise_window(window: dict[str, np.ndarray], mode: str = "minmax") -> dict[str, np.ndarray]:
+    """Normalize all 13 protocol channels inside one window."""
 
     out: dict[str, np.ndarray] = {}
     for name in PROTOCOL_CHANNELS:
-        out[name] = _normalise_array(window[name])
+        out[name] = _normalise_array(window[name], mode=mode)
     return out
 
 
-def _normalise_array(values: np.ndarray) -> np.ndarray:
-    """Min-max normalize one window and return a finite float array."""
+def _normalise_array(values: np.ndarray, mode: str = "minmax") -> np.ndarray:
+    """Normalize one window and return a finite float array.
+
+    中文说明：默认 ``minmax`` 完全保留旧行为；``zscore`` 和 ``none`` 是固定实验
+    参数，便于对比归一化策略，但不进入 Optuna 搜索空间。
+    """
 
     arr = np.asarray(values, dtype=float).copy()
+    mode = str(mode).lower()
+    if mode not in {"minmax", "zscore", "none"}:
+        raise ValueError("normalization_mode must be one of: minmax, zscore, none")
     arr[~np.isfinite(arr)] = np.nan
     finite = np.isfinite(arr)
     if not finite.any():
         return np.zeros_like(arr, dtype=float)
+    if mode == "none":
+        arr[~finite] = 0.0
+        return arr
+    if mode == "zscore":
+        mu = float(np.nanmean(arr))
+        sd = float(np.nanstd(arr))
+        arr[~finite] = mu
+        if not np.isfinite(sd) or sd <= 1e-12:
+            return arr - mu
+        return (arr - mu) / sd
     mn = float(np.nanmin(arr))
     mx = float(np.nanmax(arr))
     if mx - mn <= 1e-12:
@@ -1286,6 +1304,8 @@ def _normalise_array(values: np.ndarray) -> np.ndarray:
 
 
 def _label_in_scope(label: str, scope: TargetScope) -> bool:
+    if scope == TargetScope.GLOBAL:
+        return label in {"rest", "motion", "recovery"}
     if scope == TargetScope.MOTION_ONLY:
         return label == "motion"
     if scope == TargetScope.MOTION_POST10:
@@ -1311,6 +1331,8 @@ def _window_in_scope(
         if segment_info is None or not np.isfinite(segment_info.motion_end_s):
             return False
         return float(segment_info.motion_end_s) < float(center_s) <= float(segment_info.motion_end_s) + 10.0
+    if scope == TargetScope.GLOBAL:
+        return str(label) in {"rest", "motion", "recovery"}
     return _label_in_scope(label, scope)
 
 

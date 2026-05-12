@@ -138,13 +138,24 @@ def build_output_run_name(
     adaptive_filters: list[str],
     objective_mode: str,
     data_split_mode: str,
+    tw_f_s: float = 0.0,
 ) -> str:
     """Build the run_name required by the Notebook output layout."""
 
     scopes = "-".join(TargetScope(x).value for x in target_scopes)
     schemes = "-".join(CascadeScheme(x).value for x in cascade_schemes)
     filters = "-".join(str(x) for x in adaptive_filters)
-    return f"{scopes}__{schemes}__{filters}__{objective_mode}__{data_split_mode}"
+    return f"{scopes}__{schemes}__{filters}__{objective_mode}__{data_split_mode}__{_tw_f_run_label(tw_f_s)}"
+
+
+def _tw_f_run_label(value: float) -> str:
+    """Return a compact output-folder label for fixed TW_F seconds."""
+
+    value_f = float(value)
+    if value_f.is_integer():
+        return f"TW_F{int(value_f)}s"
+    text = f"{value_f:g}".replace(".", "p").replace("-", "m")
+    return f"TW_F{text}s"
 
 
 def safe_prepare_output_dir(
@@ -240,12 +251,20 @@ def run_batch_adaptive_protocol(
     if unsupported:
         raise ValueError(f"Unsupported adaptive_filters: {unsupported}")
 
+    trial_overrides = _normalise_trial_param_overrides(trial_param_overrides)
     input_path = Path(input_dir).resolve()
     if output_root is None:
         if csv_out_dir is not None:
             root_out = Path(csv_out_dir).resolve().parent
         else:
-            run_name = build_output_run_name(scopes, schemes, filters, objective_mode, data_split_mode)
+            run_name = build_output_run_name(
+                scopes,
+                schemes,
+                filters,
+                objective_mode,
+                data_split_mode,
+                tw_f_s=float(trial_overrides.get("TW_F", 0.0)),
+            )
             root_out = input_path.parent / "outputs" / run_name
     else:
         root_out = Path(output_root).resolve()
@@ -277,7 +296,6 @@ def run_batch_adaptive_protocol(
     save_stage_json = bool(save_stage_json or debug_mode)
     trial_cache_max_entries = max(1, int(trial_cache_max_entries))
     space = search_space or default_protocol_search_space()
-    trial_overrides = _normalise_trial_param_overrides(trial_param_overrides)
 
     def _log(message: str) -> None:
         if on_log is not None:
@@ -2068,7 +2086,12 @@ def _write_final_summary(
         "reason",
     ]
     paths: dict[str, Path] = {}
-    for scope in [TargetScope.MOTION_ONLY, TargetScope.MOTION_AND_RECOVERY, TargetScope.MOTION_POST10]:
+    for scope in [
+        TargetScope.MOTION_ONLY,
+        TargetScope.MOTION_AND_RECOVERY,
+        TargetScope.MOTION_POST10,
+        TargetScope.GLOBAL,
+    ]:
         for metric_name, column, filename in (
             ("aae", "adaptive_aae_bpm", f"{scope.value}_test_aae.csv"),
             ("accuracy", "adaptive_acc_pct", f"{scope.value}_test_accuracy.csv"),

@@ -38,6 +38,16 @@ class TargetScope(str, Enum):
     MOTION_ONLY = "motion_only"
     MOTION_AND_RECOVERY = "motion_recovery"
     MOTION_POST10 = "motion_post10"
+    GLOBAL = "global"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "TargetScope | None":
+        """Accept user-facing aliases for whole-record/global objectives."""
+
+        text = str(value).strip().lower()
+        if text in {"all", "global_all"}:
+            return cls.GLOBAL
+        return None
 
 
 @dataclass
