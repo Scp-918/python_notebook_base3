@@ -114,6 +114,7 @@ class _NormalisedWindowCache:
 
     norm_by_channel: dict[str, np.ndarray]
     window_idx: np.ndarray
+    start_idx: np.ndarray
     start_s: np.ndarray
     center_s: np.ndarray
     segment_label: np.ndarray
@@ -740,13 +741,19 @@ def _run_windows(
     ref_out: list[float] = []
     baseline_out: list[float] = []
     adaptive_out: list[float] = []
+    qc_status_out: list[str] = []
+    qc_reason_out: list[str] = []
+    qc_stat_rows: list[dict[str, Any]] = []
     prev_baseline: float | None = None
     prev_adaptive: float | None = None
     for row_idx, window_idx in enumerate(norm_cache.window_idx):
+        start_idx = int(norm_cache.start_idx[row_idx])
         center_s = float(norm_cache.center_s[row_idx])
         label = str(norm_cache.segment_label[row_idx])
         ref_hr = float(norm_cache.ref_hr_bpm[row_idx])
         norm = {name: values[row_idx] for name, values in norm_cache.norm_by_channel.items()}
+        qc_stats = _window_qc_stats(ds, start_idx, int(norm_cache.win_len))
+        qc_status, qc_reason, qc_should_skip = _qc_status_for_policy(qc_stats, params)
 
         spec_key = ("baseline_ppg", int(window_idx))
         baseline_spectrum = base.spectral_cache.get(spec_key)
@@ -762,7 +769,10 @@ def _run_windows(
         )
         prev_baseline = baseline_hr if np.isfinite(baseline_hr) else prev_baseline
 
-        if _window_in_scope(str(label), scope, float(center_s), aligned.segment_info):
+        if qc_should_skip:
+            adaptive_hr = float("nan") if qc_status in {"dropped", "interpolate_pending"} else baseline_hr
+            adaptive_stages = []
+        elif _window_in_scope(str(label), scope, float(center_s), aligned.segment_info):
             filtered, penalty_ref, adaptive_stages = _cascade_filter_window(
                 norm,
                 scheme,
@@ -787,6 +797,9 @@ def _run_windows(
         ref_out.append(float(ref_hr))
         baseline_out.append(float(baseline_hr))
         adaptive_out.append(float(adaptive_hr))
+        qc_status_out.append(qc_status)
+        qc_reason_out.append(qc_reason)
+        qc_stat_rows.append(qc_stats)
 
         if collect_frame:
             stages_json = json.dumps(adaptive_stages, ensure_ascii=False) if collect_stages else ""
@@ -805,8 +818,24 @@ def _run_windows(
                     "adaptive_hr_bpm": float(adaptive_hr),
                     "adaptive_stages_json": stages_json,
                     "lms_stages_json": stages_json,
+                    "qc_status": qc_status,
+                    "qc_reason": qc_reason,
+                    **qc_stats,
                 }
             )
+
+    adaptive_arr = _apply_qc_interpolation_policy(
+        np.asarray(adaptive_out, dtype=float),
+        np.asarray(baseline_out, dtype=float),
+        np.asarray(time_out, dtype=float),
+        qc_status_out,
+    )
+    adaptive_out = adaptive_arr.astype(float).tolist()
+    if collect_frame and rows:
+        for row, value, status in zip(rows, adaptive_out, qc_status_out, strict=False):
+            row["adaptive_hr_bpm"] = float(value)
+            if status == "interpolate_pending":
+                row["qc_status"] = "interpolated"
 
     metric_arrays: MetricArrays = {
         "window_idx": np.asarray(window_idx_out, dtype=int),
@@ -815,8 +844,142 @@ def _run_windows(
         "ref_hr_bpm": np.asarray(ref_out, dtype=float),
         "baseline_hr_bpm": np.asarray(baseline_out, dtype=float),
         "adaptive_hr_bpm": np.asarray(adaptive_out, dtype=float),
+        "qc_status": np.asarray(
+            ["interpolated" if s == "interpolate_pending" else s for s in qc_status_out],
+            dtype=object,
+        ),
+        "qc_reason": np.asarray(qc_reason_out, dtype=object),
     }
+    for key in _QC_NUMERIC_FIELDS:
+        metric_arrays[key] = np.asarray([float(row.get(key, np.nan)) for row in qc_stat_rows], dtype=float)
     return _WindowRunPayload(pd.DataFrame(rows) if collect_frame else pd.DataFrame(), metric_arrays)
+
+
+_QC_NUMERIC_FIELDS = (
+    "missing_ratio",
+    "max_consecutive_missing",
+    "ValidFlag_ratio",
+    "InterpFlag_ratio",
+    "GapLen_max",
+    "GapLen_mean",
+    "MissingBefore_max",
+    "MissingBefore_mean",
+    "qc_bad_window",
+)
+
+
+def _window_qc_stats(dataset: ProtocolDataset, start_idx: int, win_len: int) -> dict[str, Any]:
+    """Summarise sample-level QC metadata inside one FFT/adaptive window.
+
+    中文说明：统计只依赖传感器 CSV 的 QC/缺失元数据，不读取参考 HR；后续融合策略
+    可以用这些无监督质量信号做保守回退。
+    """
+
+    qc = dataset.qc_frame()
+    start = max(0, int(start_idx))
+    end = min(len(qc), start + max(0, int(win_len)))
+    if end <= start:
+        return {
+            "missing_ratio": float("nan"),
+            "max_consecutive_missing": 0.0,
+            "ValidFlag_ratio": float("nan"),
+            "InterpFlag_ratio": float("nan"),
+            "GapLen_max": float("nan"),
+            "GapLen_mean": float("nan"),
+            "MissingBefore_max": float("nan"),
+            "MissingBefore_mean": float("nan"),
+            "qc_bad_window": 1.0,
+        }
+    window = qc.iloc[start:end]
+    valid_flag = pd.to_numeric(window["ValidFlag"], errors="coerce").to_numpy(dtype=float)
+    interp_flag = pd.to_numeric(window["InterpFlag"], errors="coerce").to_numpy(dtype=float)
+    gap_len = pd.to_numeric(window["GapLen"], errors="coerce").to_numpy(dtype=float)
+    missing_before = pd.to_numeric(window["MissingBefore"], errors="coerce").to_numpy(dtype=float)
+    raw_missing = pd.to_numeric(window["raw_missing_any"], errors="coerce").fillna(0).to_numpy(dtype=float) > 0
+    invalid = np.isfinite(valid_flag) & (valid_flag <= 0)
+    interpolated = np.isfinite(interp_flag) & (interp_flag > 0)
+    missing_mask = raw_missing | invalid | interpolated
+    missing_ratio = float(np.mean(missing_mask)) if missing_mask.size else float("nan")
+    valid_ratio = float(np.nanmean(valid_flag > 0)) if valid_flag.size else float("nan")
+    interp_ratio = float(np.nanmean(interp_flag > 0)) if interp_flag.size else float("nan")
+    max_gap = float(np.nanmax(gap_len)) if gap_len.size else float("nan")
+    bad = (
+        (np.isfinite(missing_ratio) and missing_ratio > 0.20)
+        or (np.isfinite(valid_ratio) and valid_ratio < 0.80)
+        or (np.isfinite(interp_ratio) and interp_ratio > 0.50)
+        or (np.isfinite(max_gap) and max_gap > 0 and np.isfinite(missing_ratio) and missing_ratio > 0.0)
+    )
+    return {
+        "missing_ratio": missing_ratio,
+        "max_consecutive_missing": float(_max_consecutive_true(missing_mask)),
+        "ValidFlag_ratio": valid_ratio,
+        "InterpFlag_ratio": interp_ratio,
+        "GapLen_max": max_gap,
+        "GapLen_mean": float(np.nanmean(gap_len)) if gap_len.size else float("nan"),
+        "MissingBefore_max": float(np.nanmax(missing_before)) if missing_before.size else float("nan"),
+        "MissingBefore_mean": float(np.nanmean(missing_before)) if missing_before.size else float("nan"),
+        "qc_bad_window": float(bad),
+    }
+
+
+def _qc_status_for_policy(qc_stats: dict[str, Any], params: ProtocolTrialParams) -> tuple[str, str, bool]:
+    """Return status/reason and whether adaptive filtering should be skipped."""
+
+    bad = bool(float(qc_stats.get("qc_bad_window", 0.0)) > 0.5)
+    if not bad:
+        return "ok", "", False
+    policy = str(getattr(params, "qc_policy", "fallback_baseline")).lower()
+    if policy not in {"keep", "fallback_baseline", "drop", "interpolate"}:
+        policy = "fallback_baseline"
+    reasons = []
+    if float(qc_stats.get("missing_ratio", 0.0)) > 0.20:
+        reasons.append(f"missing_ratio={float(qc_stats['missing_ratio']):.3f}")
+    if float(qc_stats.get("ValidFlag_ratio", 1.0)) < 0.80:
+        reasons.append(f"ValidFlag_ratio={float(qc_stats['ValidFlag_ratio']):.3f}")
+    if float(qc_stats.get("InterpFlag_ratio", 0.0)) > 0.50:
+        reasons.append(f"InterpFlag_ratio={float(qc_stats['InterpFlag_ratio']):.3f}")
+    if float(qc_stats.get("GapLen_max", 0.0)) > 0:
+        reasons.append(f"GapLen_max={float(qc_stats['GapLen_max']):.1f}")
+    reason = "bad_window: " + ", ".join(reasons or ["quality thresholds exceeded"])
+    if policy == "keep":
+        return "bad_kept", reason + "; policy=keep", False
+    if policy == "drop":
+        return "dropped", reason + "; policy=drop", True
+    if policy == "interpolate":
+        return "interpolate_pending", reason + "; policy=interpolate", True
+    return "fallback_baseline", reason + "; policy=fallback_baseline", True
+
+
+def _apply_qc_interpolation_policy(
+    adaptive: np.ndarray,
+    baseline: np.ndarray,
+    time_s: np.ndarray,
+    qc_status: list[str],
+) -> np.ndarray:
+    """Fill ``interpolate`` QC windows from neighbouring adaptive HR values."""
+
+    out = np.asarray(adaptive, dtype=float).copy()
+    interp_mask = np.asarray([s == "interpolate_pending" for s in qc_status], dtype=bool)
+    if not interp_mask.any():
+        return out
+    x = np.asarray(time_s, dtype=float)
+    good = np.isfinite(out) & ~interp_mask
+    if good.sum() >= 2:
+        out[interp_mask] = np.interp(x[interp_mask], x[good], out[good])
+    else:
+        out[interp_mask] = np.asarray(baseline, dtype=float)[interp_mask]
+    return out
+
+
+def _max_consecutive_true(mask: np.ndarray) -> int:
+    """Return the longest run of true values in a boolean mask."""
+
+    best = 0
+    current = 0
+    for value in np.asarray(mask, dtype=bool):
+        current = current + 1 if bool(value) else 0
+        best = max(best, current)
+    return int(best)
 
 
 def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) -> _NormalisedWindowCache:
@@ -834,6 +997,7 @@ def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) 
         empty = _NormalisedWindowCache(
             norm_by_channel={name: np.empty((0, 0), dtype=np.float32) for name in PROTOCOL_CHANNELS},
             window_idx=np.empty(0, dtype=int),
+            start_idx=np.empty(0, dtype=int),
             start_s=np.empty(0, dtype=float),
             center_s=np.empty(0, dtype=float),
             segment_label=np.empty(0, dtype=object),
@@ -867,6 +1031,7 @@ def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) 
     cache = _NormalisedWindowCache(
         norm_by_channel=norm_by_channel,
         window_idx=valid_idx.astype(int),
+        start_idx=starts.astype(int),
         start_s=aligned.window_starts_s[valid].astype(float),
         center_s=aligned.window_centers_s[valid].astype(float),
         segment_label=aligned.segment_labels[valid].astype(object),

@@ -16,7 +16,7 @@ from .utils import (
     filloutliers_movmedian_linear,
 )
 
-__all__ = ["ProcessedDataset", "load_dataset", "SENSOR_COLUMNS"]
+__all__ = ["ProcessedDataset", "load_dataset", "SENSOR_COLUMNS", "QC_COLUMNS"]
 
 SAMPLE_RATE_HZ: int = 100
 
@@ -36,6 +36,15 @@ SENSOR_COLUMNS: dict[str, str] = {
     "GyroY": "GyroY(dps)",
     "GyroZ": "GyroZ(dps)",
 }
+
+QC_COLUMNS: tuple[str, ...] = (
+    "SampleIndex",
+    "Seq",
+    "ValidFlag",
+    "InterpFlag",
+    "GapLen",
+    "MissingBefore",
+)
 
 
 @dataclass
@@ -57,9 +66,30 @@ class ProcessedDataset:
     ref_data: np.ndarray
 
 
-def _bandpass_coeffs(fs: int = SAMPLE_RATE_HZ) -> tuple[np.ndarray, np.ndarray]:
+def _bandpass_coeffs(
+    fs: int = SAMPLE_RATE_HZ,
+    low_hz: float = 0.5,
+    high_hz: float = 5.0,
+) -> tuple[np.ndarray, np.ndarray]:
     nyquist = fs / 2.0
-    return butter(4, [0.5 / nyquist, 5.0 / nyquist], btype="bandpass")
+    high = min(float(high_hz), 0.45 * float(fs))
+    low = max(float(low_hz), 1e-3)
+    return butter(4, [low / nyquist, high / nyquist], btype="bandpass")
+
+
+def _bandpass_band_for_column(short: str) -> tuple[float, float]:
+    """Return the protocol band for one raw loader channel.
+
+    中文说明：旧 loader 保存的是原始 ``Uc/Ut`` 而不是协议层 ``hf/cf`` 字段。
+    这里把冷膜相关通道归到 0.1-5 Hz，PPG 保持 0.5-5 Hz，ACC/Gyro 保持
+    0.5-10 Hz，避免回退到 V2 的统一带通。
+    """
+
+    if short.startswith("PPG"):
+        return 0.5, 5.0
+    if short.startswith("Acc") or short.startswith("Gyro"):
+        return 0.5, 10.0
+    return 0.1, 5.0
 
 
 def _clean_signal(values: np.ndarray, name: str, fs: int) -> np.ndarray:
@@ -96,6 +126,47 @@ def _parse_reference_csv(gt_csv: Path) -> np.ndarray:
     return np.column_stack([time_s[valid], bpm[valid]])
 
 
+def _time_seconds_from_raw(raw: pd.DataFrame, fs: int) -> np.ndarray:
+    """Return sample time, preferring the named ``Time(s)`` column.
+
+    中文说明：新多通道 CSV 已带硬件时间列；旧 CSV 没有时则保留原来的
+    ``np.arange(n) / fs`` 行为。
+    """
+
+    n = len(raw)
+    if "Time(s)" in raw.columns:
+        time = pd.to_numeric(raw["Time(s)"], errors="coerce").to_numpy(dtype=float)
+        if np.isfinite(time).sum() >= max(1, n // 2):
+            fallback = np.arange(n, dtype=float) / float(fs)
+            mask = np.isfinite(time)
+            if not mask.all():
+                time = time.copy()
+                time[~mask] = fallback[~mask]
+            return time
+    return np.arange(n, dtype=float) / float(fs)
+
+
+def _qc_frame_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
+    """Return standard QC columns with defaults for legacy CSV files."""
+
+    n = len(raw)
+    defaults: dict[str, np.ndarray] = {
+        "SampleIndex": np.arange(n, dtype=int),
+        "Seq": np.full(n, np.nan, dtype=float),
+        "ValidFlag": np.ones(n, dtype=int),
+        "InterpFlag": np.zeros(n, dtype=int),
+        "GapLen": np.zeros(n, dtype=int),
+        "MissingBefore": np.zeros(n, dtype=int),
+    }
+    out = pd.DataFrame(index=np.arange(n))
+    for column in QC_COLUMNS:
+        if column in raw.columns:
+            out[column] = pd.to_numeric(raw[column], errors="coerce").to_numpy()
+        else:
+            out[column] = defaults[column]
+    return out
+
+
 def load_dataset(
     sensor_csv: str | Path,
     gt_csv: str | Path,
@@ -130,7 +201,10 @@ def load_dataset(
         raise ValueError(f"Sensor CSV is empty: {sensor_path}")
 
     df = pd.DataFrame()
-    df["Time_s"] = np.arange(n, dtype=float) / float(fs)
+    df["Time_s"] = _time_seconds_from_raw(raw, int(fs))
+    qc_frame = _qc_frame_from_raw(raw)
+    for column in QC_COLUMNS:
+        df[column] = qc_frame[column].to_numpy()
 
     selected = list(columns) if columns is not None else list(SENSOR_COLUMNS)
     for short in selected:
@@ -141,10 +215,11 @@ def load_dataset(
             raise KeyError(f"Column '{original}' missing in {sensor_path}")
         df[short] = raw[original].astype(float).to_numpy()
 
-    b, a = _bandpass_coeffs(fs)
     for short in selected:
         cleaned = _clean_signal(df[short].to_numpy(dtype=float), short, fs)
         df[short] = cleaned
+        low_hz, high_hz = _bandpass_band_for_column(short)
+        b, a = _bandpass_coeffs(fs, low_hz, high_hz)
         df[f"{short}_Filt"] = filtfilt(b, a, cleaned)
 
     ref_data = _parse_reference_csv(gt_path)

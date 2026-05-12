@@ -48,6 +48,9 @@ class ProtocolTrialParams:
     LMS_Mu_Min: float = 1e-6
     adaptive_filter: str = "lms"
     objective_mode: str = "aae"
+    # 中文说明：窗口级 QC 的默认策略是部署保守的 baseline 回退；该参数是固定实验
+    # 配置，不进入 Optuna/Bayes 搜索空间。
+    qc_policy: str = "fallback_baseline"
     # 中文说明：默认保留旧的 Hilbert 包络时延估计；Notebook/脚本可显式改成 direct。
     delay_estimation_mode: str = "envelope"
     # 中文说明：Alignment_TW 专用于静息段 PPG-HR 提取和全局 Tdelay 搜索；

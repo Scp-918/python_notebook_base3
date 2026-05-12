@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 from scipy.signal import butter, filtfilt, resample_poly
 
-from ..preprocess.data_loader import SENSOR_COLUMNS
+from ..preprocess.data_loader import QC_COLUMNS, SENSOR_COLUMNS
 from ..preprocess.utils import (
     fillmissing_linear,
     fillmissing_nearest,
@@ -25,6 +25,7 @@ from ..preprocess.utils import (
 
 __all__ = [
     "PROTOCOL_CHANNELS",
+    "PROTOCOL_QC_COLUMNS",
     "ProtocolDataset",
     "load_and_preprocess_protocol",
     "load_protocol_raw_clean_frames",
@@ -45,6 +46,12 @@ PROTOCOL_CHANNELS = (
     "gyrox",
     "gyroy",
     "gyroz",
+)
+
+PROTOCOL_QC_COLUMNS = (
+    *QC_COLUMNS,
+    "raw_missing_any",
+    "raw_missing_count",
 )
 
 _RAW_COLUMN_BY_FIELD = {
@@ -86,18 +93,32 @@ class ProtocolDataset:
     gyroz: np.ndarray
     ref_time_s: np.ndarray
     ref_hr_bpm: np.ndarray
+    qc: pd.DataFrame | None = None
 
     def channels(self) -> dict[str, np.ndarray]:
         """Return a copy of the channel mapping used by downstream modules."""
 
         return {name: np.asarray(getattr(self, name), dtype=float) for name in PROTOCOL_CHANNELS}
 
+    def qc_frame(self) -> pd.DataFrame:
+        """Return sample-level QC metadata aligned to ``time_s``.
+
+        中文说明：旧 CSV 或旧测试构造的 ``ProtocolDataset`` 没有 QC 字段时，
+        这里自动生成“全有效、无插值、无缺口”的默认表，保证下游窗口统计稳定。
+        """
+
+        return _normalise_qc_frame(self.qc, len(self.time_s))
+
     def to_frame(self) -> pd.DataFrame:
         """Return the sensor channels as a DataFrame with protocol field names."""
 
         data = {"time_s": self.time_s}
         data.update(self.channels())
-        return pd.DataFrame(data)
+        frame = pd.DataFrame(data)
+        qc = self.qc_frame()
+        for column in PROTOCOL_QC_COLUMNS:
+            frame[column] = qc[column].to_numpy()
+        return frame
 
     def replace_channels(self, channels: dict[str, np.ndarray], fs: int) -> "ProtocolDataset":
         """Return a copy with new channel arrays and a rebuilt time base.
@@ -108,10 +129,14 @@ class ProtocolDataset:
 
         n = min(len(v) for v in channels.values())
         trimmed = {k: np.asarray(v, dtype=float)[:n] for k, v in channels.items()}
+        start_s = float(self.time_s[0]) if len(self.time_s) and np.isfinite(self.time_s[0]) else 0.0
+        new_time_s = start_s + np.arange(n, dtype=float) / float(fs)
+        qc = _resample_qc_frame(self.qc_frame(), self.time_s, new_time_s)
         return replace(
             self,
             fs=int(fs),
-            time_s=np.arange(n, dtype=float) / float(fs),
+            time_s=new_time_s,
+            qc=qc,
             **trimmed,
         )
 
@@ -147,6 +172,7 @@ def load_and_preprocess_protocol(
     gyroz = _safe_bandpass(clean_frame["gyroz"].to_numpy(dtype=float), fs, 0.5, 10.0)
 
     ref_time_s, ref_hr_bpm = _parse_reference_csv_protocol(Path(ref_csv))
+    qc = clean_frame.loc[:, list(PROTOCOL_QC_COLUMNS)].copy()
     return ProtocolDataset(
         sample_stem=sensor_path.stem,
         fs=fs,
@@ -166,6 +192,7 @@ def load_and_preprocess_protocol(
         gyroz=gyroz,
         ref_time_s=ref_time_s,
         ref_hr_bpm=ref_hr_bpm,
+        qc=qc,
     )
 
 
@@ -183,7 +210,7 @@ def load_protocol_raw_clean_frames(
     raw = pd.read_csv(path)
     _validate_sensor_columns(raw)
     fs = int(fs_origin)
-    time_s = np.arange(len(raw), dtype=float) / float(fs)
+    time_s = _time_seconds_from_raw(raw, fs)
     raw_frame = pd.DataFrame({"time_s": time_s})
     for field in PROTOCOL_CHANNELS:
         if field == "cf1":
@@ -226,14 +253,14 @@ def _build_clean_frame(sensor_path: Path, fs: int) -> pd.DataFrame:
         raise ValueError(f"Sensor CSV is empty: {sensor_path}")
     _validate_sensor_columns(raw)
 
-    n = len(raw)
-    time_s = np.arange(n, dtype=float) / float(fs)
+    time_s = _time_seconds_from_raw(raw, fs)
+    qc_frame = _build_qc_frame(raw)
     hf1_raw = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["hf1"]])
     hf2_raw = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["hf2"]])
     uc1_raw = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["uc1"]])
     uc2_raw = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["uc2"]])
 
-    return pd.DataFrame(
+    frame = pd.DataFrame(
         {
             "time_s": time_s,
             "ppg_green": _clean_ppg(raw[_RAW_COLUMN_BY_FIELD["ppg_green"]], fs),
@@ -251,6 +278,100 @@ def _build_clean_frame(sensor_path: Path, fs: int) -> pd.DataFrame:
             "gyroz": _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["gyroz"]]),
         }
     )
+    for column in PROTOCOL_QC_COLUMNS:
+        frame[column] = qc_frame[column].to_numpy()
+    return frame
+
+
+def _time_seconds_from_raw(raw: pd.DataFrame, fs: int) -> np.ndarray:
+    """Return sample time, preferring the named ``Time(s)`` column."""
+
+    n = len(raw)
+    if "Time(s)" in raw.columns:
+        time = pd.to_numeric(raw["Time(s)"], errors="coerce").to_numpy(dtype=float)
+        if np.isfinite(time).sum() >= max(1, n // 2):
+            fallback = np.arange(n, dtype=float) / float(fs)
+            mask = np.isfinite(time)
+            if not mask.all():
+                time = time.copy()
+                time[~mask] = fallback[~mask]
+            return time
+    return np.arange(n, dtype=float) / float(fs)
+
+
+def _build_qc_frame(raw: pd.DataFrame) -> pd.DataFrame:
+    """Build sample-level QC metadata from new or legacy CSV layouts."""
+
+    n = len(raw)
+    qc = _normalise_qc_frame(None, n)
+    for column in QC_COLUMNS:
+        if column in raw.columns:
+            qc[column] = pd.to_numeric(raw[column], errors="coerce").to_numpy()
+    raw_numeric = pd.DataFrame(
+        {
+            field: pd.to_numeric(raw[raw_name], errors="coerce")
+            for field, raw_name in _RAW_COLUMN_BY_FIELD.items()
+            if raw_name in raw.columns
+        }
+    )
+    if raw_numeric.empty:
+        qc["raw_missing_any"] = np.zeros(n, dtype=int)
+        qc["raw_missing_count"] = np.zeros(n, dtype=int)
+    else:
+        missing = raw_numeric.isna()
+        qc["raw_missing_any"] = missing.any(axis=1).astype(int).to_numpy()
+        qc["raw_missing_count"] = missing.sum(axis=1).astype(int).to_numpy()
+    return _normalise_qc_frame(qc, n)
+
+
+def _normalise_qc_frame(qc: pd.DataFrame | None, n: int) -> pd.DataFrame:
+    """Return a complete QC frame with stable columns and length."""
+
+    defaults: dict[str, np.ndarray] = {
+        "SampleIndex": np.arange(n, dtype=int),
+        "Seq": np.full(n, np.nan, dtype=float),
+        "ValidFlag": np.ones(n, dtype=int),
+        "InterpFlag": np.zeros(n, dtype=int),
+        "GapLen": np.zeros(n, dtype=int),
+        "MissingBefore": np.zeros(n, dtype=int),
+        "raw_missing_any": np.zeros(n, dtype=int),
+        "raw_missing_count": np.zeros(n, dtype=int),
+    }
+    out = pd.DataFrame(index=np.arange(n))
+    source = qc if qc is not None else pd.DataFrame()
+    for column in PROTOCOL_QC_COLUMNS:
+        if column in source.columns:
+            values = pd.to_numeric(source[column], errors="coerce").to_numpy()
+            if values.size < n:
+                pad = defaults[column][values.size : n]
+                values = np.concatenate([values, pad])
+            out[column] = values[:n]
+        else:
+            out[column] = defaults[column]
+    return out
+
+
+def _resample_qc_frame(qc: pd.DataFrame, old_time_s: np.ndarray, new_time_s: np.ndarray) -> pd.DataFrame:
+    """Nearest-neighbour resample QC metadata onto a new sample grid."""
+
+    n = len(new_time_s)
+    if n == 0:
+        return _normalise_qc_frame(None, 0)
+    source = _normalise_qc_frame(qc, len(old_time_s))
+    old_time = np.asarray(old_time_s, dtype=float)
+    if old_time.size != len(source) or not np.isfinite(old_time).all():
+        old_time = np.arange(len(source), dtype=float)
+    new_time = np.asarray(new_time_s, dtype=float)
+    idx = np.searchsorted(old_time, new_time, side="left")
+    idx = np.clip(idx, 0, max(0, old_time.size - 1))
+    prev_idx = np.clip(idx - 1, 0, max(0, old_time.size - 1))
+    choose_prev = np.abs(new_time - old_time[prev_idx]) <= np.abs(new_time - old_time[idx])
+    nearest = np.where(choose_prev, prev_idx, idx).astype(int)
+    out = pd.DataFrame(index=np.arange(n))
+    for column in PROTOCOL_QC_COLUMNS:
+        values = source[column].to_numpy()
+        out[column] = values[nearest] if values.size else _normalise_qc_frame(None, n)[column].to_numpy()
+    return _normalise_qc_frame(out, n)
 
 
 def _validate_sensor_columns(raw: pd.DataFrame) -> None:
