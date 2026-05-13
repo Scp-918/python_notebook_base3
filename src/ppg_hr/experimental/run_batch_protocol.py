@@ -58,6 +58,7 @@ from .spectral_utils import compute_power_spectrum
 
 __all__ = [
     "BatchProtocolResult",
+    "build_cross_motion_summary_table",
     "build_output_run_name",
     "plot_window_diagnostics_from_records",
     "replay_best_record_hr_curves",
@@ -2925,6 +2926,196 @@ def _stable_int_hash(payload: Any) -> int:
     text = json.dumps(_jsonify(payload), ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return int(digest[:16], 16) % (2**32)
+
+
+def build_cross_motion_summary_table(
+    *,
+    table_output_dir: str | Path,
+    results_root: str | Path,
+    adaptive_filter: str,
+    adaptive_data_type: str = "",
+    cascade_scheme: str | None = None,
+    target_scope: str = "motion_only",
+    TW_F: float | None = None,
+) -> Path:
+    """Aggregate Stage-6 result records across all motion types.
+
+    中文说明：该函数只读取已训练完成的记录文件，不重新训练、不回放样本。输出表用于
+    横向比较不同运动类型下 baseline/adaptive/final 以及 post-hoc upper-bound 指标。
+    """
+
+    output_dir = Path(table_output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    data_type = adaptive_data_type or str(cascade_scheme or "")
+    rows: list[dict[str, Any]] = []
+    for motion_dir in _scan_stage6_motion_dirs(Path(results_root)):
+        metrics_path = motion_dir / "best_metrics.csv"
+        params_path = motion_dir / "best_params_and_alignment.csv"
+        freq_path = motion_dir / "motion_frequency_and_params.csv"
+        if not (metrics_path.exists() and params_path.exists() and freq_path.exists()):
+            continue
+        metrics_df = pd.read_csv(metrics_path)
+        params_df = pd.read_csv(params_path)
+        freq_df = pd.read_csv(freq_path)
+        selected_metrics = _filter_cross_motion_records(
+            metrics_df,
+            adaptive_filter=adaptive_filter,
+            adaptive_data_type=data_type,
+            cascade_scheme=cascade_scheme,
+            target_scope=target_scope,
+            TW_F=TW_F,
+            filter_column="filter_type",
+        )
+        fusion_distribution = _read_fusion_distribution(motion_dir / "full_report.json")
+        for _, metric_row in selected_metrics.iterrows():
+            motion_type = _row_value(metric_row, "motion_type", motion_dir.name)
+            params_row = _first_matching_summary_row(params_df, metric_row, adaptive_filter, data_type, cascade_scheme, TW_F)
+            freq_row = _first_matching_summary_row(freq_df, metric_row, adaptive_filter, data_type, cascade_scheme, TW_F)
+            rows.append(
+                {
+                    "motion_type": motion_type,
+                    "target_scope": _row_value(metric_row, "target_scope", target_scope),
+                    "split": _row_value(metric_row, "split", _row_value(params_row, "split", "")),
+                    "mode": _row_value(metric_row, "mode", _row_value(params_row, "mode", "")),
+                    "TW": _row_float(metric_row, "TW", _row_float(params_row, "TW")),
+                    "TW_F": _row_float(metric_row, "TW_F", _row_float(params_row, "TW_F")),
+                    "baseline_aae": _row_float(metric_row, "baseline_aae_bpm"),
+                    "adaptive_aae": _row_float(metric_row, "adaptive_aae_bpm"),
+                    "final_aae": _row_float(metric_row, "final_aae_bpm"),
+                    "posthoc_baseline_aae": _row_float(metric_row, "posthoc_baseline_aae_bpm"),
+                    "posthoc_adaptive_aae": _row_float(metric_row, "posthoc_adaptive_aae_bpm"),
+                    "posthoc_final_aae": _row_float(metric_row, "posthoc_final_aae_bpm"),
+                    "baseline_acc": _row_float(metric_row, "baseline_acc_pct"),
+                    "adaptive_acc": _row_float(metric_row, "adaptive_acc_pct"),
+                    "final_acc": _row_float(metric_row, "final_acc_pct"),
+                    "posthoc_baseline_acc": _row_float(metric_row, "posthoc_baseline_acc_pct"),
+                    "posthoc_adaptive_acc": _row_float(metric_row, "posthoc_adaptive_acc_pct"),
+                    "posthoc_final_acc": _row_float(metric_row, "posthoc_final_acc_pct"),
+                    "best_tdelay_s": _row_float(params_row, "best_tdelay_s"),
+                    "time_bias_after_s": _row_float(params_row, "time_bias_after_s"),
+                    "motion_frequency_hz": _row_float(freq_row, "motion_frequency_hz"),
+                    "penalty_ref_channel": _row_value(freq_row, "penalty_ref_channel", ""),
+                    "adaptive_filter": adaptive_filter,
+                    "adaptive_data_type": data_type,
+                    "cascade_scheme": str(cascade_scheme or _row_value(params_row, "cascade_scheme", data_type)),
+                    "final_source_distribution": fusion_distribution,
+                }
+            )
+    summary = pd.DataFrame(rows)
+    if not summary.empty:
+        summary = summary.sort_values(["motion_type", "target_scope", "split", "mode"]).reset_index(drop=True)
+    out_path = output_dir / f"summary_{adaptive_filter}_{data_type}_{_tw_f_run_label(float(TW_F or 0.0))}.csv"
+    summary.to_csv(out_path, index=False, encoding="utf-8-sig")
+    return out_path
+
+
+def _scan_stage6_motion_dirs(results_root: Path) -> list[Path]:
+    """Return motion-type directories that contain compact Stage-6 records."""
+
+    base = results_root / "motion_types" if (results_root / "motion_types").exists() else results_root
+    if not base.exists():
+        return []
+    return sorted(
+        [path for path in base.iterdir() if path.is_dir() and (path / "best_metrics.csv").exists()],
+        key=lambda item: item.name,
+    )
+
+
+def _filter_cross_motion_records(
+    df: pd.DataFrame,
+    *,
+    adaptive_filter: str,
+    adaptive_data_type: str,
+    cascade_scheme: str | None,
+    target_scope: str,
+    TW_F: float | None,
+    filter_column: str,
+) -> pd.DataFrame:
+    """Filter one Stage-6 table by the summary selectors that are present."""
+
+    selected = df.copy()
+    selectors = [
+        ("target_scope", TargetScope(target_scope).value),
+        (filter_column, adaptive_filter),
+        ("adaptive_filter", adaptive_filter),
+        ("adaptive_data_type", adaptive_data_type),
+        ("cascade_scheme", str(cascade_scheme or "")),
+    ]
+    for column, expected in selectors:
+        if not expected or column not in selected.columns:
+            continue
+        narrowed = selected[selected[column].astype(str) == str(expected)]
+        if not narrowed.empty:
+            selected = narrowed
+    if TW_F is not None and "TW_F" in selected.columns:
+        values = pd.to_numeric(selected["TW_F"], errors="coerce")
+        narrowed = selected[np.isclose(values.astype(float), float(TW_F), equal_nan=False)]
+        if not narrowed.empty:
+            selected = narrowed
+    return selected
+
+
+def _first_matching_summary_row(
+    df: pd.DataFrame,
+    metric_row: pd.Series,
+    adaptive_filter: str,
+    adaptive_data_type: str,
+    cascade_scheme: str | None,
+    TW_F: float | None,
+) -> pd.Series:
+    """Pick metadata row matching one metrics row; return an empty row if absent."""
+
+    if df.empty:
+        return pd.Series(dtype=object)
+    selected = df.copy()
+    for column in ("motion_type", "split", "mode", "target_scope"):
+        expected = _row_value(metric_row, column, "")
+        if expected and column in selected.columns:
+            narrowed = selected[selected[column].astype(str) == str(expected)]
+            if not narrowed.empty:
+                selected = narrowed
+    selected = _filter_cross_motion_records(
+        selected,
+        adaptive_filter=adaptive_filter,
+        adaptive_data_type=adaptive_data_type,
+        cascade_scheme=cascade_scheme,
+        target_scope=_row_value(metric_row, "target_scope", "motion_only"),
+        TW_F=TW_F,
+        filter_column="filter_type",
+    )
+    return selected.iloc[0] if not selected.empty else pd.Series(dtype=object)
+
+
+def _read_fusion_distribution(report_path: Path) -> str:
+    """Read final_source distribution from full_report.json as compact JSON text."""
+
+    if not report_path.exists():
+        return "{}"
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "{}"
+    distribution = payload.get("fusion_source_distribution", {})
+    if not isinstance(distribution, dict):
+        distribution = {}
+    return json.dumps(_jsonify(distribution), ensure_ascii=False, sort_keys=True)
+
+
+def _row_value(row: pd.Series, column: str, default: Any = "") -> Any:
+    if row is None or column not in row.index:
+        return default
+    value = row.get(column)
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return default
+    return value
+
+
+def _row_float(row: pd.Series, column: str, default: float = float("nan")) -> float:
+    value = _row_value(row, column, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def plot_window_diagnostics_from_records(
