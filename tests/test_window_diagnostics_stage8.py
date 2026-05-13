@@ -12,6 +12,90 @@ from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams
 from ppg_hr.params import CascadeScheme, TargetScope
 
 
+class _FakeLine:
+    def __init__(self, ydata, label: str = "") -> None:
+        self._ydata = np.asarray(ydata, dtype=float)
+        self._label = label
+
+    def get_ydata(self):
+        return self._ydata
+
+    def get_label(self):
+        return self._label
+
+
+class _FakeAxes:
+    def __init__(self, fig: "_FakeFigure") -> None:
+        self.figure = fig
+        self.lines: list[_FakeLine] = []
+        self._ylabel = ""
+
+    def twinx(self):
+        right = _FakeAxes(self.figure)
+        self.figure.axes.append(right)
+        return right
+
+    def axvspan(self, *args, **kwargs):
+        return None
+
+    def axvline(self, *args, **kwargs):
+        line = _FakeLine([0.0, 1.0], label=str(kwargs.get("label", "")))
+        self.lines.append(line)
+        return line
+
+    def plot(self, *args, **kwargs):
+        ydata = args[1] if len(args) > 1 else args[0]
+        line = _FakeLine(ydata, label=str(kwargs.get("label", "")))
+        self.lines.append(line)
+        return [line]
+
+    def set_title(self, *args, **kwargs):
+        return None
+
+    def set_xlabel(self, *args, **kwargs):
+        return None
+
+    def set_ylabel(self, text, *args, **kwargs):
+        self._ylabel = str(text)
+        return None
+
+    def get_ylabel(self):
+        return self._ylabel
+
+    def grid(self, *args, **kwargs):
+        return None
+
+    def legend(self, *args, **kwargs):
+        return None
+
+    def set_xlim(self, *args, **kwargs):
+        return None
+
+
+class _FakeFigure:
+    def __init__(self) -> None:
+        self.axes: list[_FakeAxes] = [_FakeAxes(self)]
+
+    def tight_layout(self):
+        return None
+
+    def savefig(self, out_path, *args, **kwargs):
+        Path(out_path).write_bytes(b"fake-png")
+
+
+class _FakePyplot:
+    def __init__(self) -> None:
+        self.last_figure: _FakeFigure | None = None
+
+    def subplots(self, *args, **kwargs):
+        self.last_figure = _FakeFigure()
+        return self.last_figure, self.last_figure.axes[0]
+
+    def close(self, fig):
+        return None
+
+
+
 def test_window_diagnostics_from_records_plots_selected_fft_window_and_stages(
     tmp_path: Path,
     monkeypatch,
@@ -130,6 +214,7 @@ def test_window_diagnostics_from_records_plots_selected_fft_window_and_stages(
 
     monkeypatch.setattr(rbp, "load_and_preprocess_protocol", lambda *args, **kwargs: dataset)
     monkeypatch.setattr(rbp, "run_protocol_trial", fake_run_protocol_trial)
+    monkeypatch.setattr(rbp, "_prepare_matplotlib", lambda out_path: _FakePyplot())
 
     paths = rbp.plot_window_diagnostics_from_records(
         signal_csv=tmp_path / "multi_tiaosheng1.csv",
@@ -153,3 +238,70 @@ def test_window_diagnostics_from_records_plots_selected_fft_window_and_stages(
     assert len(paths["stages"]) == 1
     assert paths["stages"][0]["reference_channel_ranking"]["ACC"][0] == "accx"
     assert "tiaosheng_lms_ACC3_TW_F1s_motion_only_start2s" in paths["waveform"].name
+
+
+def test_window_waveform_diagnostic_uses_dual_y_axes(tmp_path: Path, monkeypatch) -> None:
+    fake_plt = _FakePyplot()
+    monkeypatch.setattr(rbp, "_prepare_matplotlib", lambda out_path: fake_plt)
+    out_path = tmp_path / "waveform.png"
+    stages = [
+        {"channel": "accx", "output_signal": [0.3, 0.2, 0.1, 0.0]},
+        {"channel": "accy", "output_signal": [0.1, 0.0, -0.1, -0.2]},
+    ]
+
+    rbp._plot_window_waveform_diagnostic(
+        out_path,
+        time_s=np.arange(4, dtype=float),
+        raw_ppg=np.array([0.0, 1.0, 0.0, -1.0]),
+        filtered=np.array([0.2, 0.1, 0.0, -0.1]),
+        stages=stages,
+        adaptive_start_s=0.0,
+        fft_start_s=1.0,
+        fft_end_s=3.0,
+        title="diagnostic",
+    )
+
+    fig = fake_plt.last_figure
+    assert fig is not None
+    assert out_path.exists()
+    assert len(fig.axes) == 2
+    assert fig.axes[0].get_ylabel() == "Raw/stage amplitude"
+    assert fig.axes[1].get_ylabel() == "Final adaptive amplitude"
+    assert any(line.get_label().startswith("stage 1") for line in fig.axes[0].lines)
+    assert any(line.get_label() == "PPG after final adaptive" for line in fig.axes[1].lines)
+
+
+def test_window_spectrum_diagnostic_plots_normalized_fft_amplitudes(tmp_path: Path, monkeypatch) -> None:
+    fake_plt = _FakePyplot()
+    monkeypatch.setattr(rbp, "_prepare_matplotlib", lambda out_path: fake_plt)
+    spectra = [
+        (np.array([0.0, 1.0, 2.0]), np.array([0.0, 2.0, 4.0])),
+        (np.array([0.0, 1.0, 2.0]), np.array([0.0, 10.0, 5.0])),
+    ]
+
+    def fake_compute_power_spectrum(*args, **kwargs):
+        return spectra.pop(0)
+
+    monkeypatch.setattr(rbp, "compute_power_spectrum", fake_compute_power_spectrum)
+    out_path = tmp_path / "spectrum.png"
+
+    rbp._plot_window_spectrum_diagnostic(
+        out_path,
+        raw_ppg=np.array([0.0, 1.0, 0.0]),
+        filtered=np.array([0.0, 0.5, 0.0]),
+        fs=4,
+        motion_frequency_hz=1.0,
+        penalty_width_hz=0.1,
+        final_hr_bpm=60.0,
+        penalty_ref_channel="accx",
+        title="spectrum",
+    )
+
+    fig = fake_plt.last_figure
+    assert fig is not None
+    ax = fig.axes[0]
+    raw_line, filtered_line = ax.lines[0], ax.lines[1]
+    assert out_path.exists()
+    assert np.nanmax(raw_line.get_ydata()) == 1.0
+    assert np.nanmax(filtered_line.get_ydata()) == 1.0
+    assert ax.get_ylabel() == "Normalized FFT amplitude"

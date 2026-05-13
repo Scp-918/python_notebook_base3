@@ -3322,24 +3322,36 @@ def _plot_window_waveform_diagnostic(
     fft_end_s: float,
     title: str,
 ) -> None:
-    """Plot before/after PPG and optional cascade stage outputs for one window."""
+    """Plot raw/stage waveforms and final adaptive output for one window."""
 
     plt = _prepare_matplotlib(out_path)
-    fig, ax = plt.subplots(figsize=(10, 4.8))
-    ax.axvspan(adaptive_start_s, fft_start_s, color="#b7b7b7", alpha=0.18, lw=0, label="TW_F context")
-    ax.axvspan(fft_start_s, fft_end_s, color="#83c5be", alpha=0.20, lw=0, label="FFT window")
-    ax.plot(time_s, raw_ppg, color="#1f77b4", lw=1.2, label="PPG before adaptive")
-    ax.plot(time_s, filtered, color="#2ca02c", lw=1.4, label="PPG after adaptive")
-    for idx, stage in enumerate(stages[:-1], start=1):
+    fig, ax_left = plt.subplots(figsize=(10, 4.8))
+    ax_right = ax_left.twinx()
+    ax_left.axvspan(adaptive_start_s, fft_start_s, color="#b7b7b7", alpha=0.18, lw=0, label="TW_F context")
+    ax_left.axvspan(fft_start_s, fft_end_s, color="#83c5be", alpha=0.20, lw=0, label="FFT window")
+    ax_left.plot(time_s, raw_ppg, color="#1f77b4", lw=1.2, label="PPG before adaptive")
+    stage_colors = ["#ff7f0e", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+    for idx, stage in enumerate(stages, start=1):
         if "output_signal" not in stage:
             continue
         values = _fit_signal_length(np.asarray(stage["output_signal"], dtype=float), len(time_s))
-        ax.plot(time_s, values, lw=0.9, alpha=0.55, label=f"stage {idx}: {stage.get('channel', '')}")
-    ax.set_title(title)
-    ax.set_xlabel("Aligned time (s)")
-    ax.set_ylabel("Normalized / filtered amplitude")
-    ax.grid(True, alpha=0.25)
-    ax.legend(loc="best", fontsize=8)
+        color = stage_colors[(idx - 1) % len(stage_colors)]
+        ax_left.plot(
+            time_s,
+            values,
+            color=color,
+            lw=0.95,
+            alpha=0.62,
+            label=f"stage {idx}: {stage.get('channel', '')}",
+        )
+    ax_right.plot(time_s, filtered, color="#2ca02c", lw=1.6, label="PPG after final adaptive")
+    ax_left.set_title(title)
+    ax_left.set_xlabel("Aligned time (s)")
+    ax_left.set_ylabel("Raw/stage amplitude")
+    ax_right.set_ylabel("Final adaptive amplitude")
+    ax_left.grid(True, alpha=0.25)
+    ax_left.legend(loc="upper left", fontsize=8)
+    ax_right.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -3362,6 +3374,8 @@ def _plot_window_spectrum_diagnostic(
     plt = _prepare_matplotlib(out_path)
     raw_freq, raw_amp = compute_power_spectrum(raw_ppg, fs, apply_hamming=True, demean=True)
     filt_freq, filt_amp = compute_power_spectrum(filtered, fs, apply_hamming=True, demean=True)
+    raw_amp = _normalise_fft_amplitude(raw_amp)
+    filt_amp = _normalise_fft_amplitude(filt_amp)
     fig, ax = plt.subplots(figsize=(10, 4.8))
     ax.plot(raw_freq, raw_amp, color="#1f77b4", lw=1.2, label="PPG before adaptive")
     ax.plot(filt_freq, filt_amp, color="#2ca02c", lw=1.3, label="PPG after adaptive")
@@ -3381,12 +3395,27 @@ def _plot_window_spectrum_diagnostic(
     ax.set_xlim(left=0.0, right=min(max(float(fs) / 2.0, 0.5), 5.0))
     ax.set_title(title)
     ax.set_xlabel("Frequency (Hz)")
-    ax.set_ylabel("Amplitude")
+    ax.set_ylabel("Normalized FFT amplitude")
     ax.grid(True, alpha=0.25)
     ax.legend(loc="best", fontsize=8)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
+
+
+def _normalise_fft_amplitude(amp: np.ndarray) -> np.ndarray:
+    """Scale one FFT magnitude curve to a maximum finite value of one."""
+
+    arr = np.asarray(amp, dtype=float).copy()
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return arr
+    max_amp = float(np.nanmax(arr[finite]))
+    if max_amp <= 0.0:
+        arr[finite] = 0.0
+        return arr
+    arr[finite] = arr[finite] / max_amp
+    return arr
 
 
 def _compact_float_label(value: float) -> str:
