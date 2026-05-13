@@ -58,6 +58,7 @@ from .segmentation import detect_activity_segments
 __all__ = [
     "BatchProtocolResult",
     "build_output_run_name",
+    "replay_best_record_hr_curves",
     "redraw_best_param_hr_curves",
     "run_batch_adaptive_protocol",
     "safe_prepare_output_dir",
@@ -2922,6 +2923,286 @@ def _stable_int_hash(payload: Any) -> int:
     text = json.dumps(_jsonify(payload), ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return int(digest[:16], 16) % (2**32)
+
+
+def replay_best_record_hr_curves(
+    *,
+    signal_csv: str | Path,
+    ref_csv: str | Path,
+    output_dir: str | Path,
+    motion_type: str,
+    split: str = "",
+    mode: str = "",
+    target_scope: str = "motion_only",
+    adaptive_filter: str = "lms",
+    adaptive_data_type: str = "",
+    cascade_scheme: str | None = None,
+    TW_F: float | None = None,
+    results_root: str | Path,
+    fs_origin: int = 100,
+) -> dict[str, Path]:
+    """Replay one sample from compact Stage-6 result records without retraining.
+
+    中文说明：该入口只读取 ``best_params_and_alignment.csv`` 等记录文件来恢复最优
+    参数，然后对单个样本重新执行 ``run_protocol_trial``；不会启动 Optuna 或改写训练
+    结果。输出 CSV 便于 Notebook 后续重画，PNG 用于快速人工核对 final 融合曲线。
+    """
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    motion_dir = _stage6_motion_record_dir(Path(results_root), motion_type)
+    records = _read_stage6_record_tables(motion_dir)
+    best_row = _select_stage6_best_record(
+        records["best_params"],
+        motion_type=motion_type,
+        split=split,
+        mode=mode,
+        target_scope=TargetScope(target_scope).value,
+        adaptive_filter=adaptive_filter,
+        adaptive_data_type=adaptive_data_type,
+        cascade_scheme=cascade_scheme,
+        TW_F=TW_F,
+    )
+    params = _params_from_stage6_record(best_row, adaptive_filter=adaptive_filter, TW_F=TW_F)
+    scheme_text = _stage6_row_text(best_row, "cascade_scheme")
+    if cascade_scheme:
+        scheme_text = str(cascade_scheme)
+    elif not scheme_text:
+        scheme_text = _stage6_row_text(best_row, "adaptive_data_type") or adaptive_data_type
+    scheme = CascadeScheme(scheme_text)
+    scope = TargetScope(target_scope)
+
+    dataset = load_and_preprocess_protocol(signal_csv, ref_csv, fs_origin=fs_origin)
+    run = run_protocol_trial(dataset, scheme, scope, params, collect_frame=True, collect_stages=False)
+    if not run.success:
+        raise RuntimeError(f"Replay failed: {run.reason}")
+    frame = run.frame.copy()
+    if frame.empty:
+        raise RuntimeError("Replay produced no window frame")
+
+    replay_frame = _build_replay_frame(frame)
+    label_data_type = adaptive_data_type or scheme.value
+    label = f"{motion_type}_{params.adaptive_filter}_{label_data_type}_{_tw_f_run_label(params.TW_F)}_{scope.value}"
+    csv_path = out_dir / f"replay_{label}.csv"
+    plot_path = out_dir / f"replay_{label}.png"
+    replay_frame.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    _plot_replay_hr_curves(
+        plot_path,
+        dataset=dataset,
+        frame=replay_frame,
+        motion_type=motion_type,
+        scope=scope,
+        scheme=scheme,
+        params=params,
+    )
+    return {"plot": plot_path, "csv": csv_path}
+
+
+def _stage6_motion_record_dir(results_root: Path, motion_type: str) -> Path:
+    """Locate the per-motion result directory used by Stage-6 records."""
+
+    root = results_root
+    candidates = [
+        root / "motion_types" / motion_type,
+        root / motion_type,
+        root,
+    ]
+    for item in candidates:
+        if (item / "best_params_and_alignment.csv").exists():
+            return item
+    raise FileNotFoundError(f"Cannot find best_params_and_alignment.csv under {results_root}")
+
+
+def _read_stage6_record_tables(motion_dir: Path) -> dict[str, pd.DataFrame]:
+    """Read compact records and verify the expected Stage-6 files are present."""
+
+    files = {
+        "best_params": motion_dir / "best_params_and_alignment.csv",
+        "best_metrics": motion_dir / "best_metrics.csv",
+        "motion_frequency": motion_dir / "motion_frequency_and_params.csv",
+        "full_report": motion_dir / "full_report.json",
+    }
+    missing = [path.name for path in files.values() if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing Stage-6 replay records: {', '.join(missing)}")
+    # 中文说明：replay 主要依赖 best_params；其余文件在这里一起校验/读取，确保记录目录
+    # 是完整的一次训练输出，后续诊断或表格汇总也能复用相同入口。
+    return {
+        "best_params": pd.read_csv(files["best_params"]),
+        "best_metrics": pd.read_csv(files["best_metrics"]),
+        "motion_frequency": pd.read_csv(files["motion_frequency"]),
+    }
+
+
+def _select_stage6_best_record(
+    best_df: pd.DataFrame,
+    *,
+    motion_type: str,
+    split: str,
+    mode: str,
+    target_scope: str,
+    adaptive_filter: str,
+    adaptive_data_type: str,
+    cascade_scheme: str | None,
+    TW_F: float | None,
+) -> pd.Series:
+    """Pick the best-param row matching replay selectors, falling back gracefully."""
+
+    if best_df.empty:
+        raise ValueError("best_params_and_alignment.csv is empty")
+    candidates = best_df.copy()
+    filters: list[tuple[str, str]] = [
+        ("motion_type", motion_type),
+        ("split", split),
+        ("mode", mode),
+        ("target_scope", target_scope),
+        ("adaptive_filter", adaptive_filter),
+        ("adaptive_data_type", adaptive_data_type),
+    ]
+    if cascade_scheme:
+        filters.append(("cascade_scheme", str(cascade_scheme)))
+    for column, expected in filters:
+        if not expected or column not in candidates.columns:
+            continue
+        narrowed = candidates[candidates[column].astype(str) == str(expected)]
+        if not narrowed.empty:
+            candidates = narrowed
+    if TW_F is not None and "TW_F" in candidates.columns:
+        values = pd.to_numeric(candidates["TW_F"], errors="coerce")
+        narrowed = candidates[np.isclose(values.astype(float), float(TW_F), equal_nan=False)]
+        if not narrowed.empty:
+            candidates = narrowed
+    return candidates.iloc[0]
+
+
+def _params_from_stage6_record(
+    row: pd.Series,
+    *,
+    adaptive_filter: str,
+    TW_F: float | None,
+) -> ProtocolTrialParams:
+    """Restore ProtocolTrialParams from a Stage-6 best_params JSON row."""
+
+    payload = _parse_stage6_params_json(row.get("best_params_json", "{}"))
+    valid_names = {item.name for item in fields(ProtocolTrialParams)}
+    values = {name: payload[name] for name in valid_names if name in payload}
+    for name in ("TW", "TW_F", "Fs_Target", "normalization_mode"):
+        if name in row.index and name not in values:
+            value = row.get(name)
+            if pd.notna(value):
+                values[name] = value
+    params = ProtocolTrialParams(**values)
+    row_filter = _stage6_row_text(row, "adaptive_filter")
+    fixed_filter = adaptive_filter or row_filter or params.adaptive_filter
+    fixed_tw_f = float(TW_F) if TW_F is not None else float(getattr(params, "TW_F", 0.0))
+    return replace(params, adaptive_filter=fixed_filter, TW_F=fixed_tw_f)
+
+
+def _parse_stage6_params_json(raw: Any) -> dict[str, Any]:
+    """Parse JSON/dict-like params saved in CSV without trusting column order."""
+
+    if isinstance(raw, dict):
+        return dict(raw)
+    if raw is None or (isinstance(raw, float) and math.isnan(raw)):
+        return {}
+    text = str(raw).strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = ast.literal_eval(text)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _stage6_row_text(row: pd.Series, column: str) -> str:
+    if column not in row.index:
+        return ""
+    value = row.get(column)
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return ""
+    return str(value)
+
+
+def _build_replay_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize solver window columns into a stable replay CSV schema."""
+
+    baseline = frame["baseline_hr_bpm"] if "baseline_hr_bpm" in frame else frame.get("baseline_ppg_hr_bpm")
+    if baseline is None:
+        baseline = np.full(len(frame), np.nan)
+    reference = frame["ref_hr_bpm"] if "ref_hr_bpm" in frame else frame.get("reference_hr_bpm")
+    if reference is None:
+        reference = np.full(len(frame), np.nan)
+    columns: dict[str, Any] = {
+        "time_s": frame.get("time_s", np.arange(len(frame), dtype=float)),
+        "reference_hr_bpm": reference,
+        "baseline_hr_bpm": baseline,
+        "adaptive_hr_bpm": frame.get("adaptive_hr_bpm", np.full(len(frame), np.nan)),
+        "final_hr_bpm": frame.get("final_hr_bpm", np.full(len(frame), np.nan)),
+        "final_source": frame.get("final_source", np.full(len(frame), "", dtype=object)),
+        "segment_label": frame.get("segment_label", np.full(len(frame), "", dtype=object)),
+    }
+    if "fusion_reason" in frame:
+        columns["fusion_reason"] = frame["fusion_reason"]
+    return pd.DataFrame(columns)
+
+
+def _plot_replay_hr_curves(
+    out_path: Path,
+    *,
+    dataset: ProtocolDataset,
+    frame: pd.DataFrame,
+    motion_type: str,
+    scope: TargetScope,
+    scheme: CascadeScheme,
+    params: ProtocolTrialParams,
+) -> None:
+    """Draw reference/baseline/adaptive/final HR curves for one replay run."""
+
+    plt = _prepare_matplotlib(out_path)
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    if dataset.ref_time_s.size and dataset.ref_hr_bpm.size:
+        ax.plot(dataset.ref_time_s, dataset.ref_hr_bpm, color="#222222", lw=1.3, label="reference HR")
+    time_s = np.asarray(frame["time_s"], dtype=float)
+    ax.plot(time_s, frame["baseline_hr_bpm"], color="#1f77b4", lw=1.1, marker="o", ms=3, label="baseline FFT")
+    ax.plot(time_s, frame["adaptive_hr_bpm"], color="#ff7f0e", lw=1.1, marker="o", ms=3, label="adaptive")
+    ax.plot(time_s, frame["final_hr_bpm"], color="#2ca02c", lw=1.6, marker="o", ms=3, label="final")
+    _shade_replay_segments(ax, frame)
+    ax.set_title(
+        f"{motion_type} | {params.adaptive_filter} | {scheme.value} | {scope.value} | {_tw_f_run_label(params.TW_F)}"
+    )
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("HR (bpm)")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def _shade_replay_segments(ax: Any, frame: pd.DataFrame) -> None:
+    """Add light motion/recovery bands without relying on reference HR."""
+
+    if "segment_label" not in frame or "time_s" not in frame or len(frame) == 0:
+        return
+    labels = frame["segment_label"].astype(str).to_numpy()
+    times = np.asarray(frame["time_s"], dtype=float)
+    if times.size == 1:
+        half_step = 0.5
+    else:
+        diffs = np.diff(np.sort(times))
+        finite = diffs[np.isfinite(diffs) & (diffs > 0)]
+        half_step = float(np.median(finite) / 2.0) if finite.size else 0.5
+    color_map = {"motion": "#f6c85f", "recovery": "#9fd3c7"}
+    start = 0
+    while start < labels.size:
+        label = labels[start]
+        end = start + 1
+        while end < labels.size and labels[end] == label:
+            end += 1
+        if label in color_map:
+            ax.axvspan(times[start] - half_step, times[end - 1] + half_step, color=color_map[label], alpha=0.18, lw=0)
+        start = end
 
 
 def _prepare_matplotlib(out_path: Path) -> Any:
