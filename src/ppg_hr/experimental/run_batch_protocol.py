@@ -44,7 +44,7 @@ from .cascade_solver import (
     clear_trial_heavy_caches,
     run_protocol_trial,
 )
-from .preprocess_protocol import ProtocolDataset, load_and_preprocess_protocol
+from .preprocess_protocol import ProtocolDataset, load_and_preprocess_protocol, resample_protocol_dataset
 from .protocol_outputs import SampleOutputPaths, plot_signal_figures, write_qc_tables
 from .protocol_search_space import (
     ProtocolSearchSpace,
@@ -3162,6 +3162,7 @@ def plot_window_diagnostics_from_records(
     scheme = CascadeScheme(scheme_text)
     scope = TargetScope(target_scope)
     dataset = load_and_preprocess_protocol(signal_csv, ref_csv, fs_origin=fs_origin)
+    dataset = resample_protocol_dataset(dataset, fs_target=int(params.Fs_Target))
     run = run_protocol_trial(dataset, scheme, scope, params, collect_frame=True, collect_stages=True)
     if not run.success:
         raise RuntimeError(f"Window diagnostic replay failed: {run.reason}")
@@ -3171,12 +3172,37 @@ def plot_window_diagnostics_from_records(
 
     row = _select_window_diagnostic_row(frame, aligned_fft_start_s)
     stages = _parse_window_stages(row)
-    motion_freq = _diagnostic_motion_frequency(run, records["motion_frequency"], motion_type)
     raw_time, raw_ppg = _diagnostic_ppg_context(dataset, row, params)
     filtered = _diagnostic_filtered_signal(stages, raw_ppg)
     fft_start = float(row.get("fft_start_s", aligned_fft_start_s))
     fft_end = float(row.get("fft_end_s", fft_start + float(params.TW)))
     adaptive_start = float(row.get("adaptive_start_s", fft_start - float(params.TW_F)))
+    penalty_ref_channel = str(row.get("penalty_ref_channel", "")) or _stage_penalty_ref_channel(stages)
+    penalty_ref_context = _diagnostic_channel_context(dataset, row, params, penalty_ref_channel, len(raw_ppg))
+    raw_fft = _diagnostic_fft_window(
+        raw_ppg,
+        row,
+        fs=int(dataset.fs),
+        fft_start_s=fft_start,
+        fft_end_s=fft_end,
+        adaptive_start_s=adaptive_start,
+    )
+    filtered_fft = _diagnostic_fft_window(
+        filtered,
+        row,
+        fs=int(dataset.fs),
+        fft_start_s=fft_start,
+        fft_end_s=fft_end,
+        adaptive_start_s=adaptive_start,
+    )
+    penalty_ref_fft = _diagnostic_fft_window(
+        penalty_ref_context,
+        row,
+        fs=int(dataset.fs),
+        fft_start_s=fft_start,
+        fft_end_s=fft_end,
+        adaptive_start_s=adaptive_start,
+    )
     label_data_type = adaptive_data_type or scheme.value
     label = (
         f"{motion_type}_{params.adaptive_filter}_{label_data_type}_"
@@ -3195,15 +3221,15 @@ def plot_window_diagnostics_from_records(
         fft_end_s=fft_end,
         title=f"{motion_type} | {params.adaptive_filter} | {scheme.value} | {_tw_f_run_label(params.TW_F)}",
     )
-    _plot_window_spectrum_diagnostic(
+    spectrum_info = _plot_window_spectrum_diagnostic(
         spectrum_path,
-        raw_ppg=raw_ppg,
-        filtered=filtered,
+        raw_ppg=raw_fft,
+        filtered=filtered_fft,
+        penalty_ref=penalty_ref_fft,
         fs=int(dataset.fs),
-        motion_frequency_hz=motion_freq,
         penalty_width_hz=float(getattr(params, "Spec_Penalty_Width", 0.2)),
-        final_hr_bpm=float(row.get("final_hr_bpm", np.nan)),
-        penalty_ref_channel=str(row.get("penalty_ref_channel", "")),
+        penalty_weight=float(getattr(params, "Spec_Penalty_Weight", 0.2)),
+        penalty_ref_channel=penalty_ref_channel,
         title=f"{motion_type} spectrum | start {aligned_fft_start_s:g}s",
     )
     return {
@@ -3211,6 +3237,9 @@ def plot_window_diagnostics_from_records(
         "spectrum": spectrum_path,
         "stages": stages,
         "window": row.to_dict(),
+        "best_params": params.to_dict(),
+        "best_record": best_row.to_dict(),
+        "spectrum_info": spectrum_info,
     }
 
 
@@ -3268,13 +3297,9 @@ def _diagnostic_ppg_context(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extract the raw PPG context used for the selected diagnostic window."""
 
-    fs = int(dataset.fs)
-    fft_start = float(row.get("fft_start_s", 0.0))
-    fft_end = float(row.get("fft_end_s", fft_start + float(params.TW)))
-    adaptive_start = float(row.get("adaptive_start_s", fft_start - float(params.TW_F)))
-    start_idx = max(0, int(round(adaptive_start * fs)))
-    end_idx = min(len(dataset.ppg_green), int(round(fft_end * fs)))
+    start_idx, end_idx, adaptive_start = _diagnostic_context_indices(dataset, row, params)
     if end_idx <= start_idx:
+        fs = int(dataset.fs)
         end_idx = min(len(dataset.ppg_green), start_idx + max(1, int(round(float(params.TW) * fs))))
     time_s = np.asarray(dataset.time_s[start_idx:end_idx], dtype=float)
     signal = np.asarray(dataset.ppg_green[start_idx:end_idx], dtype=float)
@@ -3282,6 +3307,53 @@ def _diagnostic_ppg_context(
         time_s = np.asarray([adaptive_start], dtype=float)
         signal = np.asarray([np.nan], dtype=float)
     return time_s, signal
+
+
+def _diagnostic_context_indices(
+    dataset: ProtocolDataset,
+    row: pd.Series,
+    params: ProtocolTrialParams,
+) -> tuple[int, int, float]:
+    """Return source indices for the displayed TW_F + FFT diagnostic context."""
+
+    fs = int(dataset.fs)
+    fft_start = float(row.get("fft_start_s", 0.0))
+    fft_end = float(row.get("fft_end_s", fft_start + float(params.TW)))
+    adaptive_start = float(row.get("adaptive_start_s", fft_start - float(params.TW_F)))
+    start_idx = max(0, int(round(adaptive_start * fs)))
+    end_idx = min(len(dataset.time_s), int(round(fft_end * fs)))
+    return start_idx, end_idx, adaptive_start
+
+
+def _diagnostic_channel_context(
+    dataset: ProtocolDataset,
+    row: pd.Series,
+    params: ProtocolTrialParams,
+    channel: str,
+    fallback_len: int,
+) -> np.ndarray:
+    """Extract one reference-channel context for FFT-window motion-peak diagnostics."""
+
+    if not channel:
+        return np.full(int(fallback_len), np.nan, dtype=float)
+    channels = dataset.channels()
+    if channel not in channels:
+        return np.full(int(fallback_len), np.nan, dtype=float)
+    start_idx, end_idx, _ = _diagnostic_context_indices(dataset, row, params)
+    values = np.asarray(channels[channel][start_idx:end_idx], dtype=float)
+    if values.size == int(fallback_len):
+        return values
+    return _align_signal_to_context(values, int(fallback_len))
+
+
+def _stage_penalty_ref_channel(stages: list[dict[str, Any]]) -> str:
+    """Return the first recorded penalty reference channel from cascade metadata."""
+
+    for stage in stages:
+        value = stage.get("penalty_ref_channel", "")
+        if value:
+            return str(value)
+    return ""
 
 
 def _diagnostic_filtered_signal(stages: list[dict[str, Any]], raw_ppg: np.ndarray) -> np.ndarray:
@@ -3292,12 +3364,12 @@ def _diagnostic_filtered_signal(stages: list[dict[str, Any]], raw_ppg: np.ndarra
             continue
         values = np.asarray(stage.get("output_signal"), dtype=float)
         if values.size:
-            return _fit_signal_length(values, len(raw_ppg))
+            return _align_signal_to_context(values, len(raw_ppg))
     return np.asarray(raw_ppg, dtype=float)
 
 
-def _fit_signal_length(values: np.ndarray, target_len: int) -> np.ndarray:
-    """Pad or crop a stage vector to the raw context length for plotting."""
+def _align_signal_to_context(values: np.ndarray, target_len: int) -> np.ndarray:
+    """Right-align a stage vector to the diagnostic context without drawing fake prefix lines."""
 
     arr = np.asarray(values, dtype=float)
     if target_len <= 0:
@@ -3306,8 +3378,39 @@ def _fit_signal_length(values: np.ndarray, target_len: int) -> np.ndarray:
         return arr
     if arr.size > target_len:
         return arr[-target_len:]
-    pad_value = float(arr[0]) if arr.size else np.nan
-    return np.concatenate([np.full(target_len - arr.size, pad_value, dtype=float), arr])
+    return np.concatenate([np.full(target_len - arr.size, np.nan, dtype=float), arr])
+
+
+def _diagnostic_fft_window(
+    values: np.ndarray,
+    row: pd.Series,
+    *,
+    fs: int,
+    fft_start_s: float,
+    fft_end_s: float,
+    adaptive_start_s: float,
+) -> np.ndarray:
+    """Crop a diagnostic context down to the exact FFT/HR extraction sub-window."""
+
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return arr
+    offset = _safe_int(row.get("fft_offset_samples", None), default=int(round((fft_start_s - adaptive_start_s) * fs)))
+    length = _safe_int(row.get("fft_input_samples", None), default=int(round((fft_end_s - fft_start_s) * fs)))
+    start = max(0, min(int(offset), arr.size))
+    stop = max(start, min(start + max(1, int(length)), arr.size))
+    return arr[start:stop]
+
+
+def _safe_int(value: Any, *, default: int) -> int:
+    """Convert saved CSV values to int while tolerating missing/NaN cells."""
+
+    try:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return int(default)
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _plot_window_waveform_diagnostic(
@@ -3334,7 +3437,7 @@ def _plot_window_waveform_diagnostic(
     for idx, stage in enumerate(stages, start=1):
         if "output_signal" not in stage:
             continue
-        values = _fit_signal_length(np.asarray(stage["output_signal"], dtype=float), len(time_s))
+        values = _align_signal_to_context(np.asarray(stage["output_signal"], dtype=float), len(time_s))
         color = stage_colors[(idx - 1) % len(stage_colors)]
         ax_left.plot(
             time_s,
@@ -3362,26 +3465,51 @@ def _plot_window_spectrum_diagnostic(
     *,
     raw_ppg: np.ndarray,
     filtered: np.ndarray,
+    penalty_ref: np.ndarray,
     fs: int,
-    motion_frequency_hz: float,
     penalty_width_hz: float,
-    final_hr_bpm: float,
+    penalty_weight: float,
     penalty_ref_channel: str,
     title: str,
-) -> None:
-    """Plot raw/filtered spectra and annotate motion penalty and final HR peak."""
+) -> dict[str, float]:
+    """Plot FFT-window spectra and annotate motion and penalized-spectrum HR peaks."""
 
     plt = _prepare_matplotlib(out_path)
     raw_freq, raw_amp = compute_power_spectrum(raw_ppg, fs, apply_hamming=True, demean=True)
     filt_freq, filt_amp = compute_power_spectrum(filtered, fs, apply_hamming=True, demean=True)
+    ref_freq, ref_amp = compute_power_spectrum(penalty_ref, fs, apply_hamming=True, demean=True)
+    motion_frequency_hz = _dominant_frequency_from_spectrum(ref_freq, ref_amp, 0.2, 5.0)
+    penalized_amp = _apply_spectral_penalty(
+        filt_freq,
+        filt_amp,
+        motion_frequency_hz=motion_frequency_hz,
+        penalty_width_hz=penalty_width_hz,
+        penalty_weight=penalty_weight,
+    )
+    penalized_hr_hz = _dominant_frequency_from_spectrum(filt_freq, penalized_amp, 0.5, 4.0)
     raw_amp = _normalise_fft_amplitude(raw_amp)
     filt_amp = _normalise_fft_amplitude(filt_amp)
+    penalized_plot_amp = _normalise_fft_amplitude(penalized_amp)
     fig, ax = plt.subplots(figsize=(10, 4.8))
-    ax.plot(raw_freq, raw_amp, color="#1f77b4", lw=1.2, label="PPG before adaptive")
-    ax.plot(filt_freq, filt_amp, color="#2ca02c", lw=1.3, label="PPG after adaptive")
+    ax.plot(raw_freq, raw_amp, color="#1f77b4", lw=1.2, label="PPG raw FFT window")
+    ax.plot(filt_freq, filt_amp, color="#2ca02c", lw=1.3, label="PPG after adaptive FFT window")
+    ax.plot(
+        filt_freq,
+        penalized_plot_amp,
+        color="#9467bd",
+        lw=1.2,
+        ls="-.",
+        label="PPG after adaptive + spectral penalty",
+    )
     if np.isfinite(motion_frequency_hz):
         width = max(0.0, float(penalty_width_hz))
-        ax.axvline(motion_frequency_hz, color="#d62728", lw=1.0, ls="--", label=f"motion {motion_frequency_hz:.2f} Hz")
+        ax.axvline(
+            motion_frequency_hz,
+            color="#d62728",
+            lw=1.0,
+            ls="--",
+            label=f"motion artifact peak {motion_frequency_hz:.2f} Hz",
+        )
         ax.axvspan(
             max(0.0, motion_frequency_hz - width),
             motion_frequency_hz + width,
@@ -3390,8 +3518,17 @@ def _plot_window_spectrum_diagnostic(
             lw=0,
             label=f"penalty band {penalty_ref_channel}".strip(),
         )
-    if np.isfinite(final_hr_bpm):
-        ax.axvline(final_hr_bpm / 60.0, color="#111111", lw=1.0, ls=":", label=f"final HR {final_hr_bpm:.1f} bpm")
+    if np.isfinite(penalized_hr_hz):
+        penalized_hr_bpm = float(penalized_hr_hz * 60.0)
+        ax.axvline(
+            penalized_hr_hz,
+            color="#111111",
+            lw=1.0,
+            ls=":",
+            label=f"penalized spectrum HR {penalized_hr_bpm:.1f} bpm",
+        )
+    else:
+        penalized_hr_bpm = float("nan")
     ax.set_xlim(left=0.0, right=min(max(float(fs) / 2.0, 0.5), 5.0))
     ax.set_title(title)
     ax.set_xlabel("Frequency (Hz)")
@@ -3401,6 +3538,10 @@ def _plot_window_spectrum_diagnostic(
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
+    return {
+        "motion_artifact_peak_hz": float(motion_frequency_hz),
+        "penalized_spectrum_hr_bpm": float(penalized_hr_bpm),
+    }
 
 
 def _normalise_fft_amplitude(amp: np.ndarray) -> np.ndarray:
@@ -3416,6 +3557,60 @@ def _normalise_fft_amplitude(amp: np.ndarray) -> np.ndarray:
         return arr
     arr[finite] = arr[finite] / max_amp
     return arr
+
+
+def _apply_spectral_penalty(
+    freq: np.ndarray,
+    amp: np.ndarray,
+    *,
+    motion_frequency_hz: float,
+    penalty_width_hz: float,
+    penalty_weight: float,
+) -> np.ndarray:
+    """Apply the same motion-frequency attenuation used by HR extraction."""
+
+    out = np.asarray(amp, dtype=float).copy()
+    if not np.isfinite(motion_frequency_hz) or motion_frequency_hz <= 0.0:
+        return out
+    freq_arr = np.asarray(freq, dtype=float)
+    width = max(0.0, float(penalty_width_hz))
+    weight = float(penalty_weight)
+    mask = (np.abs(freq_arr - float(motion_frequency_hz)) < width) | (
+        np.abs(freq_arr - 2.0 * float(motion_frequency_hz)) < width
+    )
+    out[mask] *= weight
+    return out
+
+
+def _dominant_frequency_from_spectrum(
+    freq: np.ndarray,
+    amp: np.ndarray,
+    low_hz: float,
+    high_hz: float,
+) -> float:
+    """Return the strongest finite frequency in one band from an already computed spectrum."""
+
+    freq_arr = np.asarray(freq, dtype=float)
+    amp_arr = np.asarray(amp, dtype=float)
+    n = min(freq_arr.size, amp_arr.size)
+    if n == 0:
+        return float("nan")
+    freq_arr = freq_arr[:n]
+    amp_arr = amp_arr[:n]
+    mask = (
+        np.isfinite(freq_arr)
+        & np.isfinite(amp_arr)
+        & (freq_arr >= float(low_hz))
+        & (freq_arr <= float(high_hz))
+    )
+    if not mask.any():
+        return float("nan")
+    valid_idx = np.flatnonzero(mask)
+    max_amp = float(np.nanmax(amp_arr[valid_idx]))
+    if max_amp <= 0.0:
+        return float("nan")
+    idx = valid_idx[int(np.argmax(amp_arr[valid_idx]))]
+    return float(freq_arr[idx])
 
 
 def _compact_float_label(value: float) -> str:
