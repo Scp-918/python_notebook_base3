@@ -54,10 +54,12 @@ from .protocol_search_space import (
 )
 from .qc import QcResult, quality_filter_sample
 from .segmentation import detect_activity_segments
+from .spectral_utils import compute_power_spectrum
 
 __all__ = [
     "BatchProtocolResult",
     "build_output_run_name",
+    "plot_window_diagnostics_from_records",
     "replay_best_record_hr_curves",
     "redraw_best_param_hr_curves",
     "run_batch_adaptive_protocol",
@@ -2923,6 +2925,282 @@ def _stable_int_hash(payload: Any) -> int:
     text = json.dumps(_jsonify(payload), ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return int(digest[:16], 16) % (2**32)
+
+
+def plot_window_diagnostics_from_records(
+    *,
+    signal_csv: str | Path,
+    ref_csv: str | Path,
+    output_dir: str | Path,
+    adaptive_filter: str,
+    adaptive_data_type: str = "",
+    cascade_scheme: str | None = None,
+    results_root: str | Path,
+    aligned_fft_start_s: float,
+    TW_F: float | None = None,
+    motion_type: str,
+    split: str = "",
+    mode: str = "",
+    target_scope: str = "motion_only",
+    fs_origin: int = 100,
+) -> dict[str, Any]:
+    """Draw waveform and spectrum diagnostics for one aligned FFT sub-window.
+
+    中文说明：``aligned_fft_start_s`` 始终表示对齐后的 FFT 子窗起点；诊断图会同时
+    标出 ``TW_F`` 前置收敛上下文和最终 FFT/HR 提取区间。函数只读取 Stage-6 记录
+    恢复参数，不重新训练，也不读取 ref HR 来决定 final 融合。
+    """
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    motion_dir = _stage6_motion_record_dir(Path(results_root), motion_type)
+    records = _read_stage6_record_tables(motion_dir)
+    best_row = _select_stage6_best_record(
+        records["best_params"],
+        motion_type=motion_type,
+        split=split,
+        mode=mode,
+        target_scope=TargetScope(target_scope).value,
+        adaptive_filter=adaptive_filter,
+        adaptive_data_type=adaptive_data_type,
+        cascade_scheme=cascade_scheme,
+        TW_F=TW_F,
+    )
+    params = _params_from_stage6_record(best_row, adaptive_filter=adaptive_filter, TW_F=TW_F)
+    scheme_text = str(cascade_scheme or _stage6_row_text(best_row, "cascade_scheme") or adaptive_data_type)
+    scheme = CascadeScheme(scheme_text)
+    scope = TargetScope(target_scope)
+    dataset = load_and_preprocess_protocol(signal_csv, ref_csv, fs_origin=fs_origin)
+    run = run_protocol_trial(dataset, scheme, scope, params, collect_frame=True, collect_stages=True)
+    if not run.success:
+        raise RuntimeError(f"Window diagnostic replay failed: {run.reason}")
+    frame = run.frame.copy()
+    if frame.empty:
+        raise RuntimeError("Window diagnostic replay produced no frame")
+
+    row = _select_window_diagnostic_row(frame, aligned_fft_start_s)
+    stages = _parse_window_stages(row)
+    motion_freq = _diagnostic_motion_frequency(run, records["motion_frequency"], motion_type)
+    raw_time, raw_ppg = _diagnostic_ppg_context(dataset, row, params)
+    filtered = _diagnostic_filtered_signal(stages, raw_ppg)
+    fft_start = float(row.get("fft_start_s", aligned_fft_start_s))
+    fft_end = float(row.get("fft_end_s", fft_start + float(params.TW)))
+    adaptive_start = float(row.get("adaptive_start_s", fft_start - float(params.TW_F)))
+    label_data_type = adaptive_data_type or scheme.value
+    label = (
+        f"{motion_type}_{params.adaptive_filter}_{label_data_type}_"
+        f"{_tw_f_run_label(params.TW_F)}_{scope.value}_start{_compact_float_label(aligned_fft_start_s)}s"
+    )
+    waveform_path = out_dir / f"window_waveform_{label}.png"
+    spectrum_path = out_dir / f"window_spectrum_{label}.png"
+    _plot_window_waveform_diagnostic(
+        waveform_path,
+        time_s=raw_time,
+        raw_ppg=raw_ppg,
+        filtered=filtered,
+        stages=stages,
+        adaptive_start_s=adaptive_start,
+        fft_start_s=fft_start,
+        fft_end_s=fft_end,
+        title=f"{motion_type} | {params.adaptive_filter} | {scheme.value} | {_tw_f_run_label(params.TW_F)}",
+    )
+    _plot_window_spectrum_diagnostic(
+        spectrum_path,
+        raw_ppg=raw_ppg,
+        filtered=filtered,
+        fs=int(dataset.fs),
+        motion_frequency_hz=motion_freq,
+        penalty_width_hz=float(getattr(params, "Spec_Penalty_Width", 0.2)),
+        final_hr_bpm=float(row.get("final_hr_bpm", np.nan)),
+        penalty_ref_channel=str(row.get("penalty_ref_channel", "")),
+        title=f"{motion_type} spectrum | start {aligned_fft_start_s:g}s",
+    )
+    return {
+        "waveform": waveform_path,
+        "spectrum": spectrum_path,
+        "stages": stages,
+        "window": row.to_dict(),
+    }
+
+
+def _select_window_diagnostic_row(frame: pd.DataFrame, aligned_fft_start_s: float) -> pd.Series:
+    """Return the row whose FFT sub-window starts closest to the requested time."""
+
+    if "fft_start_s" not in frame.columns:
+        raise KeyError("Diagnostic frame is missing fft_start_s")
+    starts = pd.to_numeric(frame["fft_start_s"], errors="coerce").to_numpy(dtype=float)
+    if starts.size == 0 or not np.isfinite(starts).any():
+        raise ValueError("Diagnostic frame has no finite fft_start_s values")
+    idx = int(np.nanargmin(np.abs(starts - float(aligned_fft_start_s))))
+    return frame.iloc[idx]
+
+
+def _parse_window_stages(row: pd.Series) -> list[dict[str, Any]]:
+    """Parse cascade stage metadata for one diagnostic window."""
+
+    column = "adaptive_stages_json" if "adaptive_stages_json" in row.index else "lms_stages_json"
+    text = row.get(column, "")
+    if text is None or (isinstance(text, float) and math.isnan(text)) or not str(text).strip():
+        return []
+    try:
+        stages = json.loads(str(text))
+    except json.JSONDecodeError:
+        return []
+    return stages if isinstance(stages, list) else []
+
+
+def _diagnostic_motion_frequency(
+    run: ProtocolRunResult,
+    motion_frequency_df: pd.DataFrame,
+    motion_type: str,
+) -> float:
+    """Choose motion-frequency metadata for spectrum annotations."""
+
+    if run.motion_frequency is not None and np.isfinite(float(run.motion_frequency)):
+        return float(run.motion_frequency)
+    if not motion_frequency_df.empty and "motion_frequency_hz" in motion_frequency_df.columns:
+        candidates = motion_frequency_df
+        if "motion_type" in candidates.columns:
+            narrowed = candidates[candidates["motion_type"].astype(str) == str(motion_type)]
+            if not narrowed.empty:
+                candidates = narrowed
+        value = pd.to_numeric(candidates["motion_frequency_hz"], errors="coerce").dropna()
+        if not value.empty:
+            return float(value.iloc[0])
+    return float("nan")
+
+
+def _diagnostic_ppg_context(
+    dataset: ProtocolDataset,
+    row: pd.Series,
+    params: ProtocolTrialParams,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract the raw PPG context used for the selected diagnostic window."""
+
+    fs = int(dataset.fs)
+    fft_start = float(row.get("fft_start_s", 0.0))
+    fft_end = float(row.get("fft_end_s", fft_start + float(params.TW)))
+    adaptive_start = float(row.get("adaptive_start_s", fft_start - float(params.TW_F)))
+    start_idx = max(0, int(round(adaptive_start * fs)))
+    end_idx = min(len(dataset.ppg_green), int(round(fft_end * fs)))
+    if end_idx <= start_idx:
+        end_idx = min(len(dataset.ppg_green), start_idx + max(1, int(round(float(params.TW) * fs))))
+    time_s = np.asarray(dataset.time_s[start_idx:end_idx], dtype=float)
+    signal = np.asarray(dataset.ppg_green[start_idx:end_idx], dtype=float)
+    if time_s.size == 0:
+        time_s = np.asarray([adaptive_start], dtype=float)
+        signal = np.asarray([np.nan], dtype=float)
+    return time_s, signal
+
+
+def _diagnostic_filtered_signal(stages: list[dict[str, Any]], raw_ppg: np.ndarray) -> np.ndarray:
+    """Return the final stage output if present, otherwise a raw-signal fallback."""
+
+    for stage in reversed(stages):
+        if "output_signal" not in stage:
+            continue
+        values = np.asarray(stage.get("output_signal"), dtype=float)
+        if values.size:
+            return _fit_signal_length(values, len(raw_ppg))
+    return np.asarray(raw_ppg, dtype=float)
+
+
+def _fit_signal_length(values: np.ndarray, target_len: int) -> np.ndarray:
+    """Pad or crop a stage vector to the raw context length for plotting."""
+
+    arr = np.asarray(values, dtype=float)
+    if target_len <= 0:
+        return arr
+    if arr.size == target_len:
+        return arr
+    if arr.size > target_len:
+        return arr[-target_len:]
+    pad_value = float(arr[0]) if arr.size else np.nan
+    return np.concatenate([np.full(target_len - arr.size, pad_value, dtype=float), arr])
+
+
+def _plot_window_waveform_diagnostic(
+    out_path: Path,
+    *,
+    time_s: np.ndarray,
+    raw_ppg: np.ndarray,
+    filtered: np.ndarray,
+    stages: list[dict[str, Any]],
+    adaptive_start_s: float,
+    fft_start_s: float,
+    fft_end_s: float,
+    title: str,
+) -> None:
+    """Plot before/after PPG and optional cascade stage outputs for one window."""
+
+    plt = _prepare_matplotlib(out_path)
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    ax.axvspan(adaptive_start_s, fft_start_s, color="#b7b7b7", alpha=0.18, lw=0, label="TW_F context")
+    ax.axvspan(fft_start_s, fft_end_s, color="#83c5be", alpha=0.20, lw=0, label="FFT window")
+    ax.plot(time_s, raw_ppg, color="#1f77b4", lw=1.2, label="PPG before adaptive")
+    ax.plot(time_s, filtered, color="#2ca02c", lw=1.4, label="PPG after adaptive")
+    for idx, stage in enumerate(stages[:-1], start=1):
+        if "output_signal" not in stage:
+            continue
+        values = _fit_signal_length(np.asarray(stage["output_signal"], dtype=float), len(time_s))
+        ax.plot(time_s, values, lw=0.9, alpha=0.55, label=f"stage {idx}: {stage.get('channel', '')}")
+    ax.set_title(title)
+    ax.set_xlabel("Aligned time (s)")
+    ax.set_ylabel("Normalized / filtered amplitude")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def _plot_window_spectrum_diagnostic(
+    out_path: Path,
+    *,
+    raw_ppg: np.ndarray,
+    filtered: np.ndarray,
+    fs: int,
+    motion_frequency_hz: float,
+    penalty_width_hz: float,
+    final_hr_bpm: float,
+    penalty_ref_channel: str,
+    title: str,
+) -> None:
+    """Plot raw/filtered spectra and annotate motion penalty and final HR peak."""
+
+    plt = _prepare_matplotlib(out_path)
+    raw_freq, raw_amp = compute_power_spectrum(raw_ppg, fs, apply_hamming=True, demean=True)
+    filt_freq, filt_amp = compute_power_spectrum(filtered, fs, apply_hamming=True, demean=True)
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    ax.plot(raw_freq, raw_amp, color="#1f77b4", lw=1.2, label="PPG before adaptive")
+    ax.plot(filt_freq, filt_amp, color="#2ca02c", lw=1.3, label="PPG after adaptive")
+    if np.isfinite(motion_frequency_hz):
+        width = max(0.0, float(penalty_width_hz))
+        ax.axvline(motion_frequency_hz, color="#d62728", lw=1.0, ls="--", label=f"motion {motion_frequency_hz:.2f} Hz")
+        ax.axvspan(
+            max(0.0, motion_frequency_hz - width),
+            motion_frequency_hz + width,
+            color="#d62728",
+            alpha=0.12,
+            lw=0,
+            label=f"penalty band {penalty_ref_channel}".strip(),
+        )
+    if np.isfinite(final_hr_bpm):
+        ax.axvline(final_hr_bpm / 60.0, color="#111111", lw=1.0, ls=":", label=f"final HR {final_hr_bpm:.1f} bpm")
+    ax.set_xlim(left=0.0, right=min(max(float(fs) / 2.0, 0.5), 5.0))
+    ax.set_title(title)
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Amplitude")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def _compact_float_label(value: float) -> str:
+    text = f"{float(value):g}".replace(".", "p").replace("-", "m")
+    return text
 
 
 def replay_best_record_hr_curves(

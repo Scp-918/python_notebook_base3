@@ -1286,6 +1286,9 @@ def _cascade_filter_window(
                         ),
                         "fft_offset_samples": int(fft_offset_samples),
                         "fft_input_samples": int(fft_input_samples if fft_input_samples is not None else len(current)),
+                        # 中文说明：collect_stages=True 只用于回放/诊断等完整输出场景；保存
+                        # 每级输出可直接重画某窗口的级联波形，默认批量 Optuna 不收集该字段。
+                        "output_signal": np.asarray(current, dtype=float).round(8).tolist(),
                         **stage_extra,
                     }
                 )
