@@ -3126,6 +3126,7 @@ def plot_window_diagnostics_from_records(
     adaptive_filter: str,
     adaptive_data_type: str = "",
     cascade_scheme: str | None = None,
+    override_cascade_scheme: str | None = None,
     results_root: str | Path,
     aligned_fft_start_s: float,
     TW_F: float | None = None,
@@ -3159,7 +3160,8 @@ def plot_window_diagnostics_from_records(
     )
     params = _params_from_stage6_record(best_row, adaptive_filter=adaptive_filter, TW_F=TW_F)
     scheme_text = str(cascade_scheme or _stage6_row_text(best_row, "cascade_scheme") or adaptive_data_type)
-    scheme = CascadeScheme(scheme_text)
+    scheme_to_run = override_cascade_scheme if override_cascade_scheme else scheme_text
+    scheme = CascadeScheme(scheme_to_run)
     scope = TargetScope(target_scope)
     dataset = load_and_preprocess_protocol(signal_csv, ref_csv, fs_origin=fs_origin)
     dataset = resample_protocol_dataset(dataset, fs_target=int(params.Fs_Target))
@@ -3203,11 +3205,19 @@ def plot_window_diagnostics_from_records(
         fft_end_s=fft_end,
         adaptive_start_s=adaptive_start,
     )
-    label_data_type = adaptive_data_type or scheme.value
-    label = (
-        f"{motion_type}_{params.adaptive_filter}_{label_data_type}_"
-        f"{_tw_f_run_label(params.TW_F)}_{scope.value}_start{_compact_float_label(aligned_fft_start_s)}s"
-    )
+    label_data_type = adaptive_data_type or scheme_text
+    if override_cascade_scheme:
+        title_prefix = f"Params: {scheme_text} -> Run: {override_cascade_scheme}"
+        label = (
+            f"cross_{label_data_type}_to_{override_cascade_scheme}_{motion_type}_"
+            f"{params.adaptive_filter}_{_tw_f_run_label(params.TW_F)}_{scope.value}_start{_compact_float_label(aligned_fft_start_s)}s"
+        )
+    else:
+        title_prefix = scheme.value
+        label = (
+            f"{motion_type}_{params.adaptive_filter}_{label_data_type}_"
+            f"{_tw_f_run_label(params.TW_F)}_{scope.value}_start{_compact_float_label(aligned_fft_start_s)}s"
+        )
     waveform_path = out_dir / f"window_waveform_{label}.png"
     spectrum_path = out_dir / f"window_spectrum_{label}.png"
     _plot_window_waveform_diagnostic(
@@ -3219,7 +3229,7 @@ def plot_window_diagnostics_from_records(
         adaptive_start_s=adaptive_start,
         fft_start_s=fft_start,
         fft_end_s=fft_end,
-        title=f"{motion_type} | {params.adaptive_filter} | {scheme.value} | {_tw_f_run_label(params.TW_F)}",
+        title=f"{motion_type} | {params.adaptive_filter} | {title_prefix} | {_tw_f_run_label(params.TW_F)}",
     )
     spectrum_info = _plot_window_spectrum_diagnostic(
         spectrum_path,
@@ -3630,6 +3640,7 @@ def replay_best_record_hr_curves(
     adaptive_filter: str = "lms",
     adaptive_data_type: str = "",
     cascade_scheme: str | None = None,
+    override_cascade_scheme: str | None = None,
     TW_F: float | None = None,
     results_root: str | Path,
     fs_origin: int = 100,
@@ -3662,7 +3673,8 @@ def replay_best_record_hr_curves(
         scheme_text = str(cascade_scheme)
     elif not scheme_text:
         scheme_text = _stage6_row_text(best_row, "adaptive_data_type") or adaptive_data_type
-    scheme = CascadeScheme(scheme_text)
+    scheme_to_run = override_cascade_scheme if override_cascade_scheme else scheme_text
+    scheme = CascadeScheme(scheme_to_run)
     scope = TargetScope(target_scope)
 
     dataset = load_and_preprocess_protocol(signal_csv, ref_csv, fs_origin=fs_origin)
@@ -3674,11 +3686,19 @@ def replay_best_record_hr_curves(
         raise RuntimeError("Replay produced no window frame")
 
     replay_frame = _build_replay_frame(frame)
-    label_data_type = adaptive_data_type or scheme.value
-    label = f"{motion_type}_{params.adaptive_filter}_{label_data_type}_{_tw_f_run_label(params.TW_F)}_{scope.value}"
+    label_data_type = adaptive_data_type or scheme_text
+    
+    if override_cascade_scheme:
+        title_prefix = f"Params: {scheme_text} -> Run: {override_cascade_scheme}"
+        label = f"cross_{label_data_type}_to_{override_cascade_scheme}_{motion_type}_{params.adaptive_filter}_{_tw_f_run_label(params.TW_F)}_{scope.value}"
+    else:
+        title_prefix = scheme.value
+        label = f"{motion_type}_{params.adaptive_filter}_{label_data_type}_{_tw_f_run_label(params.TW_F)}_{scope.value}"
+
     csv_path = out_dir / f"replay_{label}.csv"
     plot_path = out_dir / f"replay_{label}.png"
     replay_frame.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    
     _plot_replay_hr_curves(
         plot_path,
         dataset=dataset,
@@ -3687,6 +3707,7 @@ def replay_best_record_hr_curves(
         scope=scope,
         scheme=scheme,
         params=params,
+        title_prefix=title_prefix,
     )
     return {"plot": plot_path, "csv": csv_path}
 
@@ -3849,6 +3870,7 @@ def _plot_replay_hr_curves(
     scope: TargetScope,
     scheme: CascadeScheme,
     params: ProtocolTrialParams,
+    title_prefix: str = "",
 ) -> None:
     """Draw reference/baseline/adaptive/final HR curves for one replay run."""
 
@@ -3861,8 +3883,9 @@ def _plot_replay_hr_curves(
     ax.plot(time_s, frame["adaptive_hr_bpm"], color="#ff7f0e", lw=1.1, marker="o", ms=3, label="adaptive")
     ax.plot(time_s, frame["final_hr_bpm"], color="#2ca02c", lw=1.6, marker="o", ms=3, label="final")
     _shade_replay_segments(ax, frame)
+    prefix = title_prefix if title_prefix else scheme.value
     ax.set_title(
-        f"{motion_type} | {params.adaptive_filter} | {scheme.value} | {scope.value} | {_tw_f_run_label(params.TW_F)}"
+        f"{motion_type} | {params.adaptive_filter} | {prefix} | {scope.value} | {_tw_f_run_label(params.TW_F)}"
     )
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("HR (bpm)")
