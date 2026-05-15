@@ -37,7 +37,6 @@ gh pr create --repo Scp-918/python_notebook_base3 --base change2 --head wqwshn:m
 
 注意：
 - `notebooks/run_batch_adaptive_protocol.ipynb` 中的 `PROJECT_ROOT` 是本机路径，**严禁提交**。
-- CLAUDE.md 属于项目文档，可提交。
 - 不确定改动是否应提交时，先问再做。
 
 ## 环境与命令
