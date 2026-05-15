@@ -1,8 +1,9 @@
 """Discovery of ``multi_<motion_type><index>.csv`` / ``*_ref.csv`` sample pairs.
 
 中文说明：本模块只做文件名层面的样本发现。传感器文件必须形如
-``multi_kaihe1.csv``，参考心率文件必须是同 stem 加 ``_ref``。没有配对的 CSV
-会写入 unpaired，不进入后续 QC、预处理或训练。
+``multi_kaihe1.csv``，参考心率文件支持两种命名：同 stem 加 ``_ref``
+（旧 Polar 格式）或 ``_HR_ref``（新格式 CSV）。没有配对的 CSV 会写入
+unpaired，不进入后续 QC、预处理或训练。
 """
 
 from __future__ import annotations
@@ -113,14 +114,21 @@ def discover_sample_pairs_with_unpaired(input_dir: Path) -> PairDiscovery:
             )
             continue
         motion_type, motion_index, motion_id = parsed
-        ref_stem = f"{sensor.stem}_ref"
-        ref = by_stem.get(ref_stem)
+        ref = None
+        ref_stem = ""
+        for suffix in ("_ref", "_HR_ref"):
+            candidate = f"{sensor.stem}{suffix}"
+            found = by_stem.get(candidate)
+            if found is not None:
+                ref = found
+                ref_stem = candidate
+                break
         if ref is None:
             unpaired.append(
                 UnpairedSample(
                     file_name=sensor.name,
                     file_path=sensor,
-                    reason=f"missing reference file {ref_stem}.csv",
+                    reason=f"missing reference file (tried {sensor.stem}_ref.csv, {sensor.stem}_HR_ref.csv)",
                 )
             )
             continue
@@ -138,9 +146,13 @@ def discover_sample_pairs_with_unpaired(input_dir: Path) -> PairDiscovery:
 
     sensor_stems = {p.sensor_csv.stem for p in pairs}
     for ref in csv_files:
-        if not ref.stem.endswith("_ref"):
+        if not (ref.stem.endswith("_ref") or ref.stem.endswith("_HR_ref")):
             continue
-        sensor_stem = ref.stem.removesuffix("_ref")
+        sensor_stem = ref.stem
+        for suffix in ("_HR_ref", "_ref"):
+            if sensor_stem.endswith(suffix):
+                sensor_stem = sensor_stem.removesuffix(suffix)
+                break
         if ref.stem in paired_ref_stems or sensor_stem in sensor_stems:
             continue
         unpaired.append(

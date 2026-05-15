@@ -75,11 +75,51 @@ def _clean_signal(values: np.ndarray, name: str, fs: int) -> np.ndarray:
 
 
 def _parse_reference_csv(gt_csv: Path) -> np.ndarray:
-    gt = pd.read_csv(gt_csv, skiprows=3, header=None)
-    if gt.shape[1] < 3:
-        raise ValueError(f"Reference CSV {gt_csv} has fewer than 3 columns")
-    raw_time = gt.iloc[:, 1].astype(str).str.strip()
-    raw_bpm = gt.iloc[:, 2]
+    # 尝试两种格式：新格式带标准表头，旧格式前3行为元数据。
+    candidates: list[pd.DataFrame] = []
+    try:
+        candidates.append(pd.read_csv(gt_csv))
+    except Exception:
+        pass
+    try:
+        candidates.append(pd.read_csv(gt_csv, skiprows=3, header=None))
+    except Exception:
+        pass
+
+    for gt in candidates:
+        if gt.empty:
+            continue
+        lower_cols = [str(c).strip().lower() for c in gt.columns]
+        time_idx = _first_ref_column(lower_cols, ("time", "seconds", "sec", "elapsed"))
+        hr_idx = _first_ref_column(lower_cols, ("hr", "heart", "bpm"))
+
+        if time_idx is not None and hr_idx is not None:
+            time_s = _parse_ref_time(gt.iloc[:, time_idx])
+            bpm = pd.to_numeric(gt.iloc[:, hr_idx], errors="coerce").to_numpy(dtype=float)
+        elif gt.shape[1] >= 3:
+            time_s = _parse_ref_time(gt.iloc[:, 1])
+            bpm = pd.to_numeric(gt.iloc[:, 2], errors="coerce").to_numpy(dtype=float)
+        elif gt.shape[1] >= 2:
+            time_s = _parse_ref_time(gt.iloc[:, 0])
+            bpm = pd.to_numeric(gt.iloc[:, 1], errors="coerce").to_numpy(dtype=float)
+        else:
+            continue
+
+        valid = ~(np.isnan(time_s) | np.isnan(bpm))
+        if valid.sum() >= 2:
+            return np.column_stack([time_s[valid], bpm[valid]])
+    raise ValueError(f"Cannot parse reference CSV: {gt_csv}")
+
+
+def _first_ref_column(names: list[str], needles: tuple[str, ...]) -> int | None:
+    for i, name in enumerate(names):
+        if any(n in name for n in needles):
+            return i
+    return None
+
+
+def _parse_ref_time(series: pd.Series) -> np.ndarray:
+    raw = series.astype(str).str.strip()
 
     def _to_seconds(t: str) -> float:
         try:
@@ -90,10 +130,7 @@ def _parse_reference_csv(gt_csv: Path) -> np.ndarray:
             except ValueError:
                 return float("nan")
 
-    time_s = np.array([_to_seconds(t) for t in raw_time], dtype=float)
-    bpm = pd.to_numeric(raw_bpm, errors="coerce").to_numpy(dtype=float)
-    valid = ~(np.isnan(time_s) | np.isnan(bpm))
-    return np.column_stack([time_s[valid], bpm[valid]])
+    return np.array([_to_seconds(t) for t in raw], dtype=float)
 
 
 def load_dataset(
@@ -110,7 +147,8 @@ def load_dataset(
     sensor_csv:
         Path to the raw sensor CSV (14-column layout, see :data:`SENSOR_COLUMNS`).
     gt_csv:
-        Path to the Polar-style reference CSV (header on rows 1-3, data from row 4).
+        Path to the reference CSV. Supports Polar-style (3-row header) and
+        simple CSV with ``elapsed_seconds`` / ``hr_bpm`` columns.
     fs:
         Target sampling rate (defaults to 100 Hz, matching the original MATLAB pipeline).
     columns:
