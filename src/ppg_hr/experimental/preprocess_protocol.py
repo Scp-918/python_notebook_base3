@@ -389,7 +389,7 @@ def _raw_ratio(raw: pd.DataFrame, numerator_field: str, hf_field: str) -> np.nda
 def _clean_numeric(values: pd.Series | np.ndarray) -> np.ndarray:
     """Convert one raw column to finite numeric values by interpolation."""
 
-    arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
+    arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float).copy()
     arr[~np.isfinite(arr)] = np.nan
     arr = fillmissing_linear(arr)
     arr = fillmissing_nearest(arr)
