@@ -11,13 +11,34 @@ PPG 心率求解算法 Python 实现，源码 `src/ppg_hr/`（含 `core/`、`pre
 - 始终使用中文交互，Git 提交信息使用中文，每次提交简要叙述修改内容。
 - 高频原子化提交，严禁 `--no-verify`。
 
-## 远程仓库与推送流程
+## 远程仓库
 
-- `origin`（个人 fork）：`git@github.com:wqwshn/PPGtoHR_notebook.git`（SSH）和 `https://github.com/wqwshn/PPGtoHR_notebook.git`（HTTPS 备用 push）
-- `upstream`（原仓库）：`git@github.com:Scp-918/python_notebook_base3.git`（SSH）和 `https://github.com/Scp-918/python_notebook_base3.git`（HTTPS 备用 push）
-- fetch 走 SSH，push 按 SSH -> HTTPS 顺序自动回退。
+- `origin`（个人 fork）：`git@github.com:wqwshn/PPGtoHR_notebook.git`（SSH fetch/push + HTTPS 备用 push）
+- `upstream`（原仓库）：`git@github.com:Scp-918/python_notebook_base3.git`（SSH fetch/push + HTTPS 备用 push）
 - HTTP/HTTPS 代理：`http://127.0.0.1:7890`，SSH 不受代理影响。
-- **推送铁律**：本地开发完成后，先 push 到 `origin`，再向 `upstream` 发起 Pull Request。
+- master 基于 `upstream/change2`，共享 git 历史，可直接发起 PR。
+
+## PR 推送流程
+
+日常开发在 master 上直接进行，无需新建分支：
+
+```bash
+# 1. 在 master 上正常开发和提交
+git add <files>
+git commit -m "描述改动"
+
+# 2. 推送到自己的仓库
+git push origin master
+
+# 3. 向 upstream/change2 发起 PR
+gh pr create --repo Scp-918/python_notebook_base3 --base change2 --head wqwshn:master \
+    --title "PR 标题" --body "PR 描述"
+```
+
+注意：
+- `notebooks/run_batch_adaptive_protocol.ipynb` 中的 `PROJECT_ROOT` 是本机路径，**严禁提交**。
+- CLAUDE.md 属于项目文档，可提交。
+- 不确定改动是否应提交时，先问再做。
 
 ## 环境与命令
 
