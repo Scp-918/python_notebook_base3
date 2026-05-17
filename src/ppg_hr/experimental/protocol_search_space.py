@@ -90,6 +90,9 @@ class ProtocolTrialParams:
     rff_D: int = 100
     rff_sigma: float = 1.0
     rff_seed: int = 0
+    klms_step_size: float = 0.05
+    klms_sigma: float = 1.0
+    klms_epsilon: float = 0.1
 
     def to_dict(self) -> dict[str, Any]:
         """Return parameter values as plain Python scalars."""

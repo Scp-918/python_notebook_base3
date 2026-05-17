@@ -72,7 +72,7 @@ class ProtocolParams:
 class ProtocolSearchParams:
     """Discrete search grid for the batch adaptive protocol.
 
-    中文说明：公共项对 LMS/Volterra/RFF-LMS 三类滤波器都生效；滤波器专属项
+    中文说明：公共项对 LMS/Volterra/RFF-LMS/KLMS 四类滤波器都生效；滤波器专属项
     由 ``names_for_filter`` 动态选择，避免 LMS 误采样 RFF 或 Volterra 参数。
     """
 
@@ -97,6 +97,9 @@ class ProtocolSearchParams:
     M2: list[int] = field(default_factory=lambda: [2, 3, 4, 5])
     rff_D: list[int] = field(default_factory=lambda: [50, 100, 200, 300])
     rff_sigma: list[float] = field(default_factory=lambda: [0.1, 0.5, 1.0, 2.0, 5.0])
+    klms_step_size: list[float] = field(default_factory=lambda: [0.01, 0.05, 0.1, 0.2, 0.5])
+    klms_sigma: list[float] = field(default_factory=lambda: [0.1, 0.5, 1.0, 2.0, 5.0])
+    klms_epsilon: list[float] = field(default_factory=lambda: [0.01, 0.05, 0.1, 0.2])
 
     def names(self) -> list[str]:
         """Return active parameter names in stable dataclass order."""
@@ -130,6 +133,8 @@ class ProtocolSearchParams:
             return [*common, "LMS_Mu_Base", "alpha_u", "M2"]
         if adaptive_filter == "rff_lms":
             return [*common, "RFF_LMS_Mu_Base", "rff_D", "rff_sigma"]
+        if adaptive_filter == "klms":
+            return [*common, "klms_step_size", "klms_sigma", "klms_epsilon"]
         raise ValueError(f"Unsupported adaptive_filter: {adaptive_filter}")
 
     def options(self, name: str) -> list[Any]:
@@ -184,7 +189,7 @@ class SolverParams:
     bp_order: int = 4
 
     # Adaptive filter selection (new in 2026-04)
-    adaptive_filter: str = "lms"  # one of: "lms", "volterra", "rff_lms"
+    adaptive_filter: str = "lms"  # one of: "lms", "volterra", "rff_lms", "klms"
     ppg_mode: str = "green"  # one of: "green", "red", "ir"
 
     # Delay-search prefit controls. ``adaptive`` narrows the PPG-vs-motion
@@ -207,6 +212,11 @@ class SolverParams:
     rff_D: int = 100
     rff_sigma: float = 1.0
     rff_seed: int = 42
+
+    # KLMS-specific parameters (only used when adaptive_filter == "klms")
+    klms_step_size: float = 0.05
+    klms_sigma: float = 1.0
+    klms_epsilon: float = 0.1
 
     extras: dict[str, Any] = field(default_factory=dict)
 

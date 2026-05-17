@@ -555,6 +555,7 @@ delay_estimation_mode = "direct"
 lms
 volterra
 rff_lms
+klms
 ```
 
 #### LMS
@@ -822,6 +823,7 @@ ACTIVE_ADAPTIVE_FILTERS = [
     "lms",
     "volterra",
     "rff_lms",
+    "klms",
 ]
 ```
 
@@ -1198,6 +1200,7 @@ outputs/<run_name>/
             best_params_lms.csv
             best_params_volterra.csv
             best_params_rff_lms.csv
+            best_params_klms.csv
             best_params_all.json
             bayes_curve_data.csv
             bayes_curve.png
@@ -1370,6 +1373,7 @@ LOGO 每个 held-out group 表现如何
 best_params_lms.csv
 best_params_volterra.csv
 best_params_rff_lms.csv
+best_params_klms.csv
 ```
 
 常用于手动重画最佳参数 HR 曲线。
@@ -2172,6 +2176,7 @@ ACTIVE_ADAPTIVE_FILTERS = [
     "lms",
     "volterra",
     "rff_lms",
+    "klms",
 ]
 ```
 
@@ -2545,6 +2550,7 @@ global
 lms
 volterra
 rff_lms
+klms
 ```
 
 #### CASCADE_SCHEME
@@ -2715,3 +2721,292 @@ applied scheme:
 ```
 
 不能把跨方案重放结果直接当成 `CROSS_RUN_APPLIED_SCHEME` 自身训练得到的最优结果。
+
+---
+
+## 8. Notebook 代码块快速上手指南
+
+本章按代码块的顺序逐一说明每个代码块的功能，并按照参数大类汇总修改位置。只覆盖代码块（不含 markdown 说明块），且不涉及跨运动类型汇总与跨滤波架构回放（代码块 12/13/14）。
+
+### 8.1 代码块总览
+
+Notebook 共 15 个代码块，按流水线组织为"环境初始化 — 诊断预览 — 训练 — 结果检查与回放"四个阶段：
+
+```
+代码块 0  (Cell  2): 环境初始化与全局参数
+代码块 1  (Cell  4): 样本发现与 QC
+代码块 2  (Cell  6): 单样本预处理预览 (smoke test)
+代码块 3  (Cell  8): 静息段 Tdelay 对齐诊断图
+代码块 4  (Cell 10): 全段未对齐 PPG-HR 图
+代码块 5  (Cell 12): 训练函数封装 (只定义，不跑训练)
+代码块 6  (Cell 14): 静息段原始 PPG 与 PPG-HR 双 y 轴图
+代码块 7  (Cell 16): 训练单元 1 — all_train 拟合上限
+代码块 8  (Cell 18): 训练单元 2 — 84 模式连通性检查 (默认关闭)
+代码块 9  (Cell 20): Stage-6 输出检查
+代码块 10 (Cell 22): Stage-7 单文件 HR 曲线回放
+代码块 11 (Cell 24): Stage-8 窗口级波形与频谱诊断
+代码块 12 (Cell 26): Stage-9 跨运动类型汇总表 (本章不展开)
+代码块 13 (Cell 28): 跨滤波架构 Stage-7 replay (本章不展开)
+代码块 14 (Cell 30): 跨滤波架构 Stage-8 窗口诊断 (本章不展开)
+```
+
+### 8.2 各代码块功能说明
+
+#### 代码块 0 (Cell 2) — 环境初始化与全局参数
+
+**必须第一个运行。** 一次性设置整个 notebook 的工作环境：
+
+- 定义项目路径 `PROJECT_ROOT`、源码路径 `SRC_DIR`、测试数据目录 `TESTDATA_DIR`、输出根目录 `OUTPUT_ROOT`
+- 将 `src/` 加入 `sys.path`，导入 `ppg_hr` 所有依赖
+- 定义**全部固定参数**（TW_F、normalization_mode、qc_policy、Alignment_TW、静息段 HR 后处理参数、恢复段容差等）
+- 定义默认训练组合（target scope / cascade scheme / adaptive filter / 预算）
+- 调用 `make_unique_output_dir()` 创建本次运行的输出子目录 `RUN_OUTPUT_DIR`
+
+运行后打印项目路径和当前参数汇总，确认环境正确。
+
+#### 代码块 1 (Cell 4) — 样本发现与 QC
+
+**依赖代码块 0。** 自动扫描 `testdata/` 目录：
+
+- 通过 `discover_sample_pairs_with_unpaired` 识别 `multi_<运动类型><编号>.csv` 及其 `_ref.csv` 配对
+- 逐样本执行 `quality_filter_sample`，分出 `good_pairs`（通过 QC）和 `bad_pairs`（未通过）
+- 未配对文件写入 `unpaired_df`
+- 额外对新格式 CSV（优先 `multi_tiaosheng1.csv`）做字段验证，检查 QC 元数据列是否齐全
+
+输出 `good_pairs` 是后续所有绘图和训练的输入来源。
+
+#### 代码块 2 (Cell 6) — 单样本预处理预览
+
+**依赖代码块 1。** 取 `good_pairs[0]` 做快速体检（smoke test）：
+
+- 加载传感器 CSV 和参考 HR CSV
+- 重采样到 100 Hz
+- 运行 ACC 运动分段检测
+- 用固定 `ALIGNMENT_TW` 执行全局 Tdelay 对齐
+- 输出摘要表格（运动起止时间、静息/运动/恢复窗口数量、best_tdelay_s）
+
+如果此处失败，后续训练大概率也会失败。
+
+#### 代码块 3 (Cell 8) — 静息段 Tdelay 对齐诊断图
+
+**依赖代码块 1 + 代码块 0 的 REST_HR_* 参数。** 作用：
+
+- 按运动类型逐个加载数据集
+- 调用 `plot_rest_alignment_diagnostics_by_motion_type` 生成对齐诊断 PNG
+- 每张图叠加静息段 PPG-HR 曲线与参考 HR 曲线，用于人工判断全局 Tdelay 是否合理
+
+如果静息段 HR 偏离严重，优先回代码块 0 调整 `REST_HR_*` 参数。
+
+#### 代码块 4 (Cell 10) — 全段未对齐 PPG-HR 图
+
+**依赖代码块 1 + 代码块 3 的数据集（缺失时自动补加载）。** 作用：
+
+- 不做 Tdelay 对齐，在完整 `PPG_Green` 上直接分窗提取 HR
+- 生成每个运动类型的全段未对齐 PPG-HR PNG
+- 用于判断异常是来自原始 PPG 主频问题、分段位置还是后处理参数
+
+输出目录为 `OUTPUT_ROOT / "allfield"`。
+
+#### 代码块 5 (Cell 12) — 训练函数封装
+
+**不跑训练，只定义函数。** 依赖代码块 0 的全部固定参数。作用：
+
+- 定义 `run_training_cell()` 函数，封装 `run_batch_adaptive_protocol` 的完整调用
+- 定义 `notebook_progress` 进度回调，每 10 个 trial 打印一次关键指标
+- 定义 `make_budgets()` 快捷生成每个 cascade scheme 的训练预算
+
+后续代码块 7/8 只需填参数组合 + 调用 `run_training_cell()` 即可启动训练。
+
+#### 代码块 6 (Cell 14) — 静息段原始 PPG 与 PPG-HR 双 y 轴图
+
+**依赖代码块 1 + 已有数据集。** 作用：
+
+- 对每个运动类型画一张双 y 轴图：左轴是原始 PPG 波形，右轴是从 PPG 估计出的 HR
+- 是代码块 3（Tdelay 诊断）的辅助视角，侧重观察静息段信号质量（漂移、断裂、周期不清等）
+
+#### 代码块 7 (Cell 16) — 训练单元 1：all_train 拟合上限
+
+**这是核心训练代码块。** 依赖代码块 1 的 `good_pairs` + 代码块 5 的 `run_training_cell`。作用：
+
+- 用所有可用样本训练并在同批样本上测试，观察流程在训练集上的拟合上限
+- 按本块设定的 `ACTIVE_TARGET_SCOPES`、`ACTIVE_CASCADE_SCHEMES`、`ACTIVE_ADAPTIVE_FILTERS` 启动 Optuna 搜索
+- 每个运动类型独立训练，结果写入 `RUN_OUTPUT_DIR` 下的 Stage-6 文件
+
+小规模检查保持 `n_trials=1, n_repeats=1`；正式实验可增大预算或扩展组合。
+
+#### 代码块 8 (Cell 18) — 训练单元 2：84 模式连通性检查
+
+**默认关闭 (`RUN_FULL_84_MODE_TEST = False`)。** 依赖代码块 5。作用：
+
+- 可选地跑 3 种 target scope × 7 种 cascade scheme × 4 种 adaptive filter = 84 个组合，其中 adaptive filter 包含 `lms` / `volterra` / `rff_lms` / `klms`
+- 用于在正式实验前确认全部模式是否能连通、无崩溃
+
+开启时输出 `result_full_84`，后续代码块 9/10/11 可切换使用该结果。
+
+#### 代码块 9 (Cell 20) — Stage-6 输出检查
+
+**依赖代码块 7 或代码块 8 的训练结果。** 作用：
+
+- 自动选择最近一次训练结果（优先级：`result_full_84` > `result_full_63` > `result_all_train`）
+- 检查每个运动类型目录下是否存在 4 个 Stage-6 文件：
+  - `best_params_and_alignment.csv`
+  - `best_metrics.csv`
+  - `motion_frequency_and_params.csv`
+  - `full_report.json`
+- 展示关键列和 fusion 分布
+
+如果代码块 10 找不到 `best_params_and_alignment.csv`，先回本块确认路径正确。
+
+#### 代码块 10 (Cell 22) — Stage-7 单文件 HR 曲线回放
+
+**依赖代码块 9 能找到的 Stage-6 记录。** 默认开启 (`RUN_STAGE7_REPLAY = True`)。作用：
+
+- 从 `best_params_and_alignment.csv` 自动匹配并恢复最优参数
+- 对**单个指定的 CSV 文件**（`REPLAY_SIGNAL_CSV` + `REPLAY_REF_CSV`）重新跑完整 HR 提取
+- 输出 HR 曲线 PNG（含 Reference/Baseline/Adaptive/Final 四条曲线）和窗口级 CSV
+
+需要指定：`REPLAY_SIGNAL_CSV`、`REPLAY_REF_CSV`、`REPLAY_MOTION_TYPE`、`REPLAY_TARGET_SCOPE`、`REPLAY_ADAPTIVE_FILTER`、`REPLAY_CASCADE_SCHEME`。
+
+#### 代码块 11 (Cell 24) — Stage-8 窗口级波形与频谱诊断
+
+**依赖代码块 10 的 replay 结果。** 默认开启 (`RUN_WINDOW_DIAGNOSTICS = True`)。作用：
+
+- 选取一个 FFT 窗口（由 `MANUAL_ALIGNED_FFT_START_S` 指定秒数起点），深度诊断
+- 生成两张图：
+  - **波形图**：双 y 轴，左轴画原始 PPG 和各 stage 中间波形，右轴画最终自适应滤波后波形
+  - **频谱图**：仅用 FFT window 内数据，画三条归一化幅频谱（原始 PPG / 自适应滤波后 / 加运动惩罚后），标注 motion 峰和候选 HR
+- 输出 stage 摘要表（每级的 channel、M、K、mu、reference_channel_ranking 等）
+
+注：stage 1/2/... 是级联滤波中每个自适应步骤的中间输出，不是最终 HR，也不是新的搜索参数表。
+
+### 8.3 参数分类与修改位置
+
+#### 第一类：路径配置
+
+| 参数 | 修改位置 | 说明 |
+|------|----------|------|
+| `PROJECT_ROOT` | 代码块 0 | 项目根目录，仓库移动时只改这里 |
+| `SRC_DIR` | 代码块 0 | 源码目录，由 PROJECT_ROOT 派生 |
+| `TESTDATA_DIR` | 代码块 0 | 测试数据目录，由 PROJECT_ROOT 派生 |
+| `OUTPUT_ROOT` | 代码块 0 | 输出根目录，由 PROJECT_ROOT 派生 |
+| `CLEAN_OUTPUTS` | 代码块 0 | `True` 时每次运行覆盖之前的输出子目录 |
+| `FS_ORIGIN` | 代码块 0 | 原始采样率，默认 100 |
+| `RANDOM_STATE` | 代码块 0 | 随机种子，默认 42 |
+
+#### 第二类：核心算法固定参数
+
+| 参数 | 修改位置 | 说明 |
+|------|----------|------|
+| `TW_F` | 代码块 0；可在代码块 7/8 覆盖 | 未来窗口前置长度(s)，不进搜索空间。这是最核心的固定参数 |
+| `NORMALIZATION_MODE` | 代码块 0 | 归一化方式：`"minmax"` / `"zscore"` / `"none"` |
+| `QC_POLICY` | 代码块 0 | QC 策略，默认 `"fallback_baseline"` |
+| `DELAY_ESTIMATION_MODE` | 代码块 0 | 延迟估计模式：`"envelope"` / `"direct"` |
+
+这些参数通过 `REST_HR_TRIAL_OVERRIDES` 字典统一传入训练流程，不进入 Optuna 搜索空间。
+
+#### 第三类：对齐与时间参数
+
+| 参数 | 修改位置 | 说明 |
+|------|----------|------|
+| `ALIGNMENT_TW` | 代码块 0 | 静息段 FFT 对齐窗口(s)，**不等于训练窗口 TW**，默认 8.0 |
+| `ALIGNMENT_STEP_S` | 代码块 0 | 对齐搜索步长(s)，默认 1.0 |
+| `ENABLE_TIME_BIAS_AFTER` | 代码块 0 | 是否启用对齐后时移修正 |
+| `TIME_BIAS_AFTER_RANGE_S` | 代码块 0 | 时移搜索范围(s)，默认 (-5, 5) |
+| `TIME_BIAS_AFTER_STEP_S` | 代码块 0 | 时移搜索步长(s)，默认 1.0 |
+| `TIME_BIAS_AFTER_MODE` | 代码块 0 | 时移模式，默认 `"posthoc_oracle_alignment"` |
+| `REST_ALIGNMENT_SCORE_MODE` | 代码块 0 | 对齐评分模式：`"aae"` / `"mae"` / `"std"` |
+
+#### 第四类：静息段 HR 后处理参数
+
+| 参数 | 修改位置 | 说明 |
+|------|----------|------|
+| `REST_HR_BAND_BPM` | 代码块 0 | HR 带通范围(bpm)，默认 (40, 180) |
+| `REST_HR_TRACK_BAND_BPM` | 代码块 0 | 相邻窗口 HR 跟踪带宽(bpm)，默认 30 |
+| `REST_HR_SLEW_LIMIT_BPM` | 代码块 0 | HR 摆率限制(bpm)，默认 4.0 |
+| `REST_HR_SLEW_STEP_BPM` | 代码块 0 | 摆率步长(bpm)，默认 2.0 |
+| `REST_HR_SMOOTH_METHOD` | 代码块 0 | 平滑方法，默认 `"median"` |
+| `REST_HR_SMOOTH_WIN` | 代码块 0 | 平滑窗口大小(帧数)，默认 7 |
+| `REST_HR_PEAK_PERCENT` | 代码块 0 | 峰值检测阈值比例，默认 0.3 |
+| `REST_HR_SPEC_PENALTY_ENABLE` | 代码块 0 | 是否启用频谱惩罚 |
+| `REST_HR_SPEC_PENALTY_WEIGHT` | 代码块 0 | 频谱惩罚权重，默认 0.2 |
+| `REST_HR_SPEC_PENALTY_WIDTH_HZ` | 代码块 0 | 频谱惩罚宽度(Hz)，默认 0.2 |
+
+> 如果静息段 HR 曲线明显偏离参考（代码块 3/4/6 诊断图异常），优先调整此类参数。
+
+#### 第五类：恢复段容差参数
+
+| 参数 | 修改位置 | 说明 |
+|------|----------|------|
+| `RECOVERY_GRACE_S` | 代码块 0 | 恢复段宽限期(s)，默认 15.0 |
+| `RECOVERY_DIFF_BPM` | 代码块 0 | 恢复段允许的 HR 偏差(bpm)，默认 150.0 |
+| `RECOVERY_CROSS_DIFF_BPM` | 代码块 0 | 跨源恢复偏差阈值(bpm)，默认 8.0 |
+
+#### 第六类：训练组合与搜索预算
+
+| 参数 | 修改位置 | 说明 |
+|------|----------|------|
+| `ACTIVE_TARGET_SCOPES` | 代码块 0（默认值）；代码块 7（正式训练）；代码块 8（84 模式） | 评估窗口范围：`"global"` / `"motion_only"` / `"motion_recovery"` / `"motion_post10"` |
+| `ACTIVE_CASCADE_SCHEMES` | 同上 | 级联滤波方案：`"ACC3"` / `"HF2"` / `"CF2"` / `"HF2_CF2"` / `"CF2_HF2"` / `"ACC3_HF2"` / `"HF2_ACC3"` |
+| `ACTIVE_ADAPTIVE_FILTERS` | 同上 | 自适应滤波器类型：`"lms"` / `"volterra"` / `"rff_lms"` / `"klms"` |
+| `CASCADE_TRAIN_BUDGETS` | 同上 | 每个 cascade scheme 的 `n_trials` 和 `n_repeats` |
+| `OPTIMIZATION_OBJECTIVE` | 同上 | 优化目标：`"aae"` 或 `"accuracy"` |
+| `DATA_SPLIT_MODE` | 同上 | 数据划分：`"all_train"` / `"split"` / `"leave_one_group_out"` |
+| `VAL_GROUPS_PER_TYPE` | 同上 | 每运动类型验证组数，默认 1 |
+| `TEST_GROUPS_PER_TYPE` | 同上 | 每运动类型测试组数，默认 1 |
+
+> 快速测试建议：代码块 7 中保持 `n_trials=1, n_repeats=1`，只开 `["ACC3"]` + `["lms"]`。确认跑通后再扩大组合和预算。代码块 0 中的默认值仅用于初始化输出目录，实际训练参数以代码块 7 为准。
+
+#### 第七类：诊断开关与单文件选择
+
+| 参数 | 修改位置 | 说明 |
+|------|----------|------|
+| `RUN_FULL_84_MODE_TEST` | 代码块 8 | `True` 时跑 84 模式连通性检查，默认 `False` |
+| `RUN_STAGE7_REPLAY` | 代码块 10 | `True` 时启用 Stage-7 单文件回放 |
+| `REPLAY_SIGNAL_CSV` | 代码块 10 | 要回放的传感器 CSV 路径 |
+| `REPLAY_REF_CSV` | 代码块 10 | 要回放的参考心率 CSV 路径 |
+| `REPLAY_MOTION_TYPE` | 代码块 10 | 回放样本的运动类型（如 `"tiaosheng"`） |
+| `REPLAY_TARGET_SCOPE` | 代码块 10 | 回放使用的 target scope |
+| `REPLAY_ADAPTIVE_FILTER` | 代码块 10 | 回放使用的滤波器类型 |
+| `REPLAY_CASCADE_SCHEME` | 代码块 10 | 回放使用的级联方案 |
+| `REPLAY_TW_F` | 代码块 10 | 回放使用的 TW_F，默认沿用代码块 0 的值 |
+| `RUN_WINDOW_DIAGNOSTICS` | 代码块 11 | `True` 时启用 Stage-8 窗口诊断 |
+| `MANUAL_ALIGNED_FFT_START_S` | 代码块 11 | 手动指定诊断窗口起点(秒)，设为 `None` 则自动取 replay 第一窗 |
+
+#### 第八类：QC 元数据列
+
+| 参数 | 修改位置 | 说明 |
+|------|----------|------|
+| `QC_METADATA_COLUMNS` | 代码块 1 | 新格式 CSV 中期望出现的 QC 元数据列名列表 |
+
+### 8.4 典型工作流
+
+**首次使用（诊断阶段）：**
+
+```
+代码块 0 → 代码块 1 → 代码块 2 → 代码块 3 → 代码块 4 → 代码块 6
+(环境)    (QC)       (预览)     (对齐图)    (未对齐图)   (双y轴图)
+```
+检查所有诊断图，确认参数合理后再进入训练。
+
+**小规模训练：**
+
+```
+代码块 5 → 代码块 7 → 代码块 9
+(封装)    (all_train) (检查Stage-6输出)
+```
+
+**结果诊断：**
+
+```
+代码块 10 → 代码块 11
+(replay HR曲线) (窗口波形/频谱)
+```
+
+**参数调优循环：**
+如果训练效果不理想，按以下顺序排查：
+
+1. 先看代码块 3 的对齐诊断图 --- 静息段对齐是否正常？不正常则调整第四类参数（静息段 HR 后处理）
+2. 再看代码块 4 的未对齐 PPG-HR 图 --- 原始 PPG 主频是否可信？不可信则可能是数据本身问题
+3. 看代码块 10 的 replay HR 曲线 --- Adaptive HR 是否优于 Baseline？Final HR 是否合理？
+4. 看代码块 11 的窗口频谱 --- 是否锁错峰？滤波后波形是否发散？如果是，调整第六类参数（训练组合与搜索预算）
+5. 全局参数调整回代码块 0，训练参数调整回代码块 7，重复训练

@@ -11,7 +11,7 @@ delay_s < 0 时用首样本补头并右移；delay_s == 0 时不移动。
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from threading import Lock
 from typing import Any
 

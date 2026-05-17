@@ -9,11 +9,14 @@ import pytest
 from ppg_hr.experimental.alignment import AlignedDataset, AlignmentInfo
 from ppg_hr.experimental.cascade_solver import (
     _TrialBase,
+    _cascade_filter_window,
     _run_windows,
     clear_all_caches,
     clear_trial_heavy_caches,
 )
 from ppg_hr.experimental.envelope_delay import (
+    ChannelDelay,
+    DelayEstimate,
     NUMBA_AVAILABLE,
     _best_delay,
     _best_delay_numba,
@@ -226,3 +229,60 @@ def test_stage_json_defaults_to_empty_but_can_be_enabled() -> None:
     ).frame
     parsed = [json.loads(text) for text in with_stages["adaptive_stages_json"]]
     assert any(parsed)
+
+
+def test_cascade_filter_window_records_klms_stage_parameters() -> None:
+    fs = 20
+    t = np.arange(fs * 3, dtype=float) / fs
+    window = {
+        "ppg_green": np.sin(2 * np.pi * 1.2 * t),
+        "accx": np.sin(2 * np.pi * 1.2 * t),
+        "accy": np.zeros_like(t),
+        "accz": np.zeros_like(t),
+    }
+    params = ProtocolTrialParams(
+        Fs_Target=fs,
+        adaptive_filter="klms",
+        klms_step_size=0.05,
+        klms_sigma=1.0,
+        klms_epsilon=0.1,
+        max_order=4,
+        M_base=1,
+        C_scale=1.0,
+        K_max=2,
+    )
+    delay = ChannelDelay(
+        channel="accx",
+        sensor_type="ACC",
+        D_opt_samples=0,
+        D_opt_seconds=0.0,
+        R_max=0.5,
+        abs_corr=0.5,
+    )
+    cache = {
+        (0, round(float(params.Kstop), 8), round(1.2, 8), params.delay_estimation_mode): DelayEstimate(
+            by_channel={"accx": delay},
+            order_by_type={"ACC": ["accx"]},
+            primary_by_type={"ACC": "accx"},
+        )
+    }
+
+    filtered, penalty_ref, stages, penalty_ref_channel = _cascade_filter_window(
+        window,
+        CascadeScheme.ACC3,
+        params,
+        fmove=1.2,
+        fs=fs,
+        delay_cache=cache,
+        window_idx=0,
+        collect_stages=True,
+    )
+
+    assert filtered.shape == window["ppg_green"].shape
+    assert penalty_ref.shape == window["accx"].shape
+    assert penalty_ref_channel == "accx"
+    assert stages[0]["filter_type"] == "klms"
+    assert stages[0]["mu"] == 0.05
+    assert stages[0]["klms_step_size"] == 0.05
+    assert stages[0]["sigma"] == 1.0
+    assert stages[0]["epsilon"] == 0.1
