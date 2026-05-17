@@ -43,7 +43,7 @@ class ProtocolTrialParams:
     C_scale: float = 1.2
     K_max: int = 12
     Spec_Penalty_Width: float = 0.2
-    Spec_Penalty_Weight: float = 0.2
+    Spec_Penalty_Weight: float = 0.4
     smooth_win_len: int = 7
     hr_range_hz: float = 25.0 / 60.0
     slew_limit_bpm: int = 10

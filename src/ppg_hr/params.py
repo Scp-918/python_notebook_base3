@@ -84,13 +84,21 @@ class ProtocolSearchParams:
     C_scale: list[float] = field(default_factory=lambda: [0.6, 0.9, 1.2, 1.5])
     K_max: list[int] = field(default_factory=lambda: [8, 12, 16, 20, 30])
     Spec_Penalty_Width: list[float] = field(default_factory=lambda: [0.1, 0.2, 0.3])
-    Spec_Penalty_Weight: list[float] = field(default_factory=lambda: [0.1, 0.2, 0.4])
-    smooth_win_len: list[int] = field(default_factory=lambda: [3, 5, 7, 9])
+    smooth_win_len: list[int] = field(default_factory=lambda: [5, 7, 9])
     hr_range_hz: list[float] = field(
-        default_factory=lambda: [x / 60.0 for x in (15, 20, 25, 30, 35, 40)]
+        default_factory=lambda: [x / 60.0 for x in (20, 25, 30, 35, 40)]
     )
-    slew_limit_bpm: list[int] = field(default_factory=lambda: list(range(8, 16)))
+    slew_limit_bpm: list[int] = field(default_factory=lambda: [8, 10, 12, 14])
     slew_step_bpm: list[int] = field(default_factory=lambda: [5, 7, 9])
+    Rest_HR_Track_Band_BPM: list[float] = field(
+        default_factory=lambda: [20.0, 30.0, 50.0, 60.0, 80.0]
+    )
+    Rest_HR_Slew_Limit_BPM: list[float] = field(
+        default_factory=lambda: [1.0, 3.0, 5.0, 6.0, 8.0, 25.0]
+    )
+    Rest_HR_Slew_Step_BPM: list[float] = field(
+        default_factory=lambda: [0.5, 2.0, 4.0, 5.0, 8.0, 12.0]
+    )
     LMS_Mu_Base: list[float] = field(default_factory=lambda: [0.008, 0.01, 0.012])
     RFF_LMS_Mu_Base: list[float] = field(default_factory=lambda: [0.006, 0.008, 0.01])
     alpha_u: list[float] = field(default_factory=lambda: [0.01, 0.05, 0.1, 0.2])
@@ -121,11 +129,13 @@ class ProtocolSearchParams:
             "C_scale",
             "K_max",
             "Spec_Penalty_Width",
-            "Spec_Penalty_Weight",
             "smooth_win_len",
             "hr_range_hz",
             "slew_limit_bpm",
             "slew_step_bpm",
+            "Rest_HR_Track_Band_BPM",
+            "Rest_HR_Slew_Limit_BPM",
+            "Rest_HR_Slew_Step_BPM",
         ]
         if adaptive_filter == "lms":
             return [*common, "LMS_Mu_Base"]

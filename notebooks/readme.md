@@ -876,11 +876,13 @@ M_base: [1, 2]
 C_scale: [0.6, 0.9, 1.2, 1.5]
 K_max: [8, 12, 16, 20, 30]
 Spec_Penalty_Width: [0.1, 0.2, 0.3]
-Spec_Penalty_Weight: [0.1, 0.2, 0.4]
-smooth_win_len: [3, 5, 7, 9]
-hr_range_hz: [15/60, 20/60, 25/60, 30/60, 35/60, 40/60]
-slew_limit_bpm: [8, 9, 10, 11, 12, 13, 14, 15]
+smooth_win_len: [5, 7, 9]
+hr_range_hz: [20/60, 25/60, 30/60, 35/60, 40/60]
+slew_limit_bpm: [8, 10, 12, 14]
 slew_step_bpm: [5, 7, 9]
+Rest_HR_Track_Band_BPM: [20, 30, 50, 60, 80]
+Rest_HR_Slew_Limit_BPM: [1, 3, 5, 6, 8, 25]
+Rest_HR_Slew_Step_BPM: [0.5, 2, 4, 5, 8, 12]
 ```
 
 LMS 专属搜索项：
@@ -1003,13 +1005,14 @@ Alignment_Step:
 
 ### 4.10 Rest HR 与 Tdelay 相关固定参数
 
+以下为静息段后处理的固定配置，不进入贝叶斯搜索空间。
+静息段谱峰追踪参数（`Rest_HR_Track_Band_BPM` / `Rest_HR_Slew_Limit_BPM` /
+`Rest_HR_Slew_Step_BPM`）已进入公共搜索空间，参见 4.8 节。
+
 常用默认值：
 
 ```text
 Rest_HR_Band_BPM: (40, 180)
-Rest_HR_Track_Band_BPM: 30
-Rest_HR_Slew_Limit_BPM: 6
-Rest_HR_Slew_Step_BPM: 4
 Rest_HR_Smooth_Method: "median"
 Rest_HR_Smooth_Win: 3
 Rest_HR_Peak_Percent: 0.3
@@ -1882,13 +1885,15 @@ M_base
 C_scale
 K_max
 Spec_Penalty_Width
-Spec_Penalty_Weight
 smooth_win_len
 hr_range_hz
 slew_limit_bpm
 slew_step_bpm
+Rest_HR_Track_Band_BPM
+Rest_HR_Slew_Limit_BPM
+Rest_HR_Slew_Step_BPM
 LMS_Mu_Base
-Volterra / RFF 专属参数
+Volterra / RFF / KLMS 专属参数
 ```
 
 这些参数本身不一定绑定某个数据源。
@@ -2918,12 +2923,13 @@ Notebook 共 15 个代码块，按流水线组织为"环境初始化 — 诊断�
 
 #### 第四类：静息段 HR 后处理参数
 
+以下为固定后处理参数，不进入 Optuna 搜索空间。
+静息段谱峰追踪参数（`REST_HR_TRACK_BAND_BPM` / `REST_HR_SLEW_LIMIT_BPM` /
+`REST_HR_SLEW_STEP_BPM`）已进入公共搜索空间，由贝叶斯优化自动选取。
+
 | 参数 | 修改位置 | 说明 |
 |------|----------|------|
 | `REST_HR_BAND_BPM` | 代码块 0 | HR 带通范围(bpm)，默认 (40, 180) |
-| `REST_HR_TRACK_BAND_BPM` | 代码块 0 | 相邻窗口 HR 跟踪带宽(bpm)，默认 30 |
-| `REST_HR_SLEW_LIMIT_BPM` | 代码块 0 | HR 摆率限制(bpm)，默认 4.0 |
-| `REST_HR_SLEW_STEP_BPM` | 代码块 0 | 摆率步长(bpm)，默认 2.0 |
 | `REST_HR_SMOOTH_METHOD` | 代码块 0 | 平滑方法，默认 `"median"` |
 | `REST_HR_SMOOTH_WIN` | 代码块 0 | 平滑窗口大小(帧数)，默认 7 |
 | `REST_HR_PEAK_PERCENT` | 代码块 0 | 峰值检测阈值比例，默认 0.3 |
