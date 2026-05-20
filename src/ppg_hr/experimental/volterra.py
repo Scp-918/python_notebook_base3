@@ -22,7 +22,8 @@ def noncausal_volterra_filter(
     alpha_u: float,
     M2: int,
     mu_min: float = 1e-5,
-) -> np.ndarray:
+    return_diagnostics: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
     """Filter ``d`` with a linear + second-order Volterra adaptive model.
 
     中文说明：
@@ -45,6 +46,12 @@ def noncausal_volterra_filter(
     out = d_arr.copy()
     X, valid_indices = build_noncausal_tap_matrix(u_arr, M, K)
     if valid_indices.size == 0:
+        if return_diagnostics:
+            return out, {
+                "weight_norm_linear_t": np.asarray([], dtype=float),
+                "weight_norm_quadratic_t": np.asarray([], dtype=float),
+                "max_abs_weight_t": np.asarray([], dtype=float),
+            }
         return out
 
     mu1 = _safe_positive(mu1, mu_min)
@@ -62,6 +69,9 @@ def noncausal_volterra_filter(
     w1 = np.zeros(span, dtype=float)
     w2 = np.zeros(q_count, dtype=float)
     eps = 1e-9
+    weight_norm_linear_t: list[float] = []
+    weight_norm_quadratic_t: list[float] = []
+    max_abs_weight_t: list[float] = []
     # 中文注释：二阶 Q 只在当前窗口/级联级内预计算，用完即释放，不跨 trial 缓存。
     for row, idx in enumerate(valid_indices):
         x = X[row]
@@ -72,8 +82,21 @@ def noncausal_volterra_filter(
         w1 += (mu1 / (float(np.dot(x, x)) + eps)) * x * err
         if q.size:
             w2 += (mu2 / (float(np.dot(q, q)) + eps)) * q * err
+        weight_norm_linear_t.append(float(np.linalg.norm(w1)))
+        weight_norm_quadratic_t.append(float(np.linalg.norm(w2)))
+        max_abs = max(
+            float(np.max(np.abs(w1))) if w1.size else 0.0,
+            float(np.max(np.abs(w2))) if w2.size else 0.0,
+        )
+        max_abs_weight_t.append(max_abs)
     del Q
     out[~np.isfinite(out)] = 0.0
+    if return_diagnostics:
+        return out, {
+            "weight_norm_linear_t": np.asarray(weight_norm_linear_t, dtype=float),
+            "weight_norm_quadratic_t": np.asarray(weight_norm_quadratic_t, dtype=float),
+            "max_abs_weight_t": np.asarray(max_abs_weight_t, dtype=float),
+        }
     return out
 
 

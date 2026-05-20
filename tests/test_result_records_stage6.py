@@ -66,7 +66,16 @@ def test_motion_type_outputs_include_stage6_record_files(tmp_path: Path) -> None
         assert (tmp_path / name).exists()
 
     params_df = pd.read_csv(tmp_path / "best_params_and_alignment.csv")
-    assert {"best_params_json", "TW_F", "normalization_mode", "best_tdelay_s"}.issubset(params_df.columns)
+    assert {
+        "best_params_json",
+        "TW_F",
+        "normalization_mode",
+        "best_tdelay_s",
+        "param_TW_F",
+        "param_ppg_input_transform",
+        "param_global_objective_strategy",
+        "param_cascade_guard_policy",
+    }.issubset(params_df.columns)
     assert json.loads(params_df.loc[0, "best_params_json"])["TW_F"] == 1.5
 
     metrics_df = pd.read_csv(tmp_path / "best_metrics.csv")
@@ -84,3 +93,65 @@ def test_motion_type_outputs_include_stage6_record_files(tmp_path: Path) -> None
     assert report["motion_type"] == "tiaosheng"
     assert "fusion_source_distribution" in report
     assert "git_commit_hash" in report
+
+
+def test_flatten_params_for_record_roundtrips_all_protocol_fields() -> None:
+    params = ProtocolTrialParams(
+        TW_F=2.5,
+        ppg_input_transform="log_absorbance",
+        log_absorbance_ratio_clip=(1e-4, 1e4),
+        rff_err_clip=None,
+        klms_normalized_update=True,
+    )
+
+    flat = rbp.flatten_params_for_record(params)
+    restored = rbp.protocol_params_from_record(flat)
+
+    for field in params.to_dict():
+        assert f"param_{field}" in flat
+    assert restored.TW_F == 2.5
+    assert restored.ppg_input_transform == "log_absorbance"
+    assert restored.log_absorbance_ratio_clip == (1e-4, 1e4)
+    assert restored.rff_err_clip is None
+    assert restored.klms_normalized_update is True
+
+
+def test_protocol_params_from_record_prefers_param_columns_over_json() -> None:
+    json_params = ProtocolTrialParams(ppg_input_transform="raw_bandpass", TW=6).to_dict()
+    row = {
+        "best_params_json": json.dumps(json_params),
+        "param_ppg_input_transform": "log_absorbance",
+        "param_TW": 10,
+        "adaptive_filter": "klms",
+    }
+
+    restored = rbp.protocol_params_from_record(row)
+
+    assert restored.ppg_input_transform == "log_absorbance"
+    assert restored.TW == 10
+    assert restored.adaptive_filter == "klms"
+
+
+def test_append_history_includes_params_json_and_param_columns() -> None:
+    history: list[dict[str, object]] = []
+    params = ProtocolTrialParams(ppg_input_transform="log_absorbance", cascade_guard_policy="rms_guard")
+
+    rbp._append_history(
+        history,
+        "tiaosheng",
+        TargetScope.GLOBAL,
+        CascadeScheme.ACC3,
+        "lms",
+        params,
+        repeat_idx=0,
+        trial_idx=1,
+        objective_value=3.0,
+        metrics={"success": True, "final_aae_bpm": 3.0, "final_acc_pct": 90.0},
+        best_so_far=3.0,
+    )
+
+    row = history[0]
+    assert isinstance(row["params"], str)
+    assert json.loads(row["params"])["ppg_input_transform"] == "log_absorbance"
+    assert row["param_ppg_input_transform"] == "log_absorbance"
+    assert row["param_cascade_guard_policy"] == "rms_guard"

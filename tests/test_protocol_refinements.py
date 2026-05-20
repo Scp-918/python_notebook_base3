@@ -296,6 +296,11 @@ def test_cascade_filter_window_records_klms_stage_parameters() -> None:
     assert stages[0]["center_prune_policy"] == "freeze_new_centers"
     assert stages[0]["distance_mode"] == "normalized"
     assert stages[0]["normalized_update"] is True
+    assert "dictionary_size_t" in stages[0]
+    assert "weight_norm_t" in stages[0]
+    assert len(stages[0]["dictionary_size_t"]) > 0
+    assert "cascade_full_output_signal" in stages[0]
+    assert "cascade_guarded_output_signal" in stages[0]
 
 
 def test_rms_guard_rejects_exploded_stage_and_records_reason() -> None:

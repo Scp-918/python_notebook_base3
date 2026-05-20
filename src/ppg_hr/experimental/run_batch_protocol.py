@@ -58,8 +58,10 @@ from .spectral_utils import compute_power_spectrum
 __all__ = [
     "BatchProtocolResult",
     "build_cross_motion_summary_table",
+    "flatten_params_for_record",
     "build_output_run_name",
     "plot_window_diagnostics_from_records",
+    "protocol_params_from_record",
     "replay_best_record_hr_curves",
     "redraw_best_param_hr_curves",
     "run_batch_adaptive_protocol",
@@ -1695,6 +1697,104 @@ def _objective_value(metrics: dict[str, Any], objective_mode: str, penalty_value
     return value if np.isfinite(value) else float(penalty_value)
 
 
+def flatten_params_for_record(params: ProtocolTrialParams, prefix: str = "param_") -> dict[str, Any]:
+    """Flatten ``ProtocolTrialParams`` into stable CSV record columns.
+
+    中文说明：新记录标准入口使用 ``param_*`` 分列；tuple/list/dict 写成 JSON 字符串，
+    None 写成空字符串，读取时由 :func:`protocol_params_from_record` 还原。
+    """
+
+    out: dict[str, Any] = {}
+    for name, value in params.to_dict().items():
+        key = f"{prefix}{name}"
+        if value is None:
+            out[key] = ""
+        elif isinstance(value, (tuple, list, dict)):
+            out[key] = json.dumps(_jsonify(value), ensure_ascii=False, sort_keys=True)
+        else:
+            out[key] = value
+    return out
+
+
+def protocol_params_from_record(row: Any) -> ProtocolTrialParams:
+    """Restore trial params from CSV/Series/dict records.
+
+    中文说明：重绘时优先读取 ``param_*`` 分列；旧输出没有分列时回退
+    ``best_params_json`` 或 ``params`` JSON；再回退旧裸字段列，最后使用 dataclass
+    默认值。若多处冲突，以 ``param_*`` 为准。
+    """
+
+    record = _record_to_dict(row)
+    values: dict[str, Any] = {}
+    for json_column in ("best_params_json", "params"):
+        payload = _parse_stage6_params_json(record.get(json_column, ""))
+        values.update({name: payload[name] for name in _protocol_param_names() if name in payload})
+    for item in fields(ProtocolTrialParams):
+        if item.name in record and not _record_value_missing(record[item.name]):
+            values[item.name] = _coerce_protocol_param_value(record[item.name], item)
+    for item in fields(ProtocolTrialParams):
+        param_name = f"param_{item.name}"
+        if param_name in record and not _record_value_missing(record[param_name]):
+            values[item.name] = _coerce_protocol_param_value(record[param_name], item)
+        elif param_name in record and _record_value_missing(record[param_name]) and item.default is None:
+            values[item.name] = None
+    return ProtocolTrialParams(**values)
+
+
+def _record_to_dict(row: Any) -> dict[str, Any]:
+    """Convert pandas/dict-like records to a plain mapping."""
+
+    if isinstance(row, pd.Series):
+        return row.to_dict()
+    if isinstance(row, dict):
+        return dict(row)
+    if hasattr(row, "items"):
+        return dict(row.items())
+    return {}
+
+
+def _protocol_param_names() -> set[str]:
+    return {item.name for item in fields(ProtocolTrialParams)}
+
+
+def _record_value_missing(value: Any) -> bool:
+    """Return whether a CSV cell should be treated as missing."""
+
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _coerce_protocol_param_value(value: Any, item: Any) -> Any:
+    """Coerce one record value according to the ProtocolTrialParams default."""
+
+    default = item.default
+    if _record_value_missing(value):
+        return None if default is None else default
+    if default is None:
+        text = str(value).strip() if isinstance(value, str) else value
+        if isinstance(text, str) and text.lower() in {"none", "null", "nan"}:
+            return None
+        try:
+            return float(text)
+        except (TypeError, ValueError):
+            return text
+    if isinstance(default, bool):
+        return _parse_bool_param(value)
+    if isinstance(default, int) and not isinstance(default, bool):
+        return int(float(value))
+    if isinstance(default, float):
+        return float(value)
+    if isinstance(default, tuple):
+        return _parse_tuple_param(value, default)
+    return str(value)
+
+
 def _append_history(
     history: list[dict[str, Any]],
     motion_type: str,
@@ -1710,28 +1810,28 @@ def _append_history(
     fold_id: int | None = None,
     heldout_group_id: str = "",
 ) -> None:
-    history.append(
-        {
-            "fold_id": "" if fold_id is None else int(fold_id),
-            "heldout_group_id": str(heldout_group_id),
-            "motion_type": motion_type,
-            "target_scope": scope.value,
-            "cascade_scheme": scheme.value,
-            "adaptive_filter": adaptive_filter,
-            "repeat_idx": int(repeat_idx),
-            "trial_idx": int(trial_idx),
-            "objective_value": float(objective_value),
-            "aae_bpm": float(metrics.get("adaptive_aae_bpm", float("nan"))),
-            "accuracy_pct": float(metrics.get("adaptive_acc_pct", float("nan"))),
-            "final_aae_bpm": float(metrics.get("final_aae_bpm", float("nan"))),
-            "final_acc_pct": float(metrics.get("final_acc_pct", float("nan"))),
-            "best_so_far": float(best_so_far),
-            "success": bool(metrics.get("success", False)),
-            "reason": str(metrics.get("reason", "")),
-            "rff_seed": int(getattr(params, "rff_seed", 0)),
-            "params": params.to_dict(),
-        }
-    )
+    row = {
+        "fold_id": "" if fold_id is None else int(fold_id),
+        "heldout_group_id": str(heldout_group_id),
+        "motion_type": motion_type,
+        "target_scope": scope.value,
+        "cascade_scheme": scheme.value,
+        "adaptive_filter": adaptive_filter,
+        "repeat_idx": int(repeat_idx),
+        "trial_idx": int(trial_idx),
+        "objective_value": float(objective_value),
+        "aae_bpm": float(metrics.get("adaptive_aae_bpm", float("nan"))),
+        "accuracy_pct": float(metrics.get("adaptive_acc_pct", float("nan"))),
+        "final_aae_bpm": float(metrics.get("final_aae_bpm", float("nan"))),
+        "final_acc_pct": float(metrics.get("final_acc_pct", float("nan"))),
+        "best_so_far": float(best_so_far),
+        "success": bool(metrics.get("success", False)),
+        "reason": str(metrics.get("reason", "")),
+        "rff_seed": int(getattr(params, "rff_seed", 0)),
+        "params": json.dumps(_jsonify(params.to_dict()), ensure_ascii=False, sort_keys=True),
+    }
+    row.update(flatten_params_for_record(params))
+    history.append(row)
 
 
 def _emit_trial_progress(
@@ -1948,7 +2048,7 @@ def _write_stage6_record_files(
 def _best_params_alignment_record(result: _ModeOptimisation) -> dict[str, Any]:
     params = result.best_params
     metrics = result.test_metrics
-    return {
+    row = {
         "motion_type": result.motion_type,
         "split": _result_split_name(result),
         "mode": result.data_split_mode,
@@ -1975,6 +2075,8 @@ def _best_params_alignment_record(result: _ModeOptimisation) -> dict[str, Any]:
         "adaptive_aae_bpm": metrics.get("adaptive_aae_bpm"),
         "adaptive_acc_pct": metrics.get("adaptive_acc_pct"),
     }
+    row.update(flatten_params_for_record(params))
+    return row
 
 
 def _best_metrics_record(result: _ModeOptimisation) -> dict[str, Any]:
@@ -2010,7 +2112,7 @@ def _best_metrics_record(result: _ModeOptimisation) -> dict[str, Any]:
 
 def _motion_frequency_params_record(result: _ModeOptimisation) -> dict[str, Any]:
     params = result.best_params
-    return {
+    row = {
         "motion_type": result.motion_type,
         "split": _result_split_name(result),
         "mode": result.data_split_mode,
@@ -2029,6 +2131,8 @@ def _motion_frequency_params_record(result: _ModeOptimisation) -> dict[str, Any]
         "Spec_Penalty_Weight": float(params.Spec_Penalty_Weight),
         "reference_channel_ranking_summary": result.test_metrics.get("reference_channel_ranking_summary", ""),
     }
+    row.update(flatten_params_for_record(params))
+    return row
 
 
 def _best_params_alignment_columns() -> list[str]:
@@ -2040,6 +2144,7 @@ def _best_params_alignment_columns() -> list[str]:
         "no_posthoc_final_aae_bpm", "no_posthoc_final_acc_pct",
         "posthoc_final_aae_bpm", "posthoc_final_acc_pct",
         "baseline_aae_bpm", "baseline_acc_pct", "adaptive_aae_bpm", "adaptive_acc_pct",
+        *_param_record_columns(),
     ]
 
 
@@ -2060,6 +2165,7 @@ def _motion_frequency_params_columns() -> list[str]:
         "cascade_scheme", "adaptive_filter", "adaptive_data_type", "TW", "TW_F",
         "max_order", "M_base", "C_scale", "K_max",
         "Spec_Penalty_Width", "Spec_Penalty_Weight", "reference_channel_ranking_summary",
+        *_param_record_columns(),
     ]
 
 
@@ -2143,7 +2249,7 @@ def _summary_row(result: _ModeOptimisation) -> dict[str, Any]:
 
 
 def _best_param_row(result: _ModeOptimisation) -> dict[str, Any]:
-    return {**_summary_row(result), **result.best_params.to_dict()}
+    return {**_summary_row(result), **result.best_params.to_dict(), **flatten_params_for_record(result.best_params)}
 
 
 def _best_param_columns() -> list[str]:
@@ -2151,7 +2257,13 @@ def _best_param_columns() -> list[str]:
 
     summary_cols = _summary_columns()
     param_cols = [item.name for item in fields(ProtocolTrialParams) if item.name not in summary_cols]
-    return [*summary_cols, *param_cols]
+    return [*summary_cols, *param_cols, *_param_record_columns()]
+
+
+def _param_record_columns() -> list[str]:
+    """Return stable ``param_*`` columns for all ProtocolTrialParams fields."""
+
+    return [f"param_{item.name}" for item in fields(ProtocolTrialParams)]
 
 
 def _summary_columns() -> list[str]:
@@ -2655,25 +2767,8 @@ def _params_from_best_csv(
         fold_id=fold_id,
         heldout_group_id=heldout_group_id,
     )
-
-    values: dict[str, Any] = {}
-    for item in fields(ProtocolTrialParams):
-        if item.name not in row or pd.isna(row[item.name]):
-            continue
-        default = item.default
-        value = row[item.name]
-        if isinstance(default, bool):
-            values[item.name] = _parse_bool_param(value)
-        elif isinstance(default, int):
-            values[item.name] = int(value)
-        elif isinstance(default, float):
-            values[item.name] = float(value)
-        elif isinstance(default, tuple):
-            values[item.name] = _parse_tuple_param(value, default)
-        else:
-            values[item.name] = str(value)
-    values["adaptive_filter"] = adaptive_filter
-    return ProtocolTrialParams(**values)
+    params = protocol_params_from_record(row)
+    return replace(params, adaptive_filter=adaptive_filter)
 
 
 def _parse_bool_param(value: Any) -> bool:
@@ -3219,6 +3314,7 @@ def plot_window_diagnostics_from_records(
         )
     waveform_path = out_dir / f"window_waveform_{label}.png"
     spectrum_path = out_dir / f"window_spectrum_{label}.png"
+    weights_path = out_dir / f"window_weights_{label}.png"
     _plot_window_waveform_diagnostic(
         waveform_path,
         time_s=raw_time,
@@ -3241,9 +3337,15 @@ def plot_window_diagnostics_from_records(
         penalty_ref_channel=penalty_ref_channel,
         title=f"{motion_type} spectrum | start {aligned_fft_start_s:g}s",
     )
+    _plot_window_weight_diagnostic(
+        weights_path,
+        stages=stages,
+        title=f"{motion_type} weights | {params.adaptive_filter} | start {aligned_fft_start_s:g}s",
+    )
     return {
         "waveform": waveform_path,
         "spectrum": spectrum_path,
+        "weights": weights_path,
         "stages": stages,
         "window": row.to_dict(),
         "best_params": params.to_dict(),
@@ -3369,9 +3471,10 @@ def _diagnostic_filtered_signal(stages: list[dict[str, Any]], raw_ppg: np.ndarra
     """Return the final stage output if present, otherwise a raw-signal fallback."""
 
     for stage in reversed(stages):
-        if "output_signal" not in stage:
+        signal_key = "cascade_guarded_output_signal" if "cascade_guarded_output_signal" in stage else "output_signal"
+        if signal_key not in stage:
             continue
-        values = np.asarray(stage.get("output_signal"), dtype=float)
+        values = np.asarray(stage.get(signal_key), dtype=float)
         if values.size:
             return _align_signal_to_context(values, len(raw_ppg))
     return np.asarray(raw_ppg, dtype=float)
@@ -3456,6 +3559,18 @@ def _plot_window_waveform_diagnostic(
             alpha=0.62,
             label=f"stage {idx}: {stage.get('channel', '')}",
         )
+        if "cascade_full_output_signal" in stage:
+            full_values = _align_signal_to_context(
+                np.asarray(stage["cascade_full_output_signal"], dtype=float),
+                len(time_s),
+            )
+            ax_left.plot(time_s, full_values, color=color, lw=0.75, alpha=0.35, linestyle="--", label=f"完整级联 {idx}")
+        if "cascade_guarded_output_signal" in stage:
+            guarded_values = _align_signal_to_context(
+                np.asarray(stage["cascade_guarded_output_signal"], dtype=float),
+                len(time_s),
+            )
+            ax_left.plot(time_s, guarded_values, color=color, lw=1.1, alpha=0.75, linestyle="-.", label=f"guard 后实际使用 {idx}")
     ax_right.plot(time_s, filtered, color="#2ca02c", lw=1.6, label="PPG after final adaptive")
     ax_left.set_title(title)
     ax_left.set_xlabel("Aligned time (s)")
@@ -3464,6 +3579,46 @@ def _plot_window_waveform_diagnostic(
     ax_left.grid(True, alpha=0.25)
     ax_left.legend(loc="upper left", fontsize=8)
     ax_right.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def _plot_window_weight_diagnostic(
+    out_path: Path,
+    *,
+    stages: list[dict[str, Any]],
+    title: str,
+) -> None:
+    """Plot compact per-stage weight/dictionary diagnostics when present."""
+
+    plt = _prepare_matplotlib(out_path)
+    fig, ax = plt.subplots(figsize=(9, 3.8))
+    plotted = False
+    keys = (
+        "weight_norm_t",
+        "weight_norm_linear_t",
+        "weight_norm_quadratic_t",
+        "theta_norm_t",
+        "dictionary_size_t",
+    )
+    for stage_idx, stage in enumerate(stages, start=1):
+        channel = str(stage.get("channel", ""))
+        for key in keys:
+            if key not in stage:
+                continue
+            values = np.asarray(stage.get(key), dtype=float).ravel()
+            if values.size == 0:
+                continue
+            ax.plot(np.arange(values.size, dtype=float), values, lw=1.0, label=f"stage {stage_idx} {channel} {key}")
+            plotted = True
+    if not plotted:
+        ax.plot(np.asarray([0.0]), np.asarray([0.0]), lw=1.0, label="no weight diagnostics")
+    ax.set_title(title)
+    ax.set_xlabel("diagnostic sample")
+    ax.set_ylabel("norm / size")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="upper left", fontsize=7)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -3794,17 +3949,9 @@ def _params_from_stage6_record(
     adaptive_filter: str,
     TW_F: float | None,
 ) -> ProtocolTrialParams:
-    """Restore ProtocolTrialParams from a Stage-6 best_params JSON row."""
+    """Restore ProtocolTrialParams from a Stage-6 record using param columns first."""
 
-    payload = _parse_stage6_params_json(row.get("best_params_json", "{}"))
-    valid_names = {item.name for item in fields(ProtocolTrialParams)}
-    values = {name: payload[name] for name in valid_names if name in payload}
-    for name in ("TW", "TW_F", "Fs_Target", "normalization_mode"):
-        if name in row.index and name not in values:
-            value = row.get(name)
-            if pd.notna(value):
-                values[name] = value
-    params = ProtocolTrialParams(**values)
+    params = protocol_params_from_record(row)
     row_filter = _stage6_row_text(row, "adaptive_filter")
     fixed_filter = adaptive_filter or row_filter or params.adaptive_filter
     fixed_tw_f = float(TW_F) if TW_F is not None else float(getattr(params, "TW_F", 0.0))

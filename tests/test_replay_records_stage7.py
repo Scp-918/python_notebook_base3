@@ -114,3 +114,21 @@ def test_replay_best_record_hr_curves_reads_stage6_records_without_training(
     assert "tiaosheng_lms_ACC3_TW_F0s_motion_only" in paths["plot"].name
     out = pd.read_csv(paths["csv"])
     assert {"baseline_hr_bpm", "adaptive_hr_bpm", "final_hr_bpm", "reference_hr_bpm"}.issubset(out.columns)
+
+
+def test_stage6_record_params_restore_prefers_param_columns() -> None:
+    base = ProtocolTrialParams(TW=6, ppg_input_transform="raw_bandpass")
+    row = pd.Series(
+        {
+            "best_params_json": json.dumps(base.to_dict()),
+            "param_TW": 10,
+            "param_ppg_input_transform": "log_absorbance",
+            "adaptive_filter": "rff_lms",
+        }
+    )
+
+    params = rbp._params_from_stage6_record(row, adaptive_filter="", TW_F=None)
+
+    assert params.TW == 10
+    assert params.ppg_input_transform == "log_absorbance"
+    assert params.adaptive_filter == "rff_lms"

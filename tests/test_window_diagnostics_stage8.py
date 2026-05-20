@@ -163,6 +163,8 @@ def test_window_diagnostics_from_records_plots_selected_fft_window_and_stages(
             "penalty_ref_channel": "accx",
             "reference_channel_ranking": {"ACC": ["accx", "accy", "accz"]},
             "output_signal": [0.2, 0.1, 0.0],
+            "weight_norm_t": [0.0, 0.2, 0.3],
+            "max_abs_weight_t": [0.0, 0.1, 0.15],
         }
     ]
     frame = pd.DataFrame(
@@ -235,6 +237,7 @@ def test_window_diagnostics_from_records_plots_selected_fft_window_and_stages(
     assert call_kwargs["collect_stages"] is True
     assert paths["waveform"].exists()
     assert paths["spectrum"].exists()
+    assert paths["weights"].exists()
     assert len(paths["stages"]) == 1
     assert paths["stages"][0]["reference_channel_ranking"]["ACC"][0] == "accx"
     assert paths["best_params"]["TW_F"] == 1.0

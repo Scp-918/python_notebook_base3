@@ -94,7 +94,8 @@ def noncausal_lms_filter(
     M: int,
     K: int,
     mu: float,
-) -> np.ndarray:
+    return_diagnostics: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
     """Filter ``d`` using reference ``u`` with ``K`` future taps.
 
     中文说明：输入向量从 ``u[n+K]`` 取到 ``u[n-M+1]``。边界处无法构造完整向量的
@@ -114,12 +115,16 @@ def noncausal_lms_filter(
     out = d_arr.copy()
     X, valid_indices = build_noncausal_tap_matrix(u_arr, M, K)
     if valid_indices.size == 0:
+        if return_diagnostics:
+            return out, {"weight_norm_t": np.asarray([], dtype=float), "max_abs_weight_t": np.asarray([], dtype=float)}
         return out
 
     span = X.shape[1]
     w = np.zeros(span, dtype=float)
     mu = float(mu)
     eps = 1e-9
+    weight_norm_t: list[float] = []
+    max_abs_weight_t: list[float] = []
     # 中文注释：tap 矩阵已一次性构造；权重更新仍按时间递推，保持 NLMS 语义不变。
     for idx, uvec in zip(valid_indices, X, strict=True):
         y = float(np.dot(w, uvec))
@@ -127,6 +132,13 @@ def noncausal_lms_filter(
         out[idx] = err
         denom = float(np.dot(uvec, uvec) + eps)
         w += (mu / denom) * uvec * err
+        weight_norm_t.append(float(np.linalg.norm(w)))
+        max_abs_weight_t.append(float(np.max(np.abs(w))) if w.size else 0.0)
+    if return_diagnostics:
+        return out, {
+            "weight_norm_t": np.asarray(weight_norm_t, dtype=float),
+            "max_abs_weight_t": np.asarray(max_abs_weight_t, dtype=float),
+        }
     return out
 
 

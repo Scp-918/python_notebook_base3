@@ -1229,20 +1229,26 @@ def _cascade_filter_window(
             design = map_delay_to_lms_params(delay, sensor_type, params, fs)
             filter_type = str(getattr(params, "adaptive_filter", "lms"))
             stage_extra: dict[str, Any] = {}
+            stage_diagnostics: dict[str, Any] = {}
             stage_mu = float(design.u)
             before_stage = np.asarray(current, dtype=float).copy()
             if filter_type == "lms":
-                current = noncausal_lms_filter(
+                lms_result = noncausal_lms_filter(
                     window[channel],
                     current,
                     M=design.M,
                     K=design.K,
                     mu=design.u,
+                    return_diagnostics=bool(collect_stages),
                 )
+                if collect_stages:
+                    current, stage_diagnostics = lms_result
+                else:
+                    current = lms_result
             elif filter_type == "volterra":
                 alpha_u = float(getattr(params, "alpha_u", 0.1))
                 M2 = int(getattr(params, "M2", 3))
-                current = noncausal_volterra_filter(
+                volterra_result = noncausal_volterra_filter(
                     window[channel],
                     current,
                     M=design.M,
@@ -1251,7 +1257,12 @@ def _cascade_filter_window(
                     alpha_u=alpha_u,
                     M2=M2,
                     mu_min=float(getattr(params, "LMS_Mu_Min", 1e-6)),
+                    return_diagnostics=bool(collect_stages),
                 )
+                if collect_stages:
+                    current, stage_diagnostics = volterra_result
+                else:
+                    current = volterra_result
                 stage_extra.update(
                     {
                         "alpha_u": alpha_u,
@@ -1269,7 +1280,7 @@ def _cascade_filter_window(
                 rff_leakage = float(getattr(params, "rff_leakage", 0.0))
                 rff_err_clip = getattr(params, "rff_err_clip", None)
                 rff_theta_norm_guard = getattr(params, "rff_theta_norm_guard", None)
-                current = noncausal_rff_lms_filter(
+                rff_result = noncausal_rff_lms_filter(
                     window[channel],
                     current,
                     M=design.M,
@@ -1284,8 +1295,12 @@ def _cascade_filter_window(
                     leakage=rff_leakage,
                     err_clip=rff_err_clip,
                     theta_norm_guard=rff_theta_norm_guard,
-                    return_diagnostics=False,
+                    return_diagnostics=bool(collect_stages),
                 )
+                if collect_stages:
+                    current, stage_diagnostics = rff_result
+                else:
+                    current = rff_result
                 stage_extra.update(
                     {
                         "D": rff_D,
@@ -1308,7 +1323,7 @@ def _cascade_filter_window(
                 klms_normalized_update = bool(getattr(params, "klms_normalized_update", True))
                 klms_nlms_eps = float(getattr(params, "klms_nlms_eps", 1e-6))
                 stage_mu = klms_step_size
-                current = noncausal_klms_filter(
+                klms_result = noncausal_klms_filter(
                     window[channel],
                     current,
                     M=design.M,
@@ -1321,8 +1336,12 @@ def _cascade_filter_window(
                     distance_mode=klms_distance_mode,
                     normalized_update=klms_normalized_update,
                     nlms_eps=klms_nlms_eps,
-                    return_diagnostics=False,
+                    return_diagnostics=bool(collect_stages),
                 )
+                if collect_stages:
+                    current, stage_diagnostics = klms_result
+                else:
+                    current = klms_result
                 stage_extra.update(
                     {
                         "klms_step_size": klms_step_size,
@@ -1338,8 +1357,13 @@ def _cascade_filter_window(
             else:
                 raise ValueError(f"Unsupported adaptive_filter: {filter_type}")
 
+            full_stage_output = np.asarray(current, dtype=float).copy()
             current, guard_record = _evaluate_cascade_rms_guard(before_stage, current, params)
             stage_extra.update(guard_record)
+            if collect_stages:
+                stage_extra.update(_compact_stage_diagnostics(stage_diagnostics))
+                stage_extra["cascade_full_output_signal"] = full_stage_output.round(8).tolist()
+                stage_extra["cascade_guarded_output_signal"] = np.asarray(current, dtype=float).round(8).tolist()
 
             if collect_stages:
                 stages.append(
@@ -1456,6 +1480,29 @@ def _finite_zscore_for_guard(values: np.ndarray) -> np.ndarray:
     mean = float(np.mean(arr[finite]))
     arr[~finite] = mean
     return arr
+
+
+def _compact_stage_diagnostics(diagnostics: dict[str, Any], max_points: int = 200) -> dict[str, Any]:
+    """Convert filter diagnostics to JSON-friendly short arrays.
+
+    中文说明：只在 ``collect_stages=True`` 的回放/诊断路径写入，训练轻量路径不会
+    生成这些序列；过长序列做等距降采样，避免 stage JSON 膨胀。
+    """
+
+    out: dict[str, Any] = {}
+    for key, value in diagnostics.items():
+        if isinstance(value, np.ndarray):
+            arr = np.asarray(value, dtype=float).ravel()
+            arr[~np.isfinite(arr)] = 0.0
+            if arr.size > max_points:
+                idx = np.linspace(0, arr.size - 1, int(max_points)).round().astype(int)
+                arr = arr[idx]
+            out[key] = arr.round(8).tolist()
+        elif isinstance(value, (np.integer, np.floating)):
+            out[key] = value.item()
+        else:
+            out[key] = value
+    return out
 
 
 def _scheme_plan(scheme: CascadeScheme) -> list[tuple[str, int]]:
