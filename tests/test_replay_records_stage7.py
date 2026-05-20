@@ -12,6 +12,55 @@ from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams
 from ppg_hr.params import CascadeScheme, TargetScope
 
 
+class _FakeAxes:
+    def __init__(self) -> None:
+        self.title = ""
+
+    def plot(self, *args, **kwargs):
+        return []
+
+    def axvspan(self, *args, **kwargs):
+        return None
+
+    def set_title(self, title, *args, **kwargs):
+        self.title = str(title)
+        return None
+
+    def set_xlabel(self, *args, **kwargs):
+        return None
+
+    def set_ylabel(self, *args, **kwargs):
+        return None
+
+    def grid(self, *args, **kwargs):
+        return None
+
+    def legend(self, *args, **kwargs):
+        return None
+
+
+class _FakeFigure:
+    def __init__(self, axes: _FakeAxes) -> None:
+        self.axes = axes
+
+    def tight_layout(self):
+        return None
+
+    def savefig(self, out_path, *args, **kwargs):
+        Path(out_path).write_bytes(b"fake-png")
+
+
+class _FakePyplot:
+    def __init__(self) -> None:
+        self.axes = _FakeAxes()
+
+    def subplots(self, *args, **kwargs):
+        return _FakeFigure(self.axes), self.axes
+
+    def close(self, fig):
+        return None
+
+
 def test_replay_best_record_hr_curves_reads_stage6_records_without_training(
     tmp_path: Path,
     monkeypatch,
@@ -130,6 +179,57 @@ def test_replay_best_record_hr_curves_reads_stage6_records_without_training(
     assert "tiaosheng_lms_ACC3_TW_F0s_motion_only" in paths["plot_guarded"].name
     out = pd.read_csv(paths["csv_guarded"])
     assert {"baseline_hr_bpm", "adaptive_hr_bpm", "final_hr_bpm", "reference_hr_bpm"}.issubset(out.columns)
+
+
+def test_replay_hr_curve_title_includes_final_aae_and_accuracy(tmp_path: Path, monkeypatch) -> None:
+    fake_plt = _FakePyplot()
+    monkeypatch.setattr(rbp, "_prepare_matplotlib", lambda out_path: fake_plt)
+    time_s = np.arange(4, dtype=float)
+    zeros = np.zeros_like(time_s)
+    dataset = ProtocolDataset(
+        sample_stem="multi_tiaosheng1",
+        fs=1,
+        time_s=time_s,
+        ppg_green=zeros,
+        ppg_red=zeros,
+        ppg_ir=zeros,
+        hf1=zeros,
+        hf2=zeros,
+        cf1=zeros,
+        cf2=zeros,
+        accx=zeros,
+        accy=zeros,
+        accz=zeros,
+        gyrox=zeros,
+        gyroy=zeros,
+        gyroz=zeros,
+        ref_time_s=time_s,
+        ref_hr_bpm=np.array([70.0, 80.0, 90.0, 100.0]),
+    )
+    frame = pd.DataFrame(
+        {
+            "time_s": time_s,
+            "reference_hr_bpm": [70.0, 80.0, 90.0, 100.0],
+            "baseline_hr_bpm": [70.0, 80.0, 90.0, 100.0],
+            "adaptive_hr_bpm": [70.0, 86.0, 91.0, 102.0],
+            "final_hr_bpm": [70.0, 86.0, 91.0, 102.0],
+            "segment_label": ["rest", "motion", "motion", "recovery"],
+        }
+    )
+
+    rbp._plot_replay_hr_curves(
+        tmp_path / "replay.png",
+        dataset=dataset,
+        frame=frame,
+        motion_type="tiaosheng",
+        scope=TargetScope.MOTION_ONLY,
+        scheme=CascadeScheme.ACC3,
+        params=ProtocolTrialParams(TW_F=0.0, adaptive_filter="lms"),
+        title_prefix="ACC3 | guarded",
+    )
+
+    assert "final AAE=2.25 bpm" in fake_plt.axes.title
+    assert "final accuracy=75.0%" in fake_plt.axes.title
 
 
 def test_stage6_record_params_restore_prefers_param_columns() -> None:

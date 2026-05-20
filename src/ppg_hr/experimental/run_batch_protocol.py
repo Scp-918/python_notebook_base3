@@ -4172,8 +4172,10 @@ def _plot_replay_hr_curves(
     ax.plot(time_s, frame["final_hr_bpm"], color="#2ca02c", lw=1.6, marker="o", ms=3, label="final")
     _shade_replay_segments(ax, frame)
     prefix = title_prefix if title_prefix else scheme.value
+    metrics_title = _replay_final_metrics_title(frame)
     ax.set_title(
-        f"{motion_type} | {params.adaptive_filter} | {prefix} | {scope.value} | {_tw_f_run_label(params.TW_F)}"
+        f"{motion_type} | {params.adaptive_filter} | {prefix} | {scope.value} | "
+        f"{_tw_f_run_label(params.TW_F)} | {metrics_title}"
     )
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("HR (bpm)")
@@ -4182,6 +4184,22 @@ def _plot_replay_hr_curves(
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
+
+
+def _replay_final_metrics_title(frame: pd.DataFrame) -> str:
+    """Return compact final-HR AAE/accuracy text for replay plot titles."""
+
+    if "reference_hr_bpm" not in frame.columns or "final_hr_bpm" not in frame.columns:
+        return "final AAE=n/a | final accuracy=n/a"
+    reference = pd.to_numeric(frame["reference_hr_bpm"], errors="coerce").to_numpy(dtype=float)
+    final = pd.to_numeric(frame["final_hr_bpm"], errors="coerce").to_numpy(dtype=float)
+    mask = np.isfinite(reference) & np.isfinite(final)
+    if not mask.any():
+        return "final AAE=n/a | final accuracy=n/a"
+    abs_err = np.abs(final[mask] - reference[mask])
+    aae_bpm = float(np.mean(abs_err))
+    acc_pct = _accuracy_from_abs_err(abs_err)
+    return f"final AAE={aae_bpm:.2f} bpm | final accuracy={acc_pct:.1f}%"
 
 
 def _shade_replay_segments(ax: Any, frame: pd.DataFrame) -> None:
