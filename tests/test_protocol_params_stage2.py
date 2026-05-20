@@ -9,16 +9,62 @@ from ppg_hr.params import CascadeScheme, ProtocolSearchParams, TargetScope
 
 
 def test_fixed_trial_params_roundtrip_and_stay_out_of_search_space() -> None:
-    params = ProtocolTrialParams(TW_F=2.5, normalization_mode="zscore", qc_policy="drop")
+    params = ProtocolTrialParams(
+        TW_F=2.5,
+        normalization_mode="zscore",
+        qc_policy="drop",
+        rff_update_mode="nlms",
+        klms_center_prune_policy="freeze_new_centers",
+    )
     clone = ProtocolTrialParams(**params.to_dict())
     space = ProtocolSearchParams()
 
     assert clone.TW_F == 2.5
     assert clone.normalization_mode == "zscore"
     assert clone.qc_policy == "drop"
+    assert clone.rff_update_mode == "nlms"
+    assert clone.klms_center_prune_policy == "freeze_new_centers"
     assert "TW_F" not in space.names_for_filter("lms")
     assert "normalization_mode" not in space.names_for_filter("volterra")
     assert "qc_policy" not in space.names_for_filter("rff_lms")
+    for fixed_name in (
+        "smooth_win_len",
+        "Rest_HR_Track_Band_BPM",
+        "Rest_HR_Slew_Limit_BPM",
+        "Rest_HR_Slew_Step_BPM",
+        "rff_update_mode",
+        "klms_max_dictionary_size",
+    ):
+        assert fixed_name not in space.names_for_filter("lms")
+
+
+def test_stage1_search_space_uses_stabilized_candidate_lists() -> None:
+    space = ProtocolSearchParams()
+
+    assert space.options("Fs_Target") == [25, 50]
+    assert space.options("LMS_Mu_Base") == [0.004, 0.006, 0.008]
+    assert space.options("alpha_u") == [0.005, 0.01, 0.03, 0.05, 0.1]
+    assert space.options("M2") == [2, 3]
+    assert space.options("RFF_LMS_Mu_Base") == [0.001, 0.002, 0.004, 0.006]
+    assert space.options("rff_D") == [50, 100, 200]
+    assert space.options("rff_sigma") == [0.5, 1.0, 2.0, 5.0]
+    assert space.options("klms_step_size") == [0.005, 0.01, 0.02, 0.05]
+    assert space.options("klms_sigma") == [0.5, 1.0, 2.0, 5.0]
+    assert space.options("klms_epsilon") == [0.005, 0.01, 0.02, 0.05, 0.1]
+
+
+def test_stage1_fixed_rest_params_remain_overrideable() -> None:
+    params = ProtocolTrialParams(
+        smooth_win_len=7,
+        Rest_HR_Track_Band_BPM=30.0,
+        Rest_HR_Slew_Limit_BPM=6.0,
+        Rest_HR_Slew_Step_BPM=4.0,
+    )
+
+    assert params.smooth_win_len == 7
+    assert params.Rest_HR_Track_Band_BPM == 30.0
+    assert params.Rest_HR_Slew_Limit_BPM == 6.0
+    assert params.Rest_HR_Slew_Step_BPM == 4.0
 
 
 def test_klms_has_independent_search_parameters_and_is_batch_selectable() -> None:
@@ -34,9 +80,9 @@ def test_klms_has_independent_search_parameters_and_is_batch_selectable() -> Non
     assert "rff_sigma" not in names
     assert "alpha_u" not in names
     assert "M2" not in names
-    assert space.options("klms_step_size") == [0.01, 0.05, 0.1, 0.2, 0.5]
-    assert space.options("klms_sigma") == [0.1, 0.5, 1.0, 2.0, 5.0]
-    assert space.options("klms_epsilon") == [0.01, 0.05, 0.1, 0.2]
+    assert space.options("klms_step_size") == [0.005, 0.01, 0.02, 0.05]
+    assert space.options("klms_sigma") == [0.5, 1.0, 2.0, 5.0]
+    assert space.options("klms_epsilon") == [0.005, 0.01, 0.02, 0.05, 0.1]
 
 
 def test_decode_klms_search_space_writes_filter_specific_values() -> None:
@@ -48,9 +94,9 @@ def test_decode_klms_search_space_writes_filter_specific_values() -> None:
 
     assert params.adaptive_filter == "klms"
     assert params.objective_mode == "accuracy"
-    assert params.klms_step_size == 0.1
-    assert params.klms_sigma == 2.0
-    assert params.klms_epsilon == 0.05
+    assert params.klms_step_size == 0.02
+    assert params.klms_sigma == 5.0
+    assert params.klms_epsilon == 0.01
 
 
 def test_target_scope_global_aliases_use_canonical_global_value() -> None:

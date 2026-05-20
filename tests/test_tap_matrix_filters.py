@@ -189,12 +189,107 @@ def test_vectorized_filters_match_reference_loops() -> None:
             atol=1e-12,
         )
         np.testing.assert_allclose(
-            noncausal_rff_lms_filter(u, d, M, K, 0.008, D=32, sigma=1.5, rff_seed=77),
+            noncausal_rff_lms_filter(u, d, M, K, 0.008, D=32, sigma=1.5, rff_seed=77, update_mode="lms"),
             _ref_rff(u, d, M, K, 0.008, D=32, sigma=1.5, rff_seed=77),
             atol=1e-12,
         )
         np.testing.assert_allclose(
-            noncausal_klms_filter(u, d, M, K, step_size=0.05, sigma=1.5, epsilon=0.1),
+            noncausal_klms_filter(
+                u,
+                d,
+                M,
+                K,
+                step_size=0.05,
+                sigma=1.5,
+                epsilon=0.1,
+                max_dictionary_size=10_000,
+                distance_mode="absolute_squared",
+                normalized_update=False,
+            ),
             _ref_klms(u, d, M, K, mu=0.05, sigma=1.5, epsilon=0.1),
             atol=1e-12,
         )
+
+
+def test_rff_lms_default_nlms_stays_finite_and_reports_diagnostics() -> None:
+    rng = np.random.default_rng(2026)
+    u = rng.normal(size=256)
+    d = rng.normal(size=256)
+
+    out, diagnostics = noncausal_rff_lms_filter(
+        u,
+        d,
+        M=8,
+        K=4,
+        mu=5.0,
+        D=64,
+        sigma=1.0,
+        rff_seed=13,
+        err_clip=5.0,
+        theta_norm_guard=25.0,
+        return_diagnostics=True,
+    )
+
+    assert np.all(np.isfinite(out))
+    assert "theta_norm_t" in diagnostics
+    assert "max_abs_theta_t" in diagnostics
+    assert diagnostics["theta_norm_t"].shape[0] > 0
+    assert diagnostics["guard_triggered_count"] >= 0
+    assert diagnostics["err_clip_count"] >= 0
+
+
+def test_klms_default_limits_dictionary_and_reports_diagnostics() -> None:
+    rng = np.random.default_rng(2027)
+    u = rng.normal(size=192)
+    d = rng.normal(size=192)
+
+    out, diagnostics = noncausal_klms_filter(
+        u,
+        d,
+        M=6,
+        K=2,
+        step_size=1.0,
+        sigma=1.0,
+        epsilon=0.005,
+        max_dictionary_size=12,
+        center_prune_policy="freeze_new_centers",
+        return_diagnostics=True,
+    )
+
+    assert np.all(np.isfinite(out))
+    assert int(np.max(diagnostics["dictionary_size_t"])) <= 12
+    assert diagnostics["max_dictionary_reached_count"] > 0
+    assert diagnostics["prune_count"] == 0
+
+
+def test_klms_normalized_distance_differs_from_absolute_squared_threshold() -> None:
+    rng = np.random.default_rng(2028)
+    u = rng.normal(size=96)
+    d = rng.normal(size=96)
+
+    _, normalized = noncausal_klms_filter(
+        u,
+        d,
+        M=8,
+        K=4,
+        step_size=0.05,
+        sigma=1.0,
+        epsilon=0.1,
+        distance_mode="normalized",
+        normalized_update=True,
+        return_diagnostics=True,
+    )
+    _, absolute = noncausal_klms_filter(
+        u,
+        d,
+        M=8,
+        K=4,
+        step_size=0.05,
+        sigma=1.0,
+        epsilon=0.1,
+        distance_mode="absolute_squared",
+        normalized_update=True,
+        return_diagnostics=True,
+    )
+
+    assert int(normalized["dictionary_size_t"][-1]) <= int(absolute["dictionary_size_t"][-1])

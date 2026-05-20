@@ -76,7 +76,7 @@ class ProtocolSearchParams:
     由 ``names_for_filter`` 动态选择，避免 LMS 误采样 RFF 或 Volterra 参数。
     """
 
-    Fs_Target: list[int] = field(default_factory=lambda: [25, 50, 100])
+    Fs_Target: list[int] = field(default_factory=lambda: [25, 50])
     TW: list[int] = field(default_factory=lambda: [6, 8, 10])
     Kstop: list[float] = field(default_factory=lambda: [0.2, 0.3, 0.5])
     max_order: list[int] = field(default_factory=lambda: [8, 12, 16, 20])
@@ -99,15 +99,15 @@ class ProtocolSearchParams:
     Rest_HR_Slew_Step_BPM: list[float] = field(
         default_factory=lambda: [0.5, 2.0, 4.0, 5.0, 8.0, 12.0]
     )
-    LMS_Mu_Base: list[float] = field(default_factory=lambda: [0.008, 0.01, 0.012])
-    RFF_LMS_Mu_Base: list[float] = field(default_factory=lambda: [0.006, 0.008, 0.01])
-    alpha_u: list[float] = field(default_factory=lambda: [0.01, 0.05, 0.1, 0.2])
-    M2: list[int] = field(default_factory=lambda: [2, 3, 4, 5])
-    rff_D: list[int] = field(default_factory=lambda: [50, 100, 200, 300])
-    rff_sigma: list[float] = field(default_factory=lambda: [0.1, 0.5, 1.0, 2.0, 5.0])
-    klms_step_size: list[float] = field(default_factory=lambda: [0.01, 0.05, 0.1, 0.2, 0.5])
-    klms_sigma: list[float] = field(default_factory=lambda: [0.1, 0.5, 1.0, 2.0, 5.0])
-    klms_epsilon: list[float] = field(default_factory=lambda: [0.01, 0.05, 0.1, 0.2])
+    LMS_Mu_Base: list[float] = field(default_factory=lambda: [0.004, 0.006, 0.008])
+    RFF_LMS_Mu_Base: list[float] = field(default_factory=lambda: [0.001, 0.002, 0.004, 0.006])
+    alpha_u: list[float] = field(default_factory=lambda: [0.005, 0.01, 0.03, 0.05, 0.1])
+    M2: list[int] = field(default_factory=lambda: [2, 3])
+    rff_D: list[int] = field(default_factory=lambda: [50, 100, 200])
+    rff_sigma: list[float] = field(default_factory=lambda: [0.5, 1.0, 2.0, 5.0])
+    klms_step_size: list[float] = field(default_factory=lambda: [0.005, 0.01, 0.02, 0.05])
+    klms_sigma: list[float] = field(default_factory=lambda: [0.5, 1.0, 2.0, 5.0])
+    klms_epsilon: list[float] = field(default_factory=lambda: [0.005, 0.01, 0.02, 0.05, 0.1])
 
     def names(self) -> list[str]:
         """Return active parameter names in stable dataclass order."""
@@ -129,13 +129,9 @@ class ProtocolSearchParams:
             "C_scale",
             "K_max",
             "Spec_Penalty_Width",
-            "smooth_win_len",
             "hr_range_hz",
             "slew_limit_bpm",
             "slew_step_bpm",
-            "Rest_HR_Track_Band_BPM",
-            "Rest_HR_Slew_Limit_BPM",
-            "Rest_HR_Slew_Step_BPM",
         ]
         if adaptive_filter == "lms":
             return [*common, "LMS_Mu_Base"]

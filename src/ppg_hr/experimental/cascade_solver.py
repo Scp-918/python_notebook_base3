@@ -1249,6 +1249,11 @@ def _cascade_filter_window(
                 rff_D = int(getattr(params, "rff_D", 100))
                 rff_sigma = float(getattr(params, "rff_sigma", 1.0))
                 rff_seed = int(getattr(params, "rff_seed", 0))
+                rff_update_mode = str(getattr(params, "rff_update_mode", "nlms"))
+                rff_nlms_eps = float(getattr(params, "rff_nlms_eps", 1e-6))
+                rff_leakage = float(getattr(params, "rff_leakage", 0.0))
+                rff_err_clip = getattr(params, "rff_err_clip", None)
+                rff_theta_norm_guard = getattr(params, "rff_theta_norm_guard", None)
                 current = noncausal_rff_lms_filter(
                     window[channel],
                     current,
@@ -1259,12 +1264,34 @@ def _cascade_filter_window(
                     sigma=rff_sigma,
                     rff_seed=rff_seed,
                     mu_min=float(getattr(params, "LMS_Mu_Min", 1e-6)),
+                    update_mode=rff_update_mode,
+                    nlms_eps=rff_nlms_eps,
+                    leakage=rff_leakage,
+                    err_clip=rff_err_clip,
+                    theta_norm_guard=rff_theta_norm_guard,
+                    return_diagnostics=False,
                 )
-                stage_extra.update({"D": rff_D, "sigma": rff_sigma, "rff_seed": rff_seed})
+                stage_extra.update(
+                    {
+                        "D": rff_D,
+                        "sigma": rff_sigma,
+                        "rff_seed": rff_seed,
+                        "update_mode": rff_update_mode,
+                        "nlms_eps": rff_nlms_eps,
+                        "leakage": rff_leakage,
+                        "err_clip": rff_err_clip,
+                        "theta_norm_guard": rff_theta_norm_guard,
+                    }
+                )
             elif filter_type == "klms":
                 klms_step_size = float(getattr(params, "klms_step_size", 0.05))
                 klms_sigma = float(getattr(params, "klms_sigma", 1.0))
                 klms_epsilon = float(getattr(params, "klms_epsilon", 0.1))
+                klms_max_dictionary_size = int(getattr(params, "klms_max_dictionary_size", 300))
+                klms_center_prune_policy = str(getattr(params, "klms_center_prune_policy", "freeze_new_centers"))
+                klms_distance_mode = str(getattr(params, "klms_distance_mode", "normalized"))
+                klms_normalized_update = bool(getattr(params, "klms_normalized_update", True))
+                klms_nlms_eps = float(getattr(params, "klms_nlms_eps", 1e-6))
                 stage_mu = klms_step_size
                 current = noncausal_klms_filter(
                     window[channel],
@@ -1274,12 +1301,23 @@ def _cascade_filter_window(
                     step_size=klms_step_size,
                     sigma=klms_sigma,
                     epsilon=klms_epsilon,
+                    max_dictionary_size=klms_max_dictionary_size,
+                    center_prune_policy=klms_center_prune_policy,
+                    distance_mode=klms_distance_mode,
+                    normalized_update=klms_normalized_update,
+                    nlms_eps=klms_nlms_eps,
+                    return_diagnostics=False,
                 )
                 stage_extra.update(
                     {
                         "klms_step_size": klms_step_size,
                         "sigma": klms_sigma,
                         "epsilon": klms_epsilon,
+                        "max_dictionary_size": klms_max_dictionary_size,
+                        "center_prune_policy": klms_center_prune_policy,
+                        "distance_mode": klms_distance_mode,
+                        "normalized_update": klms_normalized_update,
+                        "nlms_eps": klms_nlms_eps,
                     }
                 )
             else:

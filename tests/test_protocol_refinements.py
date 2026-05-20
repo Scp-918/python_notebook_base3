@@ -246,6 +246,11 @@ def test_cascade_filter_window_records_klms_stage_parameters() -> None:
         klms_step_size=0.05,
         klms_sigma=1.0,
         klms_epsilon=0.1,
+        klms_max_dictionary_size=30,
+        klms_center_prune_policy="freeze_new_centers",
+        klms_distance_mode="normalized",
+        klms_normalized_update=True,
+        klms_nlms_eps=1e-6,
         max_order=4,
         M_base=1,
         C_scale=1.0,
@@ -286,3 +291,7 @@ def test_cascade_filter_window_records_klms_stage_parameters() -> None:
     assert stages[0]["klms_step_size"] == 0.05
     assert stages[0]["sigma"] == 1.0
     assert stages[0]["epsilon"] == 0.1
+    assert stages[0]["max_dictionary_size"] == 30
+    assert stages[0]["center_prune_policy"] == "freeze_new_centers"
+    assert stages[0]["distance_mode"] == "normalized"
+    assert stages[0]["normalized_update"] is True

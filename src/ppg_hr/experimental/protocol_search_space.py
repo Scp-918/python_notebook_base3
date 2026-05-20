@@ -90,9 +90,24 @@ class ProtocolTrialParams:
     rff_D: int = 100
     rff_sigma: float = 1.0
     rff_seed: int = 0
+    # 中文说明：RFF-LMS 默认使用特征空间 NLMS，避免普通 LMS 在高维随机特征下
+    # 因特征能量和大步长组合发散；字段不进入搜索空间，只作为工程固定策略。
+    rff_update_mode: str = "nlms"
+    rff_nlms_eps: float = 1e-6
+    rff_leakage: float = 0.0
+    rff_err_clip: float | None = None
+    rff_theta_norm_guard: float | None = None
     klms_step_size: float = 0.05
     klms_sigma: float = 1.0
+    # 中文说明：字段名沿用 klms_epsilon 以兼容旧 JSON；默认语义已改为
+    # squared_distance / tap_dim 的归一化距离阈值。若要复现实验旧逻辑，可把
+    # klms_distance_mode 设为 "absolute_squared"。
     klms_epsilon: float = 0.1
+    klms_max_dictionary_size: int = 300
+    klms_center_prune_policy: str = "freeze_new_centers"
+    klms_distance_mode: str = "normalized"
+    klms_normalized_update: bool = True
+    klms_nlms_eps: float = 1e-6
 
     def to_dict(self) -> dict[str, Any]:
         """Return parameter values as plain Python scalars."""
