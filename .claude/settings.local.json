@@ -5,7 +5,10 @@
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
       "Bash(git fetch *)",
-      "mcp__ide__executeCode"
+      "mcp__ide__executeCode",
+      "Bash(python -c ' *)",
+      "Bash(conda run *)",
+      "Read(//d/Code/anaconda24/envs/PPG_sensor_env/Lib/site-packages/**)"
     ]
   }
 }

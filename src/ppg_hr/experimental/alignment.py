@@ -250,7 +250,8 @@ def search_time_bias_after(
 
     中文说明：这个搜索只能发生在 HR 序列已经生成之后，用于 post-hoc
     评价和可视化诊断。它不允许改变 PPG、补偿信号、自适应滤波输入、
-    窗口划分、滤波器输出，也不参与 Optuna objective。
+    窗口划分、滤波器输出。当 OPTIMIZATION_OBJECTIVE 设为 "posthoc_aae" 时，
+    后对齐 AAE 可作为 Optuna 优化目标；否则仅用于诊断报告。
     """
 
     pred_time = np.asarray(pred_time_s, dtype=float).ravel()

@@ -912,14 +912,26 @@ OPTIMIZATION_OBJECTIVE = "aae"
 OPTIMIZATION_OBJECTIVE = "accuracy"
 ```
 
+或：
+
+```python
+OPTIMIZATION_OBJECTIVE = "posthoc_aae"
+```
+
 含义：
 
 ```text
 aae:
-    最小化 adaptive AAE。
+    最小化 adaptive AAE（对齐前，基于原始参考 HR）。
 
 accuracy:
-    最小化 100 - adaptive_acc_pct。
+    最小化 100 - adaptive_acc_pct（对齐前）。
+
+posthoc_aae:
+    最小化后对齐 AAE（基于 oracle 最佳时移后的参考 HR）。
+    注意：后对齐会用参考 HR 搜索最优时间偏移，再计算误差，
+    属于 oracle 指标，可能引入过拟合风险，建议仅在诊断或
+    特定场景下使用。
 ```
 
 accuracy 定义：
@@ -3168,7 +3180,7 @@ Notebook 共 15 个代码块，按流水线组织为"环境初始化 — 诊断�
 | `ACTIVE_CASCADE_SCHEMES` | 同上 | 级联滤波方案：`"ACC3"` / `"HF2"` / `"CF2"` / `"HF2_CF2"` / `"CF2_HF2"` / `"ACC3_HF2"` / `"HF2_ACC3"` |
 | `ACTIVE_ADAPTIVE_FILTERS` | 同上 | 自适应滤波器类型：`"lms"` / `"volterra"` / `"rff_lms"` / `"klms"` |
 | `CASCADE_TRAIN_BUDGETS` | 同上 | 每个 cascade scheme 的 `n_trials` 和 `n_repeats` |
-| `OPTIMIZATION_OBJECTIVE` | 同上 | 优化目标：`"aae"` 或 `"accuracy"` |
+| `OPTIMIZATION_OBJECTIVE` | 同上 | 优化目标：`"aae"` / `"accuracy"` / `"posthoc_aae"` |
 | `DATA_SPLIT_MODE` | 同上 | 数据划分：`"all_train"` / `"split"` / `"leave_one_group_out"` |
 | `VAL_GROUPS_PER_TYPE` | 同上 | 每运动类型验证组数，默认 1 |
 | `TEST_GROUPS_PER_TYPE` | 同上 | 每运动类型测试组数，默认 1 |

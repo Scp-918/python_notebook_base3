@@ -72,7 +72,7 @@ if optuna is not None:
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 _VALID_FILTERS = ("lms", "volterra", "rff_lms", "klms")
-_VALID_OBJECTIVES = ("aae", "accuracy")
+_VALID_OBJECTIVES = ("aae", "accuracy", "posthoc_aae")
 _VALID_SPLIT_MODES = ("split", "all_train", "leave_one_group_out")
 _DEFAULT_TRIAL_CACHE_MAX_ENTRIES = 128
 
@@ -1692,6 +1692,12 @@ def _objective_value(metrics: dict[str, Any], objective_mode: str, penalty_value
     if objective_mode == "accuracy":
         acc = float(metrics.get("final_acc_pct", metrics.get("adaptive_acc_pct", float("nan"))))
         value = 100.0 - acc
+    elif objective_mode == "posthoc_aae":
+        posthoc = metrics.get("posthoc_final_aae_bpm", float("nan"))
+        if np.isfinite(float(posthoc)):
+            value = float(posthoc)
+        else:
+            value = float(metrics.get("final_aae_bpm", metrics.get("adaptive_aae_bpm", float("nan"))))
     else:
         value = float(metrics.get("final_aae_bpm", metrics.get("adaptive_aae_bpm", float("nan"))))
     return value if np.isfinite(value) else float(penalty_value)

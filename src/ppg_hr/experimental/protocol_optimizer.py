@@ -311,6 +311,8 @@ def _cached_run(
 def _objective_value(run: ProtocolRunResult, objective_mode: str, penalty_value: float) -> float:
     if objective_mode == "accuracy":
         value = 100.0 - float(run.final_acc_pct)
+    elif objective_mode == "posthoc_aae":
+        value = float(run.posthoc_final_aae_bpm) if np.isfinite(run.posthoc_final_aae_bpm) else float(run.final_aae_bpm)
     else:
         value = float(run.final_aae_bpm)
     return value if np.isfinite(value) else float(penalty_value)

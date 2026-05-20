@@ -368,6 +368,7 @@ def _attach_time_bias_after_metrics(
     中文说明：这里的后对齐只读取已经生成的 ``adaptive_hr_bpm`` 和
     ``baseline_hr_bpm``，然后在原始参考 HR 曲线上按 ``time_s + bias``
     取样。它不会重新切窗、不会改写 PPG/补偿信号，也不会重新运行自适应滤波。
+    后对齐指标（如 posthoc_final_aae_bpm）可通过 OPTIMIZATION_OBJECTIVE="posthoc_aae" 参与贝叶斯优化。
     """
 
     if not bool(getattr(params, "Enable_Time_Bias_After", True)):
