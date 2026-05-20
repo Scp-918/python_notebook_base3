@@ -67,6 +67,20 @@ def test_stage1_fixed_rest_params_remain_overrideable() -> None:
     assert params.Rest_HR_Slew_Step_BPM == 4.0
 
 
+def test_stage2_strategy_fields_roundtrip_and_affect_cache_key() -> None:
+    base = ProtocolTrialParams()
+    transformed = ProtocolTrialParams(ppg_input_transform="log_absorbance")
+    deployment = ProtocolTrialParams(global_objective_strategy="deployment_global")
+    guarded = ProtocolTrialParams(cascade_guard_policy="rms_guard")
+
+    assert transformed.to_dict()["ppg_input_transform"] == "log_absorbance"
+    assert deployment.to_dict()["global_objective_strategy"] == "deployment_global"
+    assert guarded.to_dict()["cascade_guard_policy"] == "rms_guard"
+    assert base.cache_key() != transformed.cache_key()
+    assert base.cache_key() != deployment.cache_key()
+    assert base.cache_key() != guarded.cache_key()
+
+
 def test_klms_has_independent_search_parameters_and_is_batch_selectable() -> None:
     space = ProtocolSearchParams()
 

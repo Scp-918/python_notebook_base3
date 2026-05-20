@@ -33,6 +33,7 @@ def fuse_final_hr(
     adaptive_filter: str,
     motion_end_s: float,
     params: Any,
+    target_scope: str = "",
 ) -> FinalFusionResult:
     """Fuse baseline/adaptive HR without using reference HR.
 
@@ -58,6 +59,9 @@ def fuse_final_hr(
     diff_bpm = float(getattr(params, "Recovery_Diff_Bpm", 20.0))
     cross_bpm = float(getattr(params, "Recovery_Cross_Diff_Bpm", 8.0))
     motion_end = float(motion_end_s)
+    objective_strategy = str(getattr(params, "global_objective_strategy", "current_global_adaptive")).lower()
+    scope = str(target_scope or "").lower()
+    deployment_global = scope == "global" and objective_strategy == "deployment_global"
 
     for i in range(n):
         base_hr = float(baseline[i])
@@ -81,13 +85,13 @@ def fuse_final_hr(
         if label == "rest":
             final[i] = base_hr
             source[i] = "baseline_fft"
-            reason[i] = "rest_segment_baseline"
+            reason[i] = "deployment_global_rest_baseline" if deployment_global else "rest_segment_baseline"
             continue
         if label == "motion":
             if np.isfinite(adapt_hr):
                 final[i] = adapt_hr
                 source[i] = adaptive_source
-                reason[i] = "motion_segment_adaptive"
+                reason[i] = "deployment_global_motion_adaptive" if deployment_global else "motion_segment_adaptive"
             else:
                 final[i] = base_hr
                 source[i] = "baseline_fft"

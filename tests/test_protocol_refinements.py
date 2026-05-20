@@ -10,6 +10,7 @@ from ppg_hr.experimental.alignment import AlignedDataset, AlignmentInfo
 from ppg_hr.experimental.cascade_solver import (
     _TrialBase,
     _cascade_filter_window,
+    _evaluate_cascade_rms_guard,
     _run_windows,
     clear_all_caches,
     clear_trial_heavy_caches,
@@ -295,3 +296,35 @@ def test_cascade_filter_window_records_klms_stage_parameters() -> None:
     assert stages[0]["center_prune_policy"] == "freeze_new_centers"
     assert stages[0]["distance_mode"] == "normalized"
     assert stages[0]["normalized_update"] is True
+
+
+def test_rms_guard_rejects_exploded_stage_and_records_reason() -> None:
+    before = np.sin(np.linspace(0.0, 2.0 * np.pi, 64))
+    after = before * 100.0
+
+    guarded, record = _evaluate_cascade_rms_guard(
+        before,
+        after,
+        ProtocolTrialParams(cascade_guard_policy="rms_guard", cascade_guard_ratio_max=5.0),
+    )
+
+    np.testing.assert_allclose(guarded, before)
+    assert record["accepted"] is False
+    assert record["rms_ratio"] > 5.0
+    assert record["reject_reason"]
+
+
+def test_rms_guard_accepts_normal_stage_and_records_metrics() -> None:
+    before = np.sin(np.linspace(0.0, 2.0 * np.pi, 64))
+    after = before * 0.8
+
+    guarded, record = _evaluate_cascade_rms_guard(
+        before,
+        after,
+        ProtocolTrialParams(cascade_guard_policy="rms_guard"),
+    )
+
+    np.testing.assert_allclose(guarded, after)
+    assert record["accepted"] is True
+    assert record["reject_reason"] == ""
+    assert {"rms_before", "rms_after", "rms_ratio", "accepted", "reject_reason"}.issubset(record)

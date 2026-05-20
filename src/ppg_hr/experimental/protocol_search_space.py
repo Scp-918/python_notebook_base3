@@ -108,6 +108,19 @@ class ProtocolTrialParams:
     klms_distance_mode: str = "normalized"
     klms_normalized_update: bool = True
     klms_nlms_eps: float = 1e-6
+    # 中文说明：PPG 输入策略和全局 objective/级联 guard 会改变实际 HR 结果，
+    # 因此作为固定 trial 参数保存，并通过 cache_key 自动参与缓存隔离。
+    ppg_input_transform: str = "raw_bandpass"
+    log_absorbance_baseline_mode: str = "rolling_median"
+    log_absorbance_baseline_window_s: float = 5.0
+    log_absorbance_eps: float = 1e-6
+    log_absorbance_ratio_clip: tuple[float, float] = (1e-3, 1e3)
+    global_objective_strategy: str = "current_global_adaptive"
+    cascade_guard_policy: str = "none"
+    cascade_guard_ratio_min: float = 0.05
+    cascade_guard_ratio_max: float = 5.0
+    cascade_guard_flat_std_eps: float = 1e-6
+    cascade_guard_use_finite_zscore: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Return parameter values as plain Python scalars."""

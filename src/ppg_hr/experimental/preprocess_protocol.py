@@ -27,6 +27,7 @@ __all__ = [
     "PROTOCOL_CHANNELS",
     "PROTOCOL_QC_COLUMNS",
     "ProtocolDataset",
+    "apply_ppg_input_transform",
     "load_and_preprocess_protocol",
     "load_protocol_raw_clean_frames",
     "resample_protocol_dataset",
@@ -94,6 +95,9 @@ class ProtocolDataset:
     ref_time_s: np.ndarray
     ref_hr_bpm: np.ndarray
     qc: pd.DataFrame | None = None
+    raw_ppg_green: np.ndarray | None = None
+    raw_ppg_red: np.ndarray | None = None
+    raw_ppg_ir: np.ndarray | None = None
 
     def channels(self) -> dict[str, np.ndarray]:
         """Return a copy of the channel mapping used by downstream modules."""
@@ -157,9 +161,12 @@ def load_and_preprocess_protocol(
     clean_frame = _build_clean_frame(sensor_path, int(fs_origin))
     fs = int(fs_origin)
 
-    ppg_green = _safe_bandpass(clean_frame["ppg_green"].to_numpy(dtype=float), fs, 0.5, 5.0)
-    ppg_red = _safe_bandpass(clean_frame["ppg_red"].to_numpy(dtype=float), fs, 0.5, 5.0)
-    ppg_ir = _safe_bandpass(clean_frame["ppg_ir"].to_numpy(dtype=float), fs, 0.5, 5.0)
+    raw_ppg_green = clean_frame["ppg_green"].to_numpy(dtype=float)
+    raw_ppg_red = clean_frame["ppg_red"].to_numpy(dtype=float)
+    raw_ppg_ir = clean_frame["ppg_ir"].to_numpy(dtype=float)
+    ppg_green = _safe_bandpass(raw_ppg_green, fs, 0.5, 5.0)
+    ppg_red = _safe_bandpass(raw_ppg_red, fs, 0.5, 5.0)
+    ppg_ir = _safe_bandpass(raw_ppg_ir, fs, 0.5, 5.0)
     hf1 = _safe_bandpass(clean_frame["hf1"].to_numpy(dtype=float), fs, 0.1, 5.0)
     hf2 = _safe_bandpass(clean_frame["hf2"].to_numpy(dtype=float), fs, 0.1, 5.0)
     cf1 = _safe_bandpass(clean_frame["cf1"].to_numpy(dtype=float), fs, 0.1, 5.0)
@@ -193,7 +200,44 @@ def load_and_preprocess_protocol(
         ref_time_s=ref_time_s,
         ref_hr_bpm=ref_hr_bpm,
         qc=qc,
+        raw_ppg_green=raw_ppg_green,
+        raw_ppg_red=raw_ppg_red,
+        raw_ppg_ir=raw_ppg_ir,
     )
+
+
+def apply_ppg_input_transform(dataset: ProtocolDataset, params: object) -> ProtocolDataset:
+    """Return ``dataset`` with the trial-selected PPG input transform applied.
+
+    中文说明：``raw_bandpass`` 沿用加载阶段得到的 0.5-5 Hz PPG；``log_absorbance``
+    使用清洗后、带通前的原始 PPG 估计慢变基线 I0(t)，计算 ``-log(I/I0)`` 后再
+    做 0.5-5 Hz 带通。该函数在重采样前调用，保证 transform 改变时 alignment
+    和 trial cache 都能按参数隔离。
+    """
+
+    mode = str(getattr(params, "ppg_input_transform", "raw_bandpass")).lower()
+    if mode == "raw_bandpass":
+        return dataset
+    if mode != "log_absorbance":
+        raise ValueError("ppg_input_transform must be 'raw_bandpass' or 'log_absorbance'")
+
+    fs = int(dataset.fs)
+    baseline_mode = str(getattr(params, "log_absorbance_baseline_mode", "rolling_median")).lower()
+    baseline_window_s = float(getattr(params, "log_absorbance_baseline_window_s", 5.0))
+    eps = float(getattr(params, "log_absorbance_eps", 1e-6))
+    ratio_clip = tuple(getattr(params, "log_absorbance_ratio_clip", (1e-3, 1e3)))
+    transformed = {
+        "ppg_green": _log_absorbance_bandpass(
+            _raw_ppg_source(dataset, "ppg_green"), fs, baseline_mode, baseline_window_s, eps, ratio_clip
+        ),
+        "ppg_red": _log_absorbance_bandpass(
+            _raw_ppg_source(dataset, "ppg_red"), fs, baseline_mode, baseline_window_s, eps, ratio_clip
+        ),
+        "ppg_ir": _log_absorbance_bandpass(
+            _raw_ppg_source(dataset, "ppg_ir"), fs, baseline_mode, baseline_window_s, eps, ratio_clip
+        ),
+    }
+    return replace(dataset, **transformed)
 
 
 def load_protocol_raw_clean_frames(
@@ -418,6 +462,90 @@ def _safe_ratio(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
     out = fillmissing_nearest(out)
     out[~np.isfinite(out)] = 0.0
     return out
+
+
+def _raw_ppg_source(dataset: ProtocolDataset, field: str) -> np.ndarray:
+    """Return the cleaned pre-bandpass PPG source when available."""
+
+    raw = getattr(dataset, f"raw_{field}", None)
+    source = raw if raw is not None else getattr(dataset, field)
+    return np.asarray(source, dtype=float)
+
+
+def _log_absorbance_bandpass(
+    signal: np.ndarray,
+    fs: int,
+    baseline_mode: str,
+    baseline_window_s: float,
+    eps: float,
+    ratio_clip: tuple[float, ...],
+) -> np.ndarray:
+    """Compute a finite log-absorbance PPG signal and bandpass it.
+
+    中文说明：若原始 PPG 含 0 或负值，先整体平移到正区间，再估计慢变基线；
+    这样比逐点硬裁剪更少破坏波形形状。ratio clip 只限制异常局部比例，避免 log
+    爆炸。
+    """
+
+    arr = np.asarray(signal, dtype=float).copy()
+    arr[~np.isfinite(arr)] = np.nan
+    arr = fillmissing_linear(arr)
+    arr = fillmissing_nearest(arr)
+    arr[~np.isfinite(arr)] = 0.0
+    eps = float(eps) if np.isfinite(float(eps)) and float(eps) > 0.0 else 1e-6
+    min_value = float(np.nanmin(arr)) if arr.size else 0.0
+    if min_value <= eps:
+        arr = arr + (eps - min_value) + eps
+    arr = np.maximum(arr, eps)
+    baseline = _estimate_log_absorbance_baseline(arr, int(fs), baseline_mode, float(baseline_window_s), eps)
+    baseline = np.maximum(baseline, eps)
+    lo, hi = _normalise_ratio_clip(ratio_clip)
+    ratio = np.clip(arr / baseline, lo, hi)
+    log_abs = -np.log(ratio)
+    log_abs[~np.isfinite(log_abs)] = 0.0
+    return _safe_bandpass(log_abs, int(fs), 0.5, 5.0)
+
+
+def _estimate_log_absorbance_baseline(
+    signal: np.ndarray,
+    fs: int,
+    baseline_mode: str,
+    baseline_window_s: float,
+    eps: float,
+) -> np.ndarray:
+    """Estimate slow-varying I0(t) without using the 0.5-5 Hz PPG bandpass."""
+
+    mode = str(baseline_mode).lower()
+    if mode != "rolling_median":
+        raise ValueError("log_absorbance_baseline_mode currently supports only 'rolling_median'")
+    window = max(3, int(round(float(baseline_window_s) * float(fs))))
+    if window % 2 == 0:
+        window += 1
+    baseline = (
+        pd.Series(np.asarray(signal, dtype=float))
+        .rolling(window=window, center=True, min_periods=1)
+        .median()
+        .to_numpy(dtype=float)
+    )
+    baseline[~np.isfinite(baseline)] = np.nan
+    baseline = fillmissing_linear(baseline)
+    baseline = fillmissing_nearest(baseline)
+    baseline[~np.isfinite(baseline)] = float(np.nanmedian(signal)) if signal.size else eps
+    return baseline
+
+
+def _normalise_ratio_clip(ratio_clip: tuple[float, ...]) -> tuple[float, float]:
+    """Return a positive increasing ratio clip tuple."""
+
+    if len(ratio_clip) != 2:
+        return 1e-3, 1e3
+    lo = float(ratio_clip[0])
+    hi = float(ratio_clip[1])
+    if not np.isfinite(lo) or lo <= 0.0:
+        lo = 1e-3
+    if not np.isfinite(hi) or hi <= lo:
+        hi = max(1e3, lo * 10.0)
+    return lo, hi
 
 
 def _safe_bandpass(x: np.ndarray, fs: int, low_hz: float, high_hz: float) -> np.ndarray:

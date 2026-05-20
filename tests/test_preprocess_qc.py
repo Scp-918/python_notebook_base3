@@ -8,7 +8,11 @@ import pandas as pd
 from ppg_hr.preprocess.data_loader import QC_COLUMNS, SENSOR_COLUMNS, load_dataset
 from ppg_hr.experimental.alignment import AlignedDataset, AlignmentInfo
 from ppg_hr.experimental.cascade_solver import _TrialBase, _run_windows
-from ppg_hr.experimental.preprocess_protocol import ProtocolDataset, load_and_preprocess_protocol
+from ppg_hr.experimental.preprocess_protocol import (
+    ProtocolDataset,
+    apply_ppg_input_transform,
+    load_and_preprocess_protocol,
+)
 from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams
 from ppg_hr.experimental.segmentation import SegmentInfo
 from ppg_hr.params import CascadeScheme, TargetScope
@@ -97,6 +101,84 @@ def test_protocol_loader_carries_qc_metadata_into_frame(tmp_path: Path) -> None:
     assert np.isclose(frame["time_s"].iloc[0], 12.5)
     assert frame["ValidFlag"].iloc[0] == 0
     assert frame["InterpFlag"].sum() > 0
+
+
+def test_log_absorbance_transform_outputs_finite_ppg_with_original_length() -> None:
+    fs = 50
+    t = np.arange(fs * 6, dtype=float) / fs
+    raw = 1000.0 + 80.0 * np.sin(2 * np.pi * 1.2 * t)
+    zeros = np.zeros_like(t)
+    dataset = ProtocolDataset(
+        sample_stem="log_abs_positive",
+        fs=fs,
+        time_s=t,
+        ppg_green=zeros.copy(),
+        ppg_red=zeros.copy(),
+        ppg_ir=zeros.copy(),
+        hf1=zeros,
+        hf2=zeros,
+        cf1=zeros,
+        cf2=zeros,
+        accx=zeros,
+        accy=zeros,
+        accz=zeros,
+        gyrox=zeros,
+        gyroy=zeros,
+        gyroz=zeros,
+        ref_time_s=np.asarray([0.0, 1.0]),
+        ref_hr_bpm=np.asarray([72.0, 73.0]),
+        raw_ppg_green=raw,
+        raw_ppg_red=raw + 10.0,
+        raw_ppg_ir=raw + 20.0,
+    )
+
+    transformed = apply_ppg_input_transform(
+        dataset,
+        ProtocolTrialParams(ppg_input_transform="log_absorbance"),
+    )
+
+    assert transformed.ppg_green.shape == raw.shape
+    assert np.all(np.isfinite(transformed.ppg_green))
+    assert np.all(np.isfinite(transformed.ppg_red))
+    assert np.all(np.isfinite(transformed.ppg_ir))
+
+
+def test_log_absorbance_transform_handles_zero_and_negative_ppg() -> None:
+    fs = 50
+    t = np.arange(fs * 6, dtype=float) / fs
+    raw = -20.0 + 10.0 * np.sin(2 * np.pi * 1.2 * t)
+    zeros = np.zeros_like(t)
+    dataset = ProtocolDataset(
+        sample_stem="log_abs_negative",
+        fs=fs,
+        time_s=t,
+        ppg_green=raw.copy(),
+        ppg_red=raw.copy(),
+        ppg_ir=raw.copy(),
+        hf1=zeros,
+        hf2=zeros,
+        cf1=zeros,
+        cf2=zeros,
+        accx=zeros,
+        accy=zeros,
+        accz=zeros,
+        gyrox=zeros,
+        gyroy=zeros,
+        gyroz=zeros,
+        ref_time_s=np.asarray([0.0, 1.0]),
+        ref_hr_bpm=np.asarray([72.0, 73.0]),
+        raw_ppg_green=raw,
+        raw_ppg_red=raw,
+        raw_ppg_ir=raw,
+    )
+
+    transformed = apply_ppg_input_transform(
+        dataset,
+        ProtocolTrialParams(ppg_input_transform="log_absorbance", log_absorbance_eps=1e-6),
+    )
+
+    assert transformed.ppg_green.shape == raw.shape
+    assert np.all(np.isfinite(transformed.ppg_green))
 
 
 def test_window_qc_stats_default_to_fallback_baseline() -> None:

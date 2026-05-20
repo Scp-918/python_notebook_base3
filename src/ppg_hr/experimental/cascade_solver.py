@@ -31,7 +31,12 @@ from .fusion import fuse_final_hr
 from .klms import noncausal_klms_filter
 from .motion_frequency import estimate_motion_frequency
 from .noncausal_lms import map_delay_to_lms_params, noncausal_lms_filter
-from .preprocess_protocol import PROTOCOL_CHANNELS, ProtocolDataset, resample_protocol_dataset
+from .preprocess_protocol import (
+    PROTOCOL_CHANNELS,
+    ProtocolDataset,
+    apply_ppg_input_transform,
+    resample_protocol_dataset,
+)
 from .protocol_search_space import ProtocolTrialParams
 from .rff_lms import noncausal_rff_lms_filter
 from .segmentation import SegmentInfo, detect_activity_segments
@@ -226,6 +231,7 @@ def run_protocol_trial(
                 else float("nan")
             ),
             params=params,
+            target_scope=scope.value,
         )
         baseline_abs_err = np.abs(arrays["baseline_hr_bpm"].astype(float) - arrays["ref_hr_bpm"].astype(float))
         adaptive_abs_err = np.abs(adaptive - arrays["ref_hr_bpm"].astype(float))
@@ -518,7 +524,10 @@ def _get_global_alignment_base(dataset: ProtocolDataset, params: ProtocolTrialPa
         return cached
 
     fs_target = int(params.Fs_Target)
-    ds = resample_protocol_dataset(dataset, fs_target)
+    # 中文说明：PPG 输入策略会改变后续静息段对齐、分段窗口和最终 HR，
+    # 必须在重采样前对源 dataset 应用，并由 _global_tdelay_cache_key 隔离缓存。
+    transformed_dataset = apply_ppg_input_transform(dataset, params)
+    ds = resample_protocol_dataset(transformed_dataset, fs_target)
     fs = int(ds.fs)
     alignment_tw = float(getattr(params, "Alignment_TW", 8.0))
     # 中文说明：分段用于界定静息段和运动边界，因此也固定使用 Alignment_TW，
@@ -601,6 +610,11 @@ def _global_tdelay_cache_key(dataset: ProtocolDataset, params: ProtocolTrialPara
         round(float(getattr(params, "Rest_HR_Spec_Penalty_Weight", 0.2)), 8),
         round(float(getattr(params, "Rest_HR_Spec_Penalty_Width_Hz", 0.2)), 8),
         _normalise_alignment_score_mode(getattr(params, "Rest_Alignment_Score_Mode", "aae")),
+        str(getattr(params, "ppg_input_transform", "raw_bandpass")).lower(),
+        str(getattr(params, "log_absorbance_baseline_mode", "rolling_median")).lower(),
+        round(float(getattr(params, "log_absorbance_baseline_window_s", 5.0)), 8),
+        round(float(getattr(params, "log_absorbance_eps", 1e-6)), 12),
+        tuple(round(float(x), 12) for x in getattr(params, "log_absorbance_ratio_clip", (1e-3, 1e3))),
         "tracked_rest_hr_tdelay_v3",
     )
 
@@ -1216,6 +1230,7 @@ def _cascade_filter_window(
             filter_type = str(getattr(params, "adaptive_filter", "lms"))
             stage_extra: dict[str, Any] = {}
             stage_mu = float(design.u)
+            before_stage = np.asarray(current, dtype=float).copy()
             if filter_type == "lms":
                 current = noncausal_lms_filter(
                     window[channel],
@@ -1323,6 +1338,9 @@ def _cascade_filter_window(
             else:
                 raise ValueError(f"Unsupported adaptive_filter: {filter_type}")
 
+            current, guard_record = _evaluate_cascade_rms_guard(before_stage, current, params)
+            stage_extra.update(guard_record)
+
             if collect_stages:
                 stages.append(
                     {
@@ -1357,6 +1375,87 @@ def _cascade_filter_window(
         for stage in stages:
             stage["penalty_ref_channel"] = penalty_ref_channel
     return current, penalty_ref, stages, penalty_ref_channel
+
+
+def _evaluate_cascade_rms_guard(
+    before_signal: np.ndarray,
+    after_signal: np.ndarray,
+    params: ProtocolTrialParams,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Apply the optional per-stage RMS guard and return short stage metrics.
+
+    中文说明：``none`` 策略只记录 accepted=True，不改变级联输出；``rms_guard``
+    使用有限 zscore 后的 RMS ratio 判断本级滤波是否异常。拒绝时回退到本级输入，
+    但后续级联仍继续运行。
+    """
+
+    before = np.asarray(before_signal, dtype=float)
+    after = np.asarray(after_signal, dtype=float)
+    policy = str(getattr(params, "cascade_guard_policy", "none")).lower()
+    record = {
+        "guard_policy": policy,
+        "rms_before": float("nan"),
+        "rms_after": float("nan"),
+        "rms_ratio": float("nan"),
+        "accepted": True,
+        "reject_reason": "",
+    }
+    if policy == "none":
+        return after, record
+    if policy != "rms_guard":
+        raise ValueError("cascade_guard_policy must be 'none' or 'rms_guard'")
+
+    before_eval = _finite_zscore_for_guard(before) if bool(getattr(params, "cascade_guard_use_finite_zscore", True)) else before
+    after_eval = _finite_zscore_for_guard(after) if bool(getattr(params, "cascade_guard_use_finite_zscore", True)) else after
+    flat_eps = float(getattr(params, "cascade_guard_flat_std_eps", 1e-6))
+    ratio_min = float(getattr(params, "cascade_guard_ratio_min", 0.05))
+    ratio_max = float(getattr(params, "cascade_guard_ratio_max", 5.0))
+    before_finite = np.isfinite(before_eval)
+    after_finite = np.isfinite(after_eval)
+    if before_eval.size != after_eval.size:
+        record["accepted"] = False
+        record["reject_reason"] = "length_mismatch"
+        return before.copy(), record
+    if not before_finite.all() or not after_finite.all():
+        record["accepted"] = False
+        record["reject_reason"] = "non_finite_signal"
+        return before.copy(), record
+    rms_before = float(np.sqrt(np.mean(before_eval * before_eval))) if before_eval.size else 0.0
+    rms_after = float(np.sqrt(np.mean(after_eval * after_eval))) if after_eval.size else 0.0
+    record["rms_before"] = rms_before
+    record["rms_after"] = rms_after
+    record["rms_ratio"] = float(rms_after / rms_before) if rms_before > 0.0 else float("inf")
+    if rms_before <= flat_eps:
+        record["accepted"] = False
+        record["reject_reason"] = "before_flat"
+    elif rms_after <= flat_eps:
+        record["accepted"] = False
+        record["reject_reason"] = "after_flat"
+    elif float(np.std(after_eval)) <= flat_eps:
+        record["accepted"] = False
+        record["reject_reason"] = "after_nearly_flat"
+    elif not ratio_min <= record["rms_ratio"] <= ratio_max:
+        record["accepted"] = False
+        record["reject_reason"] = "rms_ratio_out_of_range"
+    if not record["accepted"]:
+        return before.copy(), record
+    return after, record
+
+
+def _finite_zscore_for_guard(values: np.ndarray) -> np.ndarray:
+    """Return finite values for RMS guard comparison.
+
+    中文说明：字段名沿用 finite_zscore 是为了和任务配置保持一致；这里保留原始
+    幅值尺度，只替换非有限值，因为 RMS ratio 必须能识别输出幅值爆炸。
+    """
+
+    arr = np.asarray(values, dtype=float).copy()
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return np.full_like(arr, np.nan, dtype=float)
+    mean = float(np.mean(arr[finite]))
+    arr[~finite] = mean
+    return arr
 
 
 def _scheme_plan(scheme: CascadeScheme) -> list[tuple[str, int]]:

@@ -110,6 +110,20 @@ def test_global_tdelay_cache_key_excludes_train_tw() -> None:
     assert _global_tdelay_cache_key(ds, p6) != _global_tdelay_cache_key(ds, std_mode)
 
 
+def test_global_tdelay_cache_key_includes_ppg_input_transform_fields() -> None:
+    ds, _ = _synthetic_dataset()
+    raw = ProtocolTrialParams(Fs_Target=50, ppg_input_transform="raw_bandpass")
+    log_abs = ProtocolTrialParams(Fs_Target=50, ppg_input_transform="log_absorbance")
+    changed_window = ProtocolTrialParams(
+        Fs_Target=50,
+        ppg_input_transform="log_absorbance",
+        log_absorbance_baseline_window_s=7.0,
+    )
+
+    assert _global_tdelay_cache_key(ds, raw) != _global_tdelay_cache_key(ds, log_abs)
+    assert _global_tdelay_cache_key(ds, log_abs) != _global_tdelay_cache_key(ds, changed_window)
+
+
 def test_rest_alignment_score_mode_outputs_aae_and_std_scores() -> None:
     ds, segment = _synthetic_dataset()
     estimate = estimate_global_tdelay_from_rest(

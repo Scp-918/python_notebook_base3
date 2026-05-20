@@ -56,6 +56,33 @@ def test_qc_fallback_uses_baseline_without_reference_hr() -> None:
     assert "qc_status=fallback_baseline" in result.fusion_reason[0]
 
 
+def test_deployment_global_uses_baseline_rest_adaptive_motion_and_fused_recovery() -> None:
+    result = fuse_final_hr(
+        time_s=np.asarray([0.0, 1.0, 2.0, 12.0]),
+        baseline_hr_bpm=np.asarray([70.0, 70.0, 70.0, 75.0]),
+        adaptive_hr_bpm=np.asarray([95.0, 100.0, 101.0, 120.0]),
+        segment_label=np.asarray(["rest", "motion", "motion", "recovery"], dtype=object),
+        qc_status=np.asarray(["ok", "ok", "ok", "ok"], dtype=object),
+        adaptive_filter="lms",
+        motion_end_s=2.0,
+        target_scope="global",
+        params=ProtocolTrialParams(
+            global_objective_strategy="deployment_global",
+            Recovery_Grace_S=2.0,
+            Recovery_Diff_Bpm=10.0,
+        ),
+    )
+
+    assert result.final_hr_bpm.tolist() == [70.0, 100.0, 101.0, 75.0]
+    assert result.final_source.tolist() == [
+        "baseline_fft",
+        "adaptive_lms",
+        "adaptive_lms",
+        "recovery_fallback",
+    ]
+    assert "deployment_global" in result.fusion_reason[0]
+
+
 def test_aggregate_metric_arrays_reports_final_metrics() -> None:
     arrays = {
         "ref_hr_bpm": np.asarray([70.0, 100.0]),
