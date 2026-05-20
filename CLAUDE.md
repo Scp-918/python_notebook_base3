@@ -13,10 +13,8 @@ PPG 心率求解算法 Python 实现，源码 `src/ppg_hr/`（含 `core/`、`pre
 
 ## 远程仓库
 
-- `origin`（个人 fork）：`git@github.com:wqwshn/PPGtoHR_notebook.git`（SSH fetch/push + HTTPS 备用 push）
 - `upstream`（原仓库）：`git@github.com:Scp-918/python_notebook_base3.git`（SSH fetch/push + HTTPS 备用 push）
-- HTTP/HTTPS 代理：`http://127.0.0.1:7890`，SSH 不受代理影响。
-- master 基于 `upstream/change2`，共享 git 历史，可直接发起 PR。
+- master 基于 `upstream/change3`，共享 git 历史，可直接发起 PR。
 
 ## PR 推送流程
 
@@ -41,13 +39,13 @@ gh pr create --repo Scp-918/python_notebook_base3 --base change2 --head wqwshn:m
 
 ## 环境与命令
 
-- conda 环境 `ppg-hr`，所有命令通过 `conda run -n ppg-hr` 执行。
+- conda 环境 `PPG_sensor_env`，所有命令通过 `conda run -n PPG_sensor_env` 执行。
 - 无 `setup.py`/`pyproject.toml`，通过 `sys.path.insert(0, src_dir)` 直接运行。
 
 ```bash
-conda run -n ppg-hr python -m pytest -q tests/           # 完整测试
-conda run -n ppg-hr python run_debug_protocol.py          # 冒烟测试
-conda run -n ppg-hr ruff check src/                        # 静态检查
+conda run -n PPG_sensor_env python -m pytest -q tests/           # 完整测试
+conda run -n PPG_sensor_env python run_debug_protocol.py          # 冒烟测试
+conda run -n PPG_sensor_env ruff check src/                        # 静态检查
 ```
 
 ## 设计约定

@@ -8,7 +8,7 @@
 
 ## 构建、测试与开发命令
 
-使用 conda 环境 `ppg-hr`。仓库当前没有 `setup.py` 或 `pyproject.toml`，因此本地命令需要显式设置 `PYTHONPATH=src`。
+使用 conda 环境 `PPG_sensor_env`。仓库当前没有 `setup.py` 或 `pyproject.toml`，因此本地命令需要显式设置 `PYTHONPATH=src`。
 
 ```powershell
 $env:PYTHONPATH="src"; conda run -n ppg-hr python -m pytest -q tests/
@@ -38,4 +38,4 @@ Python 代码使用 4 空格缩进。新增公共函数应保留类型标注和�
 
 日常提交信息使用中文，保持短小、明确、原子化，例如 `修复参考心率CSV解析`。不要使用 `--no-verify`。历史中也存在少量 `docs:` 前缀，可用于纯文档修改。
 
-PR 面向 `upstream/change2`，说明改动目的、核心文件、已运行测试和 Notebook/输出影响。不确定某个本地改动是否应提交时，先确认再纳入提交。
+PR 面向 `upstream/change3`，说明改动目的、核心文件、已运行测试和 Notebook/输出影响。不确定某个本地改动是否应提交时，先确认再纳入提交。
