@@ -1,11 +1,48 @@
 
-# 第二阶段批量自适应滤波协议说明
+# change3 三阶段批量自适应滤波协议说明
 
-本文档说明 `python_notebook_base` 当前 `change2` 分支中，`notebooks/run_batch_adaptive_protocol.ipynb` 与 `src/ppg_hr/` 相关代码的使用方式、数据格式、处理流程、贝叶斯训练参数、输出结果和重绘/重输出方法。
+本文档说明 `python_notebook_base` 当前 `change3` 分支中，`notebooks/run_batch_adaptive_protocol.ipynb` 与 `src/ppg_hr/` 相关代码的使用方式、数据格式、处理流程、贝叶斯训练参数、输出结果和重绘/重输出方法。
 
 本文面向第一次使用该工程的人，重点说明“应该改哪里、运行后会发生什么、输出在哪里看”。
 
 ---
+
+## 0. change3 三阶段改造速览
+
+当前 notebook 已同步三阶段改造，核心变化如下：
+
+```text
+阶段 1:
+    收缩 Optuna 搜索空间，减少低价值组合。
+    RFF-LMS 默认改为特征空间 NLMS，KLMS 默认使用归一化距离、字典上限和冻结新中心策略。
+
+阶段 2:
+    新增 PPG 输入策略 ppg_input_transform。
+    新增 global_objective_strategy，其中 deployment_global 用于模拟部署时 rest/motion/recovery 的 final HR 选择。
+    新增 cascade_guard_policy，rms_guard 可在级联某级输出 RMS 异常时回退本级输出。
+    global alignment cache key 已包含 PPG 输入变换相关字段。
+
+阶段 3:
+    训练输出统一增加 param_* 分列。
+    replay 和 diagnostics 统一通过 protocol_params_from_record 读取参数，优先 param_*，再兼容 best_params_json / params JSON。
+    窗口诊断图增加权重/诊断图，并在启用 guard 时区分完整级联输出和 guard 后实际使用输出。
+```
+
+对新手最重要的结论：
+
+```text
+想改实验策略:
+    优先改 notebook 第 0 块的固定参数。
+
+想启动训练:
+    运行第 0/1/5/7 块。
+
+想复现某个单文件曲线:
+    运行第 9/10 块，参数会从 Stage-6 记录恢复。
+
+想看某个窗口为什么选出这个 HR:
+    运行第 11 块，看 waveform、spectrum、weights 和 stage 摘要。
+```
 
 ## 1. 工程结构与运行说明
 
@@ -26,12 +63,14 @@ OUTPUT_ROOT = PROJECT_ROOT / "outputs"
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(r"D:\python_notebook_base3")
+PROJECT_ROOT = Path(r"D:\python_notebook_base")  # 请按本机实际仓库路径修改
 SRC_DIR = PROJECT_ROOT / "src"
 
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 ```
+
+`PROJECT_ROOT` 是运行 notebook 时的本机路径，只应作为本地配置使用；提交 notebook 时不要把临时实验路径写进版本库。
 
 核心 Notebook：
 
@@ -595,6 +634,32 @@ JSON
 cache key
 ```
 
+change3 阶段 1 后，RFF-LMS 默认使用特征空间 NLMS：
+
+```text
+rff_update_mode = "nlms"
+rff_nlms_eps = 1e-6
+rff_leakage = 0.0
+rff_err_clip = None
+rff_theta_norm_guard = None
+```
+
+这些是固定工程策略，不进入 Optuna 搜索空间，但会进入 `ProtocolTrialParams`、trial cache key 和 `param_*` 记录。旧的 LMS 更新仍可通过 `rff_update_mode="lms"` 兼容测试。
+
+#### KLMS
+
+KLMS 默认使用归一化距离和归一化更新，避免 tap 维度变化后 `klms_epsilon` 的实际尺度漂移：
+
+```text
+klms_distance_mode = "normalized"
+klms_normalized_update = True
+klms_nlms_eps = 1e-6
+klms_max_dictionary_size = 300
+klms_center_prune_policy = "freeze_new_centers"
+```
+
+`klms_epsilon` 字段名保留兼容旧记录；在默认 `normalized` 模式下，它的语义是 `squared_distance / tap_dim` 的阈值。若需要复现旧逻辑，可使用 `klms_distance_mode="absolute_squared"`。
+
 ---
 
 ## 4. 贝叶斯训练模式参数说明
@@ -868,7 +933,7 @@ abs_err <= 5 bpm 的窗口比例 × 100
 公共搜索项：
 
 ```text
-Fs_Target: [25, 50, 100]
+Fs_Target: [25, 50]
 TW: [6, 8, 10]
 Kstop: [0.2, 0.3, 0.5]
 max_order: [8, 12, 16, 20]
@@ -876,35 +941,33 @@ M_base: [1, 2]
 C_scale: [0.6, 0.9, 1.2, 1.5]
 K_max: [8, 12, 16, 20, 30]
 Spec_Penalty_Width: [0.1, 0.2, 0.3]
-smooth_win_len: [5, 7, 9]
 hr_range_hz: [20/60, 25/60, 30/60, 35/60, 40/60]
 slew_limit_bpm: [8, 10, 12, 14]
 slew_step_bpm: [5, 7, 9]
-Rest_HR_Track_Band_BPM: [20, 30, 50, 60, 80]
-Rest_HR_Slew_Limit_BPM: [1, 3, 5, 6, 8, 25]
-Rest_HR_Slew_Step_BPM: [0.5, 2, 4, 5, 8, 12]
 ```
+
+阶段 1 收缩搜索空间后，`smooth_win_len`、`Rest_HR_Track_Band_BPM`、`Rest_HR_Slew_Limit_BPM`、`Rest_HR_Slew_Step_BPM` 不再作为公共搜索项采样。它们仍保留在参数 dataclass 中，可通过 `trial_param_overrides` 固定传入，方便兼容旧记录和少量手动实验。
 
 LMS 专属搜索项：
 
 ```text
-LMS_Mu_Base: [0.008, 0.01, 0.012]
+LMS_Mu_Base: [0.004, 0.006, 0.008]
 ```
 
 Volterra 专属搜索项：
 
 ```text
-LMS_Mu_Base: [0.008, 0.01, 0.012]
-alpha_u: [0.01, 0.05, 0.1, 0.2]
-M2: [2, 3, 4, 5]
+LMS_Mu_Base: [0.004, 0.006, 0.008]
+alpha_u: [0.005, 0.01, 0.03, 0.05, 0.1]
+M2: [2, 3]
 ```
 
 RFF-LMS 专属搜索项：
 
 ```text
-RFF_LMS_Mu_Base: [0.006, 0.008, 0.01]
-rff_D: [50, 100, 200, 300]
-rff_sigma: [0.1, 0.5, 1.0, 2.0, 5.0]
+RFF_LMS_Mu_Base: [0.001, 0.002, 0.004, 0.006]
+rff_D: [50, 100, 200]
+rff_sigma: [0.5, 1.0, 2.0, 5.0]
 ```
 
 注意：RFF-LMS 采样的是 `RFF_LMS_Mu_Base`，但解码后仍写回统一字段：
@@ -914,6 +977,14 @@ LMS_Mu_Base
 ```
 
 这样下游求解器可以统一读取。
+
+KLMS 专属搜索项：
+
+```text
+klms_step_size: [0.005, 0.01, 0.02, 0.05]
+klms_sigma: [0.5, 1.0, 2.0, 5.0]
+klms_epsilon: [0.005, 0.01, 0.02, 0.05, 0.1]
+```
 
 ### 4.9 固定参数：不进入贝叶斯搜索空间
 
@@ -927,8 +998,15 @@ TRIAL_PARAM_OVERRIDES = {
     "delay_estimation_mode": "envelope",
     "Alignment_TW": 8.0,
     "Alignment_Step": 1.0,
+    "rff_update_mode": "nlms",
+    "klms_distance_mode": "normalized",
+    "ppg_input_transform": "raw_bandpass",
+    "global_objective_strategy": "current_global_adaptive",
+    "cascade_guard_policy": "none",
 }
 ```
+
+这些字段的来源通常是 notebook 第 0 块的 `REST_HR_TRIAL_OVERRIDES`。第 5 块 `run_training_cell()` 会复制这份字典，并把调用处临时传入的覆盖项叠加进去。
 
 #### TW_F
 
@@ -1003,11 +1081,52 @@ Alignment_Step:
     静息段全局 Tdelay 搜索步长，默认 1 秒。
 ```
 
+#### RFF/KLMS 稳定性固定参数
+
+这些参数只影响对应滤波器，不参与 Optuna 采样：
+
+```text
+rff_update_mode:
+    默认 "nlms"，表示 RFF-LMS 在随机特征空间做归一化 LMS 更新。
+
+rff_nlms_eps / rff_leakage / rff_err_clip / rff_theta_norm_guard:
+    RFF-LMS 的数值保护参数，默认尽量保持轻量，只启用 NLMS 分母保护。
+
+klms_distance_mode:
+    默认 "normalized"，表示中心距离使用 squared_distance / tap_dim。
+
+klms_max_dictionary_size:
+    KLMS 字典中心上限，默认 300。
+
+klms_center_prune_policy:
+    默认 "freeze_new_centers"，到达字典上限后不再新增中心。
+```
+
+#### PPG 输入、global objective 与 cascade guard
+
+阶段 2 新增三类固定策略：
+
+```text
+ppg_input_transform:
+    "raw_bandpass" 表示沿用旧流程，清洗后 PPG 直接带通。
+    "log_absorbance" 表示先用慢变 I0(t) 计算 -log(I/I0)，再进入带通和后续 HR 求解。
+
+global_objective_strategy:
+    "current_global_adaptive" 保留旧 global 逻辑。
+    "deployment_global" 更贴近部署场景：rest 优先 baseline，motion 优先 adaptive，recovery 由融合/回退逻辑决定。
+
+cascade_guard_policy:
+    "none" 表示使用完整级联输出。
+    "rms_guard" 会检查每一级输出 RMS ratio，异常时回退本级输出，避免某一级发散污染后续级联。
+```
+
+修改 `ppg_input_transform` 后，全局 Tdelay cache key 会随之变化；不要把不同输入策略的缓存结果混在一起解读。
+
 ### 4.10 Rest HR 与 Tdelay 相关固定参数
 
 以下为静息段后处理的固定配置，不进入贝叶斯搜索空间。
 静息段谱峰追踪参数（`Rest_HR_Track_Band_BPM` / `Rest_HR_Slew_Limit_BPM` /
-`Rest_HR_Slew_Step_BPM`）已进入公共搜索空间，参见 4.8 节。
+`Rest_HR_Slew_Step_BPM`）在阶段 1 后也改为固定参数，通常从 notebook 第 0 块传入。
 
 常用默认值：
 
@@ -1120,6 +1239,33 @@ num_repeats > 1
 不做 window 级并行，因为窗口 HR tracking 依赖上一窗口 HR，是顺序状态。
 
 ### 4.15 stage JSON
+
+窗口诊断时，stage JSON 会记录每一级级联滤波的短摘要和必要波形字段：
+
+```text
+channel
+M / K / mu
+reference_channel_ranking
+output_signal
+cascade_full_output_signal
+cascade_guarded_output_signal
+diagnostics
+```
+
+含义：
+
+```text
+output_signal:
+    本级最终交给后续流程使用的输出。
+
+cascade_full_output_signal:
+    不考虑 guard 回退时的完整级联输出。
+
+cascade_guarded_output_signal:
+    启用 rms_guard 后实际使用的输出。
+```
+
+普通训练不会把所有长诊断数组无限扩展写入汇总 CSV；这些字段主要用于 Stage-8 单窗诊断图。
 
 正式 batch 默认：
 
@@ -1381,6 +1527,21 @@ best_params_klms.csv
 
 常用于手动重画最佳参数 HR 曲线。
 
+change3 后，这些表和 `best_params_and_alignment.csv` 都会尽量写出 `param_*` 分列，例如：
+
+```text
+param_Fs_Target
+param_TW
+param_LMS_Mu_Base
+param_rff_update_mode
+param_klms_distance_mode
+param_ppg_input_transform
+param_global_objective_strategy
+param_cascade_guard_policy
+```
+
+`param_*` 是新 replay / diagnostics 的首选参数来源。它比 JSON 字符串更适合人工筛选，也能避免不同字段同名时混淆。
+
 ### 5.9 best_params_all.json
 
 保存每个 motion_type 下所有模式的最佳参数和指标。
@@ -1406,7 +1567,10 @@ accuracy_pct
 best_so_far
 success
 reason
+param_*
 ```
+
+`bayes_curve_data.csv` 中的 `param_*` 表示每个 trial 实际使用的完整参数快照。它适合排查“某次 trial 为什么好/差”，也适合和 Stage-6 最优记录做字段对照。
 
 `bayes_curve.png` 的子图数量由下面三者相乘决定：
 
@@ -1434,9 +1598,21 @@ best_tdelay_s
 best_params_json
 result_level
 params_semantics
+param_*
 ```
 
 这是后续 replay / 重输出的重要输入表。
+
+参数读取优先级：
+
+```text
+1. param_* 分列
+2. best_params_json 或 params JSON
+3. 同行裸字段
+4. ProtocolTrialParams 默认值
+```
+
+因此旧训练输出仍可重绘，但正式分析建议使用包含 `param_*` 的新输出。
 
 ### 5.12 best_metrics.csv
 
@@ -1672,6 +1848,21 @@ fusion_reason
 ---
 
 ### 6.2 单个文件窗口级波形与频谱诊断图重绘
+
+change3 后，窗口级诊断会输出三类图：
+
+```text
+window_waveform_*.png:
+    当前窗口的原始 PPG、级联 stage 中间输出、完整级联输出和 guard 后实际使用输出。
+
+window_spectrum_*.png:
+    FFT window 内的原始频谱、自适应滤波后频谱、运动惩罚后频谱，以及 motion/候选 HR 标记。
+
+window_weights_*.png:
+    自适应滤波器权重、KLMS 字典或短诊断摘要。
+```
+
+如果 `cascade_guard_policy="rms_guard"`，波形图中的“完整级联”和“guard 后实际使用”可能不同。这通常表示某一级输出 RMS 异常，被 guard 回退保护，不代表 replay 失败。
 
 #### 6.2.1 功能目的
 
@@ -2285,6 +2476,11 @@ TRIAL_PARAM_OVERRIDES = {
     "Enable_Time_Bias_After": True,
     "Time_Bias_After_Range_S": (-5.0, 5.0),
     "Time_Bias_After_Step_S": 1.0,
+    "rff_update_mode": "nlms",
+    "klms_distance_mode": "normalized",
+    "ppg_input_transform": "raw_bandpass",
+    "global_objective_strategy": "current_global_adaptive",
+    "cascade_guard_policy": "none",
 }
 ```
 
@@ -2306,6 +2502,18 @@ delay_estimation_mode:
 
 Alignment_TW:
     静息段全局 Tdelay 搜索窗口。
+
+rff_update_mode / klms_distance_mode:
+    RFF-LMS 与 KLMS 的稳定性策略。
+
+ppg_input_transform:
+    PPG 输入变换策略，默认 raw_bandpass；可切换 log_absorbance 做对照。
+
+global_objective_strategy:
+    global 目标和 final HR 选择策略。
+
+cascade_guard_policy:
+    级联保护策略，默认 none；rms_guard 会在某级输出异常时回退。
 ```
 
 ---
@@ -2764,6 +2972,7 @@ Notebook 共 15 个代码块，按流水线组织为"环境初始化 — 诊断�
 - 定义项目路径 `PROJECT_ROOT`、源码路径 `SRC_DIR`、测试数据目录 `TESTDATA_DIR`、输出根目录 `OUTPUT_ROOT`
 - 将 `src/` 加入 `sys.path`，导入 `ppg_hr` 所有依赖
 - 定义**全部固定参数**（TW_F、normalization_mode、qc_policy、Alignment_TW、静息段 HR 后处理参数、恢复段容差等）
+- 定义 change3 新增固定策略（RFF/KLMS 稳定性、PPG 输入变换、global objective、cascade guard、param_* 读取优先级）
 - 定义默认训练组合（target scope / cascade scheme / adaptive filter / 预算）
 - 调用 `make_unique_output_dir()` 创建本次运行的输出子目录 `RUN_OUTPUT_DIR`
 
@@ -2819,6 +3028,7 @@ Notebook 共 15 个代码块，按流水线组织为"环境初始化 — 诊断�
 - 定义 `run_training_cell()` 函数，封装 `run_batch_adaptive_protocol` 的完整调用
 - 定义 `notebook_progress` 进度回调，每 10 个 trial 打印一次关键指标
 - 定义 `make_budgets()` 快捷生成每个 cascade scheme 的训练预算
+- 合并 `trial_param_overrides`，把第 0 块固定策略传入 `ProtocolTrialParams`
 
 后续代码块 7/8 只需填参数组合 + 调用 `run_training_cell()` 即可启动训练。
 
@@ -2859,6 +3069,7 @@ Notebook 共 15 个代码块，按流水线组织为"环境初始化 — 诊断�
   - `motion_frequency_and_params.csv`
   - `full_report.json`
 - 展示关键列和 fusion 分布
+- 确认新记录是否含有 `param_*` 分列，供后续 replay/diagnostics 优先读取
 
 如果代码块 10 找不到 `best_params_and_alignment.csv`，先回本块确认路径正确。
 
@@ -2869,6 +3080,7 @@ Notebook 共 15 个代码块，按流水线组织为"环境初始化 — 诊断�
 - 从 `best_params_and_alignment.csv` 自动匹配并恢复最优参数
 - 对**单个指定的 CSV 文件**（`REPLAY_SIGNAL_CSV` + `REPLAY_REF_CSV`）重新跑完整 HR 提取
 - 输出 HR 曲线 PNG（含 Reference/Baseline/Adaptive/Final 四条曲线）和窗口级 CSV
+- 参数恢复统一使用 `protocol_params_from_record`，优先 `param_*`，再兼容旧 JSON
 
 需要指定：`REPLAY_SIGNAL_CSV`、`REPLAY_REF_CSV`、`REPLAY_MOTION_TYPE`、`REPLAY_TARGET_SCOPE`、`REPLAY_ADAPTIVE_FILTER`、`REPLAY_CASCADE_SCHEME`。
 
@@ -2877,9 +3089,10 @@ Notebook 共 15 个代码块，按流水线组织为"环境初始化 — 诊断�
 **依赖代码块 10 的 replay 结果。** 默认开启 (`RUN_WINDOW_DIAGNOSTICS = True`)。作用：
 
 - 选取一个 FFT 窗口（由 `MANUAL_ALIGNED_FFT_START_S` 指定秒数起点），深度诊断
-- 生成两张图：
+- 生成三类图：
   - **波形图**：双 y 轴，左轴画原始 PPG 和各 stage 中间波形，右轴画最终自适应滤波后波形
   - **频谱图**：仅用 FFT window 内数据，画三条归一化幅频谱（原始 PPG / 自适应滤波后 / 加运动惩罚后），标注 motion 峰和候选 HR
+- 额外生成 **权重/诊断图**：查看 `window_weights_*.png` 中的滤波器权重、KLMS 字典或短诊断摘要
 - 输出 stage 摘要表（每级的 channel、M、K、mu、reference_channel_ranking 等）
 
 注：stage 1/2/... 是级联滤波中每个自适应步骤的中间输出，不是最终 HR，也不是新的搜索参数表。
