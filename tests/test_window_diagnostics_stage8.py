@@ -163,6 +163,14 @@ def test_window_diagnostics_from_records_plots_selected_fft_window_and_stages(
             "penalty_ref_channel": "accx",
             "reference_channel_ranking": {"ACC": ["accx", "accy", "accz"]},
             "output_signal": [0.2, 0.1, 0.0],
+            "cascade_full_output_signal": [0.3, 0.2, 0.1],
+            "cascade_guarded_output_signal": [0.2, 0.1, 0.0],
+            "guard_policy": "rms_guard",
+            "accepted": False,
+            "reject_reason": "rms_ratio_out_of_range",
+            "rms_before": 1.0,
+            "rms_after": 8.0,
+            "rms_ratio": 8.0,
             "weight_norm_t": [0.0, 0.2, 0.3],
             "max_abs_weight_t": [0.0, 0.1, 0.15],
         }
@@ -208,10 +216,10 @@ def test_window_diagnostics_from_records_plots_selected_fft_window_and_stages(
         motion_frequency=1.0,
         metric_arrays={},
     )
-    call_kwargs: dict[str, object] = {}
+    calls: list[dict[str, object]] = []
 
-    def fake_run_protocol_trial(*args, **kwargs):
-        call_kwargs.update(kwargs)
+    def fake_run_protocol_trial(_dataset, _scheme, _scope, trial_params, **kwargs):
+        calls.append({"params": trial_params, **kwargs})
         return run
 
     monkeypatch.setattr(rbp, "load_and_preprocess_protocol", lambda *args, **kwargs: dataset)
@@ -234,16 +242,36 @@ def test_window_diagnostics_from_records_plots_selected_fft_window_and_stages(
         results_root=tmp_path / "results",
     )
 
-    assert call_kwargs["collect_stages"] is True
+    assert len(calls) == 2
+    assert [call["params"].cascade_guard_policy for call in calls] == ["none", "rms_guard"]
+    assert all(call["collect_stages"] is True for call in calls)
+    assert all(call["collect_frame"] is True for call in calls)
+    assert paths["waveform_full_cascade"].exists()
+    assert paths["spectrum_full_cascade"].exists()
+    assert paths["weights_full_cascade"].exists()
+    assert paths["waveform_guarded"].exists()
+    assert paths["spectrum_guarded"].exists()
+    assert paths["weights_guarded"].exists()
     assert paths["waveform"].exists()
     assert paths["spectrum"].exists()
     assert paths["weights"].exists()
+    assert paths["waveform"] == paths["waveform_guarded"]
+    assert paths["spectrum"] == paths["spectrum_guarded"]
+    assert paths["weights"] == paths["weights_guarded"]
+    assert paths["waveform_full_cascade"].name.endswith("_full_cascade.png")
+    assert paths["waveform_guarded"].name.endswith("_guarded.png")
+    assert set(paths["variants"]) == {"full_cascade", "guarded"}
+    assert paths["variants"]["full_cascade"]["params"]["cascade_guard_policy"] == "none"
+    assert paths["variants"]["guarded"]["params"]["cascade_guard_policy"] == "rms_guard"
     assert len(paths["stages"]) == 1
+    assert paths["stages"][0]["guard_policy"] == "rms_guard"
+    assert paths["stages"][0]["accepted"] is False
+    assert paths["variants"]["guarded"]["rejected_stage_count"] == 1
     assert paths["stages"][0]["reference_channel_ranking"]["ACC"][0] == "accx"
     assert paths["best_params"]["TW_F"] == 1.0
     assert paths["best_record"]["cascade_scheme"] == "ACC3"
     assert "spectrum_info" in paths
-    assert "tiaosheng_lms_ACC3_TW_F1s_motion_only_start2s" in paths["waveform"].name
+    assert "tiaosheng_lms_ACC3_TW_F1s_motion_only_start2s" in paths["waveform_guarded"].name
 
 
 def test_window_waveform_diagnostic_uses_dual_y_axes(tmp_path: Path, monkeypatch) -> None:
@@ -404,7 +432,8 @@ def test_window_diagnostics_resamples_context_to_stage_sample_rate(tmp_path: Pat
         ref_time_s=resampled_time,
         ref_hr_bpm=np.full_like(resampled_time, 72.0),
     )
-    stage_signal = np.sin(2 * np.pi * 1.3 * np.arange(1250, dtype=float) / 50.0)
+    stage_signal_full = np.sin(2 * np.pi * 1.3 * np.arange(1250, dtype=float) / 50.0)
+    stage_signal_guarded = np.sin(2 * np.pi * 1.7 * np.arange(1250, dtype=float) / 50.0)
     stages = [
         {
             "sensor_type": "ACC",
@@ -417,7 +446,9 @@ def test_window_diagnostics_resamples_context_to_stage_sample_rate(tmp_path: Pat
             "adaptive_input_samples": 1250,
             "fft_input_samples": 500,
             "fft_offset_samples": 750,
-            "output_signal": stage_signal.tolist(),
+            "output_signal": stage_signal_guarded.tolist(),
+            "cascade_full_output_signal": stage_signal_full.tolist(),
+            "cascade_guarded_output_signal": stage_signal_guarded.tolist(),
         }
     ]
     frame = pd.DataFrame(
@@ -460,11 +491,14 @@ def test_window_diagnostics_resamples_context_to_stage_sample_rate(tmp_path: Pat
         motion_frequency=1.0,
         metric_arrays={},
     )
-    captured: dict[str, np.ndarray] = {}
+    captured: dict[str, dict[str, np.ndarray]] = {}
 
     def fake_spectrum_plot(out_path, **kwargs):
-        captured["raw_ppg"] = np.asarray(kwargs["raw_ppg"], dtype=float)
-        captured["filtered"] = np.asarray(kwargs["filtered"], dtype=float)
+        variant = "full_cascade" if str(out_path).endswith("_full_cascade.png") else "guarded"
+        captured[variant] = {
+            "raw_ppg": np.asarray(kwargs["raw_ppg"], dtype=float),
+            "filtered": np.asarray(kwargs["filtered"], dtype=float),
+        }
         Path(out_path).write_bytes(b"fake-png")
         return {"motion_artifact_peak_hz": 1.0, "penalized_spectrum_hr_bpm": 78.0}
 
@@ -490,7 +524,11 @@ def test_window_diagnostics_resamples_context_to_stage_sample_rate(tmp_path: Pat
         results_root=tmp_path / "results",
     )
 
-    assert captured["raw_ppg"].size == 500
-    assert captured["filtered"].size == 500
-    assert np.isfinite(captured["filtered"]).all()
-    assert not np.allclose(captured["filtered"], 0.0)
+    assert set(captured) == {"full_cascade", "guarded"}
+    assert captured["full_cascade"]["raw_ppg"].size == 500
+    assert captured["full_cascade"]["filtered"].size == 500
+    assert captured["guarded"]["filtered"].size == 500
+    assert np.isfinite(captured["full_cascade"]["filtered"]).all()
+    assert np.isfinite(captured["guarded"]["filtered"]).all()
+    assert np.allclose(captured["full_cascade"]["filtered"], stage_signal_full[750:1250])
+    assert np.allclose(captured["guarded"]["filtered"], stage_signal_guarded[750:1250])

@@ -3218,6 +3218,15 @@ def _row_float(row: pd.Series, column: str, default: float = float("nan")) -> fl
         return float(default)
 
 
+def _with_cascade_guard_policy(params: ProtocolTrialParams, policy: str) -> ProtocolTrialParams:
+    """Return a params copy with only the cascade guard policy changed."""
+
+    policy_text = str(policy)
+    if policy_text not in {"none", "rms_guard"}:
+        raise ValueError("cascade_guard_policy must be 'none' or 'rms_guard'")
+    return replace(params, cascade_guard_policy=policy_text)
+
+
 def plot_window_diagnostics_from_records(
     *,
     signal_csv: str | Path,
@@ -3265,17 +3274,95 @@ def plot_window_diagnostics_from_records(
     scope = TargetScope(target_scope)
     dataset = load_and_preprocess_protocol(signal_csv, ref_csv, fs_origin=fs_origin)
     dataset = resample_protocol_dataset(dataset, fs_target=int(params.Fs_Target))
+    label_data_type = adaptive_data_type or scheme_text
+    if override_cascade_scheme:
+        title_prefix = f"Params: {scheme_text} -> Run: {override_cascade_scheme}"
+        label = (
+            f"cross_{label_data_type}_to_{override_cascade_scheme}_{motion_type}_"
+            f"{params.adaptive_filter}_{_tw_f_run_label(params.TW_F)}_{scope.value}_start{_compact_float_label(aligned_fft_start_s)}s"
+        )
+    else:
+        title_prefix = scheme.value
+        label = (
+            f"{motion_type}_{params.adaptive_filter}_{label_data_type}_"
+            f"{_tw_f_run_label(params.TW_F)}_{scope.value}_start{_compact_float_label(aligned_fft_start_s)}s"
+        )
+
+    variants = {
+        "full_cascade": _run_window_diagnostic_variant(
+            dataset=dataset,
+            scheme=scheme,
+            scope=scope,
+            params=_with_cascade_guard_policy(params, "none"),
+            output_dir=out_dir,
+            label=label,
+            variant_name="full_cascade",
+            output_mode="full_cascade",
+            motion_type=motion_type,
+            title_prefix=title_prefix,
+            aligned_fft_start_s=aligned_fft_start_s,
+        ),
+        "guarded": _run_window_diagnostic_variant(
+            dataset=dataset,
+            scheme=scheme,
+            scope=scope,
+            params=_with_cascade_guard_policy(params, "rms_guard"),
+            output_dir=out_dir,
+            label=label,
+            variant_name="guarded",
+            output_mode="guarded",
+            motion_type=motion_type,
+            title_prefix=title_prefix,
+            aligned_fft_start_s=aligned_fft_start_s,
+        ),
+    }
+    guarded = variants["guarded"]
+    return {
+        "waveform_full_cascade": variants["full_cascade"]["waveform"],
+        "spectrum_full_cascade": variants["full_cascade"]["spectrum"],
+        "weights_full_cascade": variants["full_cascade"]["weights"],
+        "waveform_guarded": guarded["waveform"],
+        "spectrum_guarded": guarded["spectrum"],
+        "weights_guarded": guarded["weights"],
+        "variants": variants,
+        "waveform": guarded["waveform"],
+        "spectrum": guarded["spectrum"],
+        "weights": guarded["weights"],
+        "stages": guarded["stages"],
+        "window": guarded["window"],
+        "best_params": guarded["params"],
+        "best_record": best_row.to_dict(),
+        "spectrum_info": guarded["spectrum_info"],
+    }
+
+
+def _run_window_diagnostic_variant(
+    *,
+    dataset: ProtocolDataset,
+    scheme: CascadeScheme,
+    scope: TargetScope,
+    params: ProtocolTrialParams,
+    output_dir: Path,
+    label: str,
+    variant_name: str,
+    output_mode: str,
+    motion_type: str,
+    title_prefix: str,
+    aligned_fft_start_s: float,
+) -> dict[str, Any]:
+    """Run one diagnostic replay variant and write waveform/spectrum/weights plots."""
+
     run = run_protocol_trial(dataset, scheme, scope, params, collect_frame=True, collect_stages=True)
     if not run.success:
-        raise RuntimeError(f"Window diagnostic replay failed: {run.reason}")
+        raise RuntimeError(f"Window diagnostic replay failed ({variant_name}): {run.reason}")
     frame = run.frame.copy()
     if frame.empty:
-        raise RuntimeError("Window diagnostic replay produced no frame")
+        raise RuntimeError(f"Window diagnostic replay produced no frame ({variant_name})")
 
     row = _select_window_diagnostic_row(frame, aligned_fft_start_s)
     stages = _parse_window_stages(row)
     raw_time, raw_ppg = _diagnostic_ppg_context(dataset, row, params)
-    filtered = _diagnostic_filtered_signal(stages, raw_ppg)
+    filtered = _diagnostic_filtered_signal(stages, raw_ppg, output_mode=output_mode)
     fft_start = float(row.get("fft_start_s", aligned_fft_start_s))
     fft_end = float(row.get("fft_end_s", fft_start + float(params.TW)))
     adaptive_start = float(row.get("adaptive_start_s", fft_start - float(params.TW_F)))
@@ -3305,22 +3392,10 @@ def plot_window_diagnostics_from_records(
         fft_end_s=fft_end,
         adaptive_start_s=adaptive_start,
     )
-    label_data_type = adaptive_data_type or scheme_text
-    if override_cascade_scheme:
-        title_prefix = f"Params: {scheme_text} -> Run: {override_cascade_scheme}"
-        label = (
-            f"cross_{label_data_type}_to_{override_cascade_scheme}_{motion_type}_"
-            f"{params.adaptive_filter}_{_tw_f_run_label(params.TW_F)}_{scope.value}_start{_compact_float_label(aligned_fft_start_s)}s"
-        )
-    else:
-        title_prefix = scheme.value
-        label = (
-            f"{motion_type}_{params.adaptive_filter}_{label_data_type}_"
-            f"{_tw_f_run_label(params.TW_F)}_{scope.value}_start{_compact_float_label(aligned_fft_start_s)}s"
-        )
-    waveform_path = out_dir / f"window_waveform_{label}.png"
-    spectrum_path = out_dir / f"window_spectrum_{label}.png"
-    weights_path = out_dir / f"window_weights_{label}.png"
+    waveform_path = output_dir / f"window_waveform_{label}_{variant_name}.png"
+    spectrum_path = output_dir / f"window_spectrum_{label}_{variant_name}.png"
+    weights_path = output_dir / f"window_weights_{label}_{variant_name}.png"
+    title_suffix = variant_name.replace("_", " ")
     _plot_window_waveform_diagnostic(
         waveform_path,
         time_s=raw_time,
@@ -3330,7 +3405,10 @@ def plot_window_diagnostics_from_records(
         adaptive_start_s=adaptive_start,
         fft_start_s=fft_start,
         fft_end_s=fft_end,
-        title=f"{motion_type} | {params.adaptive_filter} | {title_prefix} | {_tw_f_run_label(params.TW_F)}",
+        title=(
+            f"{motion_type} | {params.adaptive_filter} | {title_prefix} | "
+            f"{_tw_f_run_label(params.TW_F)} | {title_suffix}"
+        ),
     )
     spectrum_info = _plot_window_spectrum_diagnostic(
         spectrum_path,
@@ -3341,22 +3419,25 @@ def plot_window_diagnostics_from_records(
         penalty_width_hz=float(getattr(params, "Spec_Penalty_Width", 0.2)),
         penalty_weight=float(getattr(params, "Spec_Penalty_Weight", 0.2)),
         penalty_ref_channel=penalty_ref_channel,
-        title=f"{motion_type} spectrum | start {aligned_fft_start_s:g}s",
+        title=f"{motion_type} spectrum | {title_suffix} | start {aligned_fft_start_s:g}s",
     )
     _plot_window_weight_diagnostic(
         weights_path,
         stages=stages,
-        title=f"{motion_type} weights | {params.adaptive_filter} | start {aligned_fft_start_s:g}s",
+        title=f"{motion_type} weights | {params.adaptive_filter} | {title_suffix} | start {aligned_fft_start_s:g}s",
     )
+    rejected_stage_count = sum(1 for stage in stages if stage.get("accepted") is False)
     return {
         "waveform": waveform_path,
         "spectrum": spectrum_path,
         "weights": weights_path,
         "stages": stages,
         "window": row.to_dict(),
-        "best_params": params.to_dict(),
-        "best_record": best_row.to_dict(),
+        "params": params.to_dict(),
         "spectrum_info": spectrum_info,
+        "guard_policy": params.cascade_guard_policy,
+        "stage_count": len(stages),
+        "rejected_stage_count": int(rejected_stage_count),
     }
 
 
@@ -3473,16 +3554,25 @@ def _stage_penalty_ref_channel(stages: list[dict[str, Any]]) -> str:
     return ""
 
 
-def _diagnostic_filtered_signal(stages: list[dict[str, Any]], raw_ppg: np.ndarray) -> np.ndarray:
+def _diagnostic_filtered_signal(
+    stages: list[dict[str, Any]],
+    raw_ppg: np.ndarray,
+    *,
+    output_mode: str = "guarded",
+) -> np.ndarray:
     """Return the final stage output if present, otherwise a raw-signal fallback."""
 
+    if output_mode == "full_cascade":
+        signal_keys = ("cascade_full_output_signal", "output_signal")
+    else:
+        signal_keys = ("cascade_guarded_output_signal", "output_signal")
     for stage in reversed(stages):
-        signal_key = "cascade_guarded_output_signal" if "cascade_guarded_output_signal" in stage else "output_signal"
-        if signal_key not in stage:
-            continue
-        values = np.asarray(stage.get(signal_key), dtype=float)
-        if values.size:
-            return _align_signal_to_context(values, len(raw_ppg))
+        for signal_key in signal_keys:
+            if signal_key not in stage:
+                continue
+            values = np.asarray(stage.get(signal_key), dtype=float)
+            if values.size:
+                return _align_signal_to_context(values, len(raw_ppg))
     return np.asarray(raw_ppg, dtype=float)
 
 
@@ -3838,16 +3928,8 @@ def replay_best_record_hr_curves(
     scope = TargetScope(target_scope)
 
     dataset = load_and_preprocess_protocol(signal_csv, ref_csv, fs_origin=fs_origin)
-    run = run_protocol_trial(dataset, scheme, scope, params, collect_frame=True, collect_stages=False)
-    if not run.success:
-        raise RuntimeError(f"Replay failed: {run.reason}")
-    frame = run.frame.copy()
-    if frame.empty:
-        raise RuntimeError("Replay produced no window frame")
-
-    replay_frame = _build_replay_frame(frame)
     label_data_type = adaptive_data_type or scheme_text
-    
+
     if override_cascade_scheme:
         title_prefix = f"Params: {scheme_text} -> Run: {override_cascade_scheme}"
         label = f"cross_{label_data_type}_to_{override_cascade_scheme}_{motion_type}_{params.adaptive_filter}_{_tw_f_run_label(params.TW_F)}_{scope.value}"
@@ -3855,10 +3937,64 @@ def replay_best_record_hr_curves(
         title_prefix = scheme.value
         label = f"{motion_type}_{params.adaptive_filter}_{label_data_type}_{_tw_f_run_label(params.TW_F)}_{scope.value}"
 
-    csv_path = out_dir / f"replay_{label}.csv"
-    plot_path = out_dir / f"replay_{label}.png"
+    full = _run_replay_variant(
+        dataset=dataset,
+        scheme=scheme,
+        scope=scope,
+        params=_with_cascade_guard_policy(params, "none"),
+        output_dir=out_dir,
+        label=label,
+        variant_name="full_cascade",
+        motion_type=motion_type,
+        title_prefix=f"{title_prefix} | full cascade",
+    )
+    guarded = _run_replay_variant(
+        dataset=dataset,
+        scheme=scheme,
+        scope=scope,
+        params=_with_cascade_guard_policy(params, "rms_guard"),
+        output_dir=out_dir,
+        label=label,
+        variant_name="guarded",
+        motion_type=motion_type,
+        title_prefix=f"{title_prefix} | guarded",
+    )
+    return {
+        "plot_full_cascade": full["plot"],
+        "csv_full_cascade": full["csv"],
+        "plot_guarded": guarded["plot"],
+        "csv_guarded": guarded["csv"],
+        "plot": guarded["plot"],
+        "csv": guarded["csv"],
+    }
+
+
+def _run_replay_variant(
+    *,
+    dataset: ProtocolDataset,
+    scheme: CascadeScheme,
+    scope: TargetScope,
+    params: ProtocolTrialParams,
+    output_dir: Path,
+    label: str,
+    variant_name: str,
+    motion_type: str,
+    title_prefix: str,
+) -> dict[str, Path]:
+    """Run one replay variant and write its HR curve CSV/PNG."""
+
+    run = run_protocol_trial(dataset, scheme, scope, params, collect_frame=True, collect_stages=False)
+    if not run.success:
+        raise RuntimeError(f"Replay failed ({variant_name}): {run.reason}")
+    frame = run.frame.copy()
+    if frame.empty:
+        raise RuntimeError(f"Replay produced no window frame ({variant_name})")
+
+    replay_frame = _build_replay_frame(frame)
+    csv_path = output_dir / f"replay_{label}_{variant_name}.csv"
+    plot_path = output_dir / f"replay_{label}_{variant_name}.png"
     replay_frame.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    
+
     _plot_replay_hr_curves(
         plot_path,
         dataset=dataset,

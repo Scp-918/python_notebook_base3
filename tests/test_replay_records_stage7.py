@@ -91,8 +91,14 @@ def test_replay_best_record_hr_curves_reads_stage6_records_without_training(
         motion_frequency=None,
         metric_arrays={},
     )
+    calls: list[dict[str, object]] = []
+
+    def fake_run_protocol_trial(_dataset, _scheme, _scope, trial_params, **kwargs):
+        calls.append({"params": trial_params, **kwargs})
+        return run
+
     monkeypatch.setattr(rbp, "load_and_preprocess_protocol", lambda *args, **kwargs: dataset)
-    monkeypatch.setattr(rbp, "run_protocol_trial", lambda *args, **kwargs: run)
+    monkeypatch.setattr(rbp, "run_protocol_trial", fake_run_protocol_trial)
 
     paths = rbp.replay_best_record_hr_curves(
         signal_csv=tmp_path / "multi_tiaosheng1.csv",
@@ -109,10 +115,20 @@ def test_replay_best_record_hr_curves_reads_stage6_records_without_training(
         results_root=tmp_path / "results",
     )
 
-    assert paths["plot"].exists()
-    assert paths["csv"].exists()
-    assert "tiaosheng_lms_ACC3_TW_F0s_motion_only" in paths["plot"].name
-    out = pd.read_csv(paths["csv"])
+    assert len(calls) == 2
+    assert [call["params"].cascade_guard_policy for call in calls] == ["none", "rms_guard"]
+    assert all(call["collect_frame"] is True for call in calls)
+    assert all(call["collect_stages"] is False for call in calls)
+    assert paths["plot_full_cascade"].exists()
+    assert paths["csv_full_cascade"].exists()
+    assert paths["plot_guarded"].exists()
+    assert paths["csv_guarded"].exists()
+    assert paths["plot"] == paths["plot_guarded"]
+    assert paths["csv"] == paths["csv_guarded"]
+    assert paths["plot_full_cascade"].name.endswith("_full_cascade.png")
+    assert paths["plot_guarded"].name.endswith("_guarded.png")
+    assert "tiaosheng_lms_ACC3_TW_F0s_motion_only" in paths["plot_guarded"].name
+    out = pd.read_csv(paths["csv_guarded"])
     assert {"baseline_hr_bpm", "adaptive_hr_bpm", "final_hr_bpm", "reference_hr_bpm"}.issubset(out.columns)
 
 
