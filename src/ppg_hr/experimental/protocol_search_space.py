@@ -43,7 +43,7 @@ class ProtocolTrialParams:
     C_scale: float = 1.2
     K_max: int = 12
     Spec_Penalty_Width: float = 0.2
-    Spec_Penalty_Weight: float = 0.2
+    Spec_Penalty_Weight: float = 0.4
     smooth_win_len: int = 7
     hr_range_hz: float = 25.0 / 60.0
     slew_limit_bpm: int = 10
@@ -90,6 +90,9 @@ class ProtocolTrialParams:
     rff_D: int = 100
     rff_sigma: float = 1.0
     rff_seed: int = 0
+    klms_step_size: float = 0.05
+    klms_sigma: float = 1.0
+    klms_epsilon: float = 0.1
 
     def to_dict(self) -> dict[str, Any]:
         """Return parameter values as plain Python scalars."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from ppg_hr.experimental.klms import noncausal_klms_filter
 from ppg_hr.experimental.noncausal_lms import noncausal_lms_filter
 from ppg_hr.experimental.rff_lms import get_rff_weights, noncausal_rff_lms_filter
 from ppg_hr.experimental.tap_matrix import build_noncausal_tap_matrix
@@ -120,6 +121,53 @@ def _ref_rff(
     return out
 
 
+def _ref_klms(
+    u: np.ndarray,
+    d: np.ndarray,
+    M: int,
+    K: int,
+    mu: float,
+    sigma: float,
+    epsilon: float,
+) -> np.ndarray:
+    u_arr = _zscore(u)
+    d_arr = _zscore(d)
+    n = min(u_arr.size, d_arr.size)
+    u_arr = u_arr[:n]
+    d_arr = d_arr[:n]
+    M = max(1, int(M))
+    K = max(0, int(K))
+    out = np.zeros(n, dtype=float)
+    if n - K < M:
+        return out
+    centers = np.zeros((M + K, 0), dtype=float)
+    weights = np.zeros(0, dtype=float)
+    two_sigma2 = 2.0 * max(float(sigma), 1e-12) ** 2
+    for idx in range(M - 1, n - K):
+        x = u_arr[idx - M + 1 : idx + K + 1][::-1]
+        if centers.shape[1] == 0:
+            err = float(d_arr[idx])
+            out[idx] = err
+            centers = x.reshape(-1, 1)
+            weights = np.asarray([float(mu) * err], dtype=float)
+            continue
+
+        diffs = centers - x[:, None]
+        dists = np.sum(diffs * diffs, axis=0)
+        kappa = np.exp(-dists / two_sigma2)
+        y = float(weights @ kappa)
+        err = float(d_arr[idx] - y)
+        out[idx] = err
+
+        min_idx = int(np.argmin(dists))
+        if float(dists[min_idx]) <= float(epsilon):
+            weights[min_idx] += float(mu) * err
+        else:
+            centers = np.concatenate([centers, x.reshape(-1, 1)], axis=1)
+            weights = np.concatenate([weights, np.asarray([float(mu) * err])])
+    return out
+
+
 def test_tap_matrix_order_and_indices() -> None:
     u = np.arange(20, dtype=float)
     for M, K in [(1, 0), (2, 0), (2, 3), (8, 0), (8, 4)]:
@@ -143,5 +191,10 @@ def test_vectorized_filters_match_reference_loops() -> None:
         np.testing.assert_allclose(
             noncausal_rff_lms_filter(u, d, M, K, 0.008, D=32, sigma=1.5, rff_seed=77),
             _ref_rff(u, d, M, K, 0.008, D=32, sigma=1.5, rff_seed=77),
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            noncausal_klms_filter(u, d, M, K, step_size=0.05, sigma=1.5, epsilon=0.1),
+            _ref_klms(u, d, M, K, mu=0.05, sigma=1.5, epsilon=0.1),
             atol=1e-12,
         )

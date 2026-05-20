@@ -3,8 +3,8 @@ from __future__ import annotations
 import numpy as np
 
 from ppg_hr.experimental.cascade_solver import _normalise_array
-from ppg_hr.experimental.run_batch_protocol import build_output_run_name
-from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams
+from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams, decode_protocol_search_space
+from ppg_hr.experimental.run_batch_protocol import _VALID_FILTERS, build_output_run_name
 from ppg_hr.params import CascadeScheme, ProtocolSearchParams, TargetScope
 
 
@@ -19,6 +19,38 @@ def test_fixed_trial_params_roundtrip_and_stay_out_of_search_space() -> None:
     assert "TW_F" not in space.names_for_filter("lms")
     assert "normalization_mode" not in space.names_for_filter("volterra")
     assert "qc_policy" not in space.names_for_filter("rff_lms")
+
+
+def test_klms_has_independent_search_parameters_and_is_batch_selectable() -> None:
+    space = ProtocolSearchParams()
+
+    names = space.names_for_filter("klms")
+
+    assert "klms" in _VALID_FILTERS
+    assert {"klms_step_size", "klms_sigma", "klms_epsilon"}.issubset(names)
+    assert "LMS_Mu_Base" not in names
+    assert "RFF_LMS_Mu_Base" not in names
+    assert "rff_D" not in names
+    assert "rff_sigma" not in names
+    assert "alpha_u" not in names
+    assert "M2" not in names
+    assert space.options("klms_step_size") == [0.01, 0.05, 0.1, 0.2, 0.5]
+    assert space.options("klms_sigma") == [0.1, 0.5, 1.0, 2.0, 5.0]
+    assert space.options("klms_epsilon") == [0.01, 0.05, 0.1, 0.2]
+
+
+def test_decode_klms_search_space_writes_filter_specific_values() -> None:
+    space = ProtocolSearchParams()
+    idx_map = {name: 0 for name in space.names_for_filter("klms")}
+    idx_map.update({"klms_step_size": 2, "klms_sigma": 3, "klms_epsilon": 1})
+
+    params = decode_protocol_search_space(space, idx_map, adaptive_filter="klms", objective_mode="accuracy")
+
+    assert params.adaptive_filter == "klms"
+    assert params.objective_mode == "accuracy"
+    assert params.klms_step_size == 0.1
+    assert params.klms_sigma == 2.0
+    assert params.klms_epsilon == 0.05
 
 
 def test_target_scope_global_aliases_use_canonical_global_value() -> None:

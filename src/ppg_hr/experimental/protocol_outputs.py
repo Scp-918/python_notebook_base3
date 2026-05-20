@@ -24,12 +24,7 @@ from .alignment import (
     extract_rest_ppg_hr_tracked,
 )
 from .batch_pairing import SamplePair, UnpairedSample
-from .preprocess_protocol import (
-    PROTOCOL_CHANNELS,
-    ProtocolDataset,
-    load_protocol_raw_clean_frames,
-    resample_protocol_dataset,
-)
+from .preprocess_protocol import ProtocolDataset, load_protocol_raw_clean_frames, resample_protocol_dataset
 from .protocol_optimizer import ProtocolModeResult
 from .qc import QcResult
 from .segmentation import SegmentInfo

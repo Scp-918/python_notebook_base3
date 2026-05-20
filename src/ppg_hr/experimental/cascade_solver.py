@@ -28,6 +28,7 @@ from .alignment import (
 )
 from .envelope_delay import DelayEstimate, estimate_envelope_delays
 from .fusion import fuse_final_hr
+from .klms import noncausal_klms_filter
 from .motion_frequency import estimate_motion_frequency
 from .noncausal_lms import map_delay_to_lms_params, noncausal_lms_filter
 from .preprocess_protocol import PROTOCOL_CHANNELS, ProtocolDataset, resample_protocol_dataset
@@ -805,7 +806,6 @@ def _run_windows(
     prev_adaptive: float | None = None
     for row_idx, window_idx in enumerate(norm_cache.window_idx):
         start_idx = int(norm_cache.start_idx[row_idx])
-        adaptive_start_idx = int(norm_cache.adaptive_start_idx[row_idx])
         adaptive_source_start_idx = int(norm_cache.adaptive_source_start_idx[row_idx])
         fft_offset_idx = int(norm_cache.fft_offset_idx[row_idx])
         center_s = float(norm_cache.center_s[row_idx])
@@ -1215,6 +1215,7 @@ def _cascade_filter_window(
             design = map_delay_to_lms_params(delay, sensor_type, params, fs)
             filter_type = str(getattr(params, "adaptive_filter", "lms"))
             stage_extra: dict[str, Any] = {}
+            stage_mu = float(design.u)
             if filter_type == "lms":
                 current = noncausal_lms_filter(
                     window[channel],
@@ -1260,6 +1261,27 @@ def _cascade_filter_window(
                     mu_min=float(getattr(params, "LMS_Mu_Min", 1e-6)),
                 )
                 stage_extra.update({"D": rff_D, "sigma": rff_sigma, "rff_seed": rff_seed})
+            elif filter_type == "klms":
+                klms_step_size = float(getattr(params, "klms_step_size", 0.05))
+                klms_sigma = float(getattr(params, "klms_sigma", 1.0))
+                klms_epsilon = float(getattr(params, "klms_epsilon", 0.1))
+                stage_mu = klms_step_size
+                current = noncausal_klms_filter(
+                    window[channel],
+                    current,
+                    M=design.M,
+                    K=design.K,
+                    step_size=klms_step_size,
+                    sigma=klms_sigma,
+                    epsilon=klms_epsilon,
+                )
+                stage_extra.update(
+                    {
+                        "klms_step_size": klms_step_size,
+                        "sigma": klms_sigma,
+                        "epsilon": klms_epsilon,
+                    }
+                )
             else:
                 raise ValueError(f"Unsupported adaptive_filter: {filter_type}")
 
@@ -1276,7 +1298,7 @@ def _cascade_filter_window(
                         "curr_corr": float(design.curr_corr),
                         "M": int(design.M),
                         "K": int(design.K),
-                        "mu": float(design.u),
+                        "mu": stage_mu,
                         "filter_type": filter_type,
                         "mode": design.mode,
                         "delay_estimation_mode": delay_mode,

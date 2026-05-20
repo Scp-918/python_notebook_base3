@@ -122,4 +122,6 @@ def _adaptive_source(adaptive_filter: str) -> str:
         return "adaptive_volterra"
     if name == "rff_lms":
         return "adaptive_rff_lms"
+    if name == "klms":
+        return "adaptive_klms"
     return "adaptive_lms"

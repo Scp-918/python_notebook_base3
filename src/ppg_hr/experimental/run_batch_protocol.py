@@ -32,7 +32,7 @@ except ModuleNotFoundError:  # pragma: no cover - only used in lean environments
     TPESampler = None
 
 from ..params import CascadeScheme, ProtocolParams, TargetScope
-from .batch_pairing import PairDiscovery, SamplePair, discover_sample_pairs_with_unpaired
+from .batch_pairing import SamplePair, discover_sample_pairs_with_unpaired
 from .alignment import _window_fft_hr, search_time_bias_after
 from .cascade_solver import (
     MetricArrays,
@@ -40,7 +40,6 @@ from .cascade_solver import (
     _get_trial_base,
     aggregate_metric_arrays,
     clear_all_caches,
-    clear_trial_caches,
     clear_trial_heavy_caches,
     run_protocol_trial,
 )
@@ -70,7 +69,7 @@ __all__ = [
 if optuna is not None:
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-_VALID_FILTERS = ("lms", "volterra", "rff_lms")
+_VALID_FILTERS = ("lms", "volterra", "rff_lms", "klms")
 _VALID_OBJECTIVES = ("aae", "accuracy")
 _VALID_SPLIT_MODES = ("split", "all_train", "leave_one_group_out")
 _DEFAULT_TRIAL_CACHE_MAX_ENTRIES = 128

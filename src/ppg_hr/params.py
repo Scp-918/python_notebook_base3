@@ -72,7 +72,7 @@ class ProtocolParams:
 class ProtocolSearchParams:
     """Discrete search grid for the batch adaptive protocol.
 
-    中文说明：公共项对 LMS/Volterra/RFF-LMS 三类滤波器都生效；滤波器专属项
+    中文说明：公共项对 LMS/Volterra/RFF-LMS/KLMS 四类滤波器都生效；滤波器专属项
     由 ``names_for_filter`` 动态选择，避免 LMS 误采样 RFF 或 Volterra 参数。
     """
 
@@ -84,19 +84,30 @@ class ProtocolSearchParams:
     C_scale: list[float] = field(default_factory=lambda: [0.6, 0.9, 1.2, 1.5])
     K_max: list[int] = field(default_factory=lambda: [8, 12, 16, 20, 30])
     Spec_Penalty_Width: list[float] = field(default_factory=lambda: [0.1, 0.2, 0.3])
-    Spec_Penalty_Weight: list[float] = field(default_factory=lambda: [0.1, 0.2, 0.4])
-    smooth_win_len: list[int] = field(default_factory=lambda: [3, 5, 7, 9])
+    smooth_win_len: list[int] = field(default_factory=lambda: [5, 7, 9])
     hr_range_hz: list[float] = field(
-        default_factory=lambda: [x / 60.0 for x in (15, 20, 25, 30, 35, 40)]
+        default_factory=lambda: [x / 60.0 for x in (20, 25, 30, 35, 40)]
     )
-    slew_limit_bpm: list[int] = field(default_factory=lambda: list(range(8, 16)))
+    slew_limit_bpm: list[int] = field(default_factory=lambda: [8, 10, 12, 14])
     slew_step_bpm: list[int] = field(default_factory=lambda: [5, 7, 9])
+    Rest_HR_Track_Band_BPM: list[float] = field(
+        default_factory=lambda: [20.0, 30.0, 50.0, 60.0, 80.0]
+    )
+    Rest_HR_Slew_Limit_BPM: list[float] = field(
+        default_factory=lambda: [1.0, 3.0, 5.0, 6.0, 8.0, 25.0]
+    )
+    Rest_HR_Slew_Step_BPM: list[float] = field(
+        default_factory=lambda: [0.5, 2.0, 4.0, 5.0, 8.0, 12.0]
+    )
     LMS_Mu_Base: list[float] = field(default_factory=lambda: [0.008, 0.01, 0.012])
     RFF_LMS_Mu_Base: list[float] = field(default_factory=lambda: [0.006, 0.008, 0.01])
     alpha_u: list[float] = field(default_factory=lambda: [0.01, 0.05, 0.1, 0.2])
     M2: list[int] = field(default_factory=lambda: [2, 3, 4, 5])
     rff_D: list[int] = field(default_factory=lambda: [50, 100, 200, 300])
     rff_sigma: list[float] = field(default_factory=lambda: [0.1, 0.5, 1.0, 2.0, 5.0])
+    klms_step_size: list[float] = field(default_factory=lambda: [0.01, 0.05, 0.1, 0.2, 0.5])
+    klms_sigma: list[float] = field(default_factory=lambda: [0.1, 0.5, 1.0, 2.0, 5.0])
+    klms_epsilon: list[float] = field(default_factory=lambda: [0.01, 0.05, 0.1, 0.2])
 
     def names(self) -> list[str]:
         """Return active parameter names in stable dataclass order."""
@@ -118,11 +129,13 @@ class ProtocolSearchParams:
             "C_scale",
             "K_max",
             "Spec_Penalty_Width",
-            "Spec_Penalty_Weight",
             "smooth_win_len",
             "hr_range_hz",
             "slew_limit_bpm",
             "slew_step_bpm",
+            "Rest_HR_Track_Band_BPM",
+            "Rest_HR_Slew_Limit_BPM",
+            "Rest_HR_Slew_Step_BPM",
         ]
         if adaptive_filter == "lms":
             return [*common, "LMS_Mu_Base"]
@@ -130,6 +143,8 @@ class ProtocolSearchParams:
             return [*common, "LMS_Mu_Base", "alpha_u", "M2"]
         if adaptive_filter == "rff_lms":
             return [*common, "RFF_LMS_Mu_Base", "rff_D", "rff_sigma"]
+        if adaptive_filter == "klms":
+            return [*common, "klms_step_size", "klms_sigma", "klms_epsilon"]
         raise ValueError(f"Unsupported adaptive_filter: {adaptive_filter}")
 
     def options(self, name: str) -> list[Any]:
@@ -184,7 +199,7 @@ class SolverParams:
     bp_order: int = 4
 
     # Adaptive filter selection (new in 2026-04)
-    adaptive_filter: str = "lms"  # one of: "lms", "volterra", "rff_lms"
+    adaptive_filter: str = "lms"  # one of: "lms", "volterra", "rff_lms", "klms"
     ppg_mode: str = "green"  # one of: "green", "red", "ir"
 
     # Delay-search prefit controls. ``adaptive`` narrows the PPG-vs-motion
@@ -207,6 +222,11 @@ class SolverParams:
     rff_D: int = 100
     rff_sigma: float = 1.0
     rff_seed: int = 42
+
+    # KLMS-specific parameters (only used when adaptive_filter == "klms")
+    klms_step_size: float = 0.05
+    klms_sigma: float = 1.0
+    klms_epsilon: float = 0.1
 
     extras: dict[str, Any] = field(default_factory=dict)
 

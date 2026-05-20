@@ -113,14 +113,21 @@ def discover_sample_pairs_with_unpaired(input_dir: Path) -> PairDiscovery:
             )
             continue
         motion_type, motion_index, motion_id = parsed
-        ref_stem = f"{sensor.stem}_ref"
-        ref = by_stem.get(ref_stem)
+        ref = None
+        ref_stem = ""
+        for suffix in ("_ref", "_HR_ref"):
+            candidate = f"{sensor.stem}{suffix}"
+            found = by_stem.get(candidate)
+            if found is not None:
+                ref = found
+                ref_stem = candidate
+                break
         if ref is None:
             unpaired.append(
                 UnpairedSample(
                     file_name=sensor.name,
                     file_path=sensor,
-                    reason=f"missing reference file {ref_stem}.csv",
+                    reason=f"missing reference file (tried {sensor.stem}_ref.csv, {sensor.stem}_HR_ref.csv)",
                 )
             )
             continue
@@ -138,9 +145,13 @@ def discover_sample_pairs_with_unpaired(input_dir: Path) -> PairDiscovery:
 
     sensor_stems = {p.sensor_csv.stem for p in pairs}
     for ref in csv_files:
-        if not ref.stem.endswith("_ref"):
+        if not (ref.stem.endswith("_ref") or ref.stem.endswith("_HR_ref")):
             continue
-        sensor_stem = ref.stem.removesuffix("_ref")
+        sensor_stem = ref.stem
+        for suffix in ("_HR_ref", "_ref"):
+            if sensor_stem.endswith(suffix):
+                sensor_stem = sensor_stem.removesuffix(suffix)
+                break
         if ref.stem in paired_ref_stems or sensor_stem in sensor_stems:
             continue
         unpaired.append(
