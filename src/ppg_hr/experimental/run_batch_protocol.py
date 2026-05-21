@@ -3227,6 +3227,28 @@ def _with_cascade_guard_policy(params: ProtocolTrialParams, policy: str) -> Prot
     return replace(params, cascade_guard_policy=policy_text)
 
 
+def _apply_guard_overrides(
+    params: ProtocolTrialParams,
+    *,
+    guard_ratio_min_override: float | None = None,
+    guard_ratio_max_override: float | None = None,
+    guard_flat_std_eps_override: float | None = None,
+    guard_use_finite_zscore_override: bool | None = None,
+) -> ProtocolTrialParams:
+    """Return a params copy with only explicit guard threshold overrides applied."""
+
+    updates: dict[str, Any] = {}
+    if guard_ratio_min_override is not None:
+        updates["cascade_guard_ratio_min"] = float(guard_ratio_min_override)
+    if guard_ratio_max_override is not None:
+        updates["cascade_guard_ratio_max"] = float(guard_ratio_max_override)
+    if guard_flat_std_eps_override is not None:
+        updates["cascade_guard_flat_std_eps"] = float(guard_flat_std_eps_override)
+    if guard_use_finite_zscore_override is not None:
+        updates["cascade_guard_use_finite_zscore"] = bool(guard_use_finite_zscore_override)
+    return replace(params, **updates) if updates else params
+
+
 def plot_window_diagnostics_from_records(
     *,
     signal_csv: str | Path,
@@ -3244,6 +3266,10 @@ def plot_window_diagnostics_from_records(
     mode: str = "",
     target_scope: str = "motion_only",
     fs_origin: int = 100,
+    guard_ratio_min_override: float | None = None,
+    guard_ratio_max_override: float | None = None,
+    guard_flat_std_eps_override: float | None = None,
+    guard_use_finite_zscore_override: bool | None = None,
 ) -> dict[str, Any]:
     """Draw waveform and spectrum diagnostics for one aligned FFT sub-window.
 
@@ -3306,7 +3332,13 @@ def plot_window_diagnostics_from_records(
             dataset=dataset,
             scheme=scheme,
             scope=scope,
-            params=_with_cascade_guard_policy(params, "rms_guard"),
+            params=_apply_guard_overrides(
+                _with_cascade_guard_policy(params, "rms_guard"),
+                guard_ratio_min_override=guard_ratio_min_override,
+                guard_ratio_max_override=guard_ratio_max_override,
+                guard_flat_std_eps_override=guard_flat_std_eps_override,
+                guard_use_finite_zscore_override=guard_use_finite_zscore_override,
+            ),
             output_dir=out_dir,
             label=label,
             variant_name="guarded",
@@ -3894,6 +3926,10 @@ def replay_best_record_hr_curves(
     TW_F: float | None = None,
     results_root: str | Path,
     fs_origin: int = 100,
+    guard_ratio_min_override: float | None = None,
+    guard_ratio_max_override: float | None = None,
+    guard_flat_std_eps_override: float | None = None,
+    guard_use_finite_zscore_override: bool | None = None,
 ) -> dict[str, Path]:
     """Replay one sample from compact Stage-6 result records without retraining.
 
@@ -3952,7 +3988,13 @@ def replay_best_record_hr_curves(
         dataset=dataset,
         scheme=scheme,
         scope=scope,
-        params=_with_cascade_guard_policy(params, "rms_guard"),
+        params=_apply_guard_overrides(
+            _with_cascade_guard_policy(params, "rms_guard"),
+            guard_ratio_min_override=guard_ratio_min_override,
+            guard_ratio_max_override=guard_ratio_max_override,
+            guard_flat_std_eps_override=guard_flat_std_eps_override,
+            guard_use_finite_zscore_override=guard_use_finite_zscore_override,
+        ),
         output_dir=out_dir,
         label=label,
         variant_name="guarded",
