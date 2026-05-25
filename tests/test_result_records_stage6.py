@@ -155,3 +155,27 @@ def test_append_history_includes_params_json_and_param_columns() -> None:
     assert json.loads(row["params"])["ppg_input_transform"] == "log_absorbance"
     assert row["param_ppg_input_transform"] == "log_absorbance"
     assert row["param_cascade_guard_policy"] == "rms_guard"
+
+
+def test_best_params_all_json_can_be_rebuilt_from_saved_history_paths(tmp_path: Path) -> None:
+    result = _stage6_result()
+    rbp._append_history(
+        result.history,
+        "tiaosheng",
+        TargetScope.MOTION_ONLY,
+        CascadeScheme.ACC3,
+        "lms",
+        result.best_params,
+        repeat_idx=0,
+        trial_idx=0,
+        objective_value=3.0,
+        metrics={"success": True, "final_aae_bpm": 3.0, "final_acc_pct": 90.0},
+        best_so_far=3.0,
+    )
+    rbp._persist_mode_artifacts(tmp_path, result, checkpoint_status="done")
+    result.history = []
+
+    rbp._write_motion_type_outputs(tmp_path, "tiaosheng", [result], write_best_params_all=True)
+
+    payload = json.loads((tmp_path / "best_params_all.json").read_text(encoding="utf-8"))
+    assert payload[result.mode_key]["trial_history"][0]["trial_idx"] == 0

@@ -1352,6 +1352,14 @@ outputs/<run_name>/
 
     motion_types/
         <motion_type>/
+            _checkpoint.json
+            _modes/
+                <target_scope>__<cascade_scheme>__<adaptive_filter>/
+                    mode_result.json
+                    history.csv
+                    per_group.csv
+                    fold_<id>_history.csv
+                    fold_<id>_per_group.csv
             split_files.csv
             fold_split_files.csv
             mode_summary_aae.csv
@@ -1560,6 +1568,15 @@ param_cascade_guard_policy
 
 适合程序读取，不适合人工快速浏览。
 
+当前实现只在某个 `motion_type` 的全部模式都完成后重建一次该文件。
+模式执行过程中会优先写 `_modes/<mode_key>/mode_result.json` 和 `_checkpoint.json`，
+用于模式级 resume；这些内部工件不改变 `best_params_all.json` 的最终格式。
+
+Notebook 使用提示：
+如果你在 notebook 中重新运行第 7/8 训练单元，并且输出目录保持不变，那么只有
+`_checkpoint.json` 里已经标记为 `done` 的 mode 会被直接跳过；没有 `done`
+标记的 mode 会整模式重跑，而不是从某个 trial / fold 的中间状态继续。
+
 ### 5.10 bayes_curve_data.csv / bayes_curve.png
 
 每个 motion_type 输出一组贝叶斯优化曲线数据和图。
@@ -1584,11 +1601,23 @@ param_*
 
 `bayes_curve_data.csv` 中的 `param_*` 表示每个 trial 实际使用的完整参数快照。它适合排查“某次 trial 为什么好/差”，也适合和 Stage-6 最优记录做字段对照。
 
+模式执行完成后会先把该模式的 history 落到 `_modes/<mode_key>/history.csv`，然后刷新
+motion_type 级 `bayes_curve_data.csv`。这允许在清空内存中的 `result.history` 之后，
+仍然基于落盘 history 重建 `bayes_curve.png`。
+
 `bayes_curve.png` 的子图数量由下面三者相乘决定：
 
 ```text
 激活 target scopes × 激活 cascade schemes × 激活 adaptive filters
 ```
+
+Resume 只支持模式级：只有 `_checkpoint.json` 中标记为 `done` 的 mode 会在重启后跳过；
+如果某个 mode 只有部分中间文件、但没有 `done` 标记，则会整模式重跑，而不是从 trial
+或 fold 中途续跑。
+
+Notebook 使用提示：
+第 9 块输出检查主要看 motion_type 根目录下的 Stage-6 文件是否齐全；`_modes/` 和
+`_checkpoint.json` 是内部恢复工件，通常只在排查中断恢复或确认某个 mode 是否已经完成时查看。
 
 ### 5.11 best_params_and_alignment.csv
 

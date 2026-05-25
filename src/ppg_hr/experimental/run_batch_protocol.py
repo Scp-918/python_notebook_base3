@@ -125,6 +125,9 @@ class _ModeOptimisation:
     heldout_group_id: str = ""
     train_group_ids: list[str] = field(default_factory=list)
     test_group_id: str = ""
+    history_path: str = ""
+    per_group_path: str = ""
+    mode_manifest_path: str = ""
     fold_results: list["_ModeOptimisation"] = field(default_factory=list, repr=False)
     metric_arrays_by_split: dict[str, MetricArrays] = field(default_factory=dict, repr=False)
     result_level: str = "fold"
@@ -427,6 +430,8 @@ def run_batch_adaptive_protocol(
 
         all_ids = _unique_ids_from_folds(folds)
 
+        restored_results = _load_completed_mode_results(motion_dir)
+        restored_by_key = {result.mode_key: result for result in restored_results}
         mode_results: list[_ModeOptimisation] = []
         shared_trial_cache: OrderedDict[tuple[Any, ...], ProtocolRunResult] = OrderedDict()
         for scope in scopes:
@@ -447,6 +452,12 @@ def run_batch_adaptive_protocol(
                             "adaptive_filter": adaptive_filter,
                         }
                     )
+                    mode_key = _mode_key_for(scope, scheme, adaptive_filter)
+                    resumed = restored_by_key.get(mode_key)
+                    if resumed is not None:
+                        mode_results.append(resumed)
+                        gc.collect()
+                        continue
                     if not valid_folds:
                         reason = str(folds[0].get("reason", "no valid folds")) if folds else "no valid folds"
                         result = _failed_mode_optimisation(
@@ -552,9 +563,16 @@ def run_batch_adaptive_protocol(
                             test_group_id=test_ids[0] if len(test_ids) == 1 else "",
                         )
                     mode_results.append(result)
+                    _finalize_completed_mode(
+                        motion_dir,
+                        motion_type,
+                        mode_results,
+                        result,
+                        write_best_params_all=False,
+                    )
                     gc.collect()
         all_mode_results[motion_type] = mode_results
-        _write_motion_type_outputs(motion_dir, motion_type, mode_results)
+        _write_motion_type_outputs(motion_dir, motion_type, mode_results, write_best_params_all=True)
         bayes_path = _plot_bayes_curves(motion_dir, motion_type, mode_results, objective_mode)
         bayes_tables[motion_type] = bayes_path
         shared_trial_cache.clear()
@@ -1776,6 +1794,217 @@ def _record_value_missing(value: Any) -> bool:
         return False
 
 
+def _mode_artifact_dir(motion_dir: Path, result: _ModeOptimisation) -> Path:
+    return motion_dir / "_modes" / result.mode_key
+
+
+def _mode_key_for(scope: TargetScope, scheme: CascadeScheme, adaptive_filter: str) -> str:
+    return f"{scope.value}__{scheme.value}__{adaptive_filter}"
+
+
+def _mode_history_path(motion_dir: Path, result: _ModeOptimisation) -> Path:
+    return _mode_artifact_dir(motion_dir, result) / "history.csv"
+
+
+def _mode_per_group_path(motion_dir: Path, result: _ModeOptimisation) -> Path:
+    return _mode_artifact_dir(motion_dir, result) / "per_group.csv"
+
+
+def _fold_history_path(motion_dir: Path, result: _ModeOptimisation, fold: _ModeOptimisation) -> Path:
+    fold_id = 0 if fold.fold_id is None else int(fold.fold_id)
+    return _mode_artifact_dir(motion_dir, result) / f"fold_{fold_id}_history.csv"
+
+
+def _fold_per_group_path(motion_dir: Path, result: _ModeOptimisation, fold: _ModeOptimisation) -> Path:
+    fold_id = 0 if fold.fold_id is None else int(fold.fold_id)
+    return _mode_artifact_dir(motion_dir, result) / f"fold_{fold_id}_per_group.csv"
+
+
+def _mode_manifest_payload(result: _ModeOptimisation) -> dict[str, Any]:
+    return {
+        "motion_type": result.motion_type,
+        "target_scope": result.target_scope.value,
+        "cascade_scheme": result.cascade_scheme.value,
+        "adaptive_filter": result.adaptive_filter,
+        "objective_mode": result.objective_mode,
+        "data_split_mode": result.data_split_mode,
+        "best_params": result.best_params.to_dict(),
+        "best_repeat_idx": result.best_repeat_idx,
+        "best_trial_idx": result.best_trial_idx,
+        "n_trials": result.n_trials,
+        "n_repeats": result.n_repeats,
+        "train_metrics": result.train_metrics,
+        "val_metrics": result.val_metrics,
+        "test_metrics": result.test_metrics,
+        "success": result.success,
+        "reason": result.reason,
+        "fold_id": result.fold_id,
+        "heldout_group_id": result.heldout_group_id,
+        "train_group_ids": result.train_group_ids,
+        "test_group_id": result.test_group_id,
+        "history_path": result.history_path,
+        "per_group_path": result.per_group_path,
+        "mode_manifest_path": result.mode_manifest_path,
+        "result_level": result.result_level,
+        "aggregation": result.aggregation,
+        "params_semantics": result.params_semantics,
+        "representative_fold_id": result.representative_fold_id,
+        "representative_heldout_group_id": result.representative_heldout_group_id,
+        "fold_results": [_mode_manifest_payload(fold) for fold in result.fold_results],
+    }
+
+
+def _mode_result_from_manifest_payload(payload: dict[str, Any]) -> _ModeOptimisation:
+    return _ModeOptimisation(
+        motion_type=str(payload.get("motion_type", "")),
+        target_scope=TargetScope(str(payload.get("target_scope", TargetScope.MOTION_ONLY.value))),
+        cascade_scheme=CascadeScheme(str(payload.get("cascade_scheme", CascadeScheme.ACC3.value))),
+        adaptive_filter=str(payload.get("adaptive_filter", "lms")),
+        objective_mode=str(payload.get("objective_mode", "aae")),
+        data_split_mode=str(payload.get("data_split_mode", "split")),
+        best_params=ProtocolTrialParams(**dict(payload.get("best_params", {}))),
+        best_repeat_idx=int(payload.get("best_repeat_idx", 0) or 0),
+        best_trial_idx=int(payload.get("best_trial_idx", 0) or 0),
+        n_trials=int(payload.get("n_trials", 0) or 0),
+        n_repeats=int(payload.get("n_repeats", 0) or 0),
+        train_metrics=dict(payload.get("train_metrics", {})),
+        val_metrics=dict(payload.get("val_metrics", {})),
+        test_metrics=dict(payload.get("test_metrics", {})),
+        per_group_rows=[],
+        history=[],
+        success=bool(payload.get("success", False)),
+        reason=str(payload.get("reason", "")),
+        fold_id=(None if payload.get("fold_id", None) in ("", None) else int(payload.get("fold_id"))),
+        heldout_group_id=str(payload.get("heldout_group_id", "")),
+        train_group_ids=[str(item) for item in payload.get("train_group_ids", [])],
+        test_group_id=str(payload.get("test_group_id", "")),
+        history_path=str(payload.get("history_path", "")),
+        per_group_path=str(payload.get("per_group_path", "")),
+        mode_manifest_path=str(payload.get("mode_manifest_path", "")),
+        fold_results=[
+            _mode_result_from_manifest_payload(dict(item))
+            for item in payload.get("fold_results", [])
+            if isinstance(item, dict)
+        ],
+        result_level=str(payload.get("result_level", "fold")),
+        aggregation=str(payload.get("aggregation", "")),
+        params_semantics=str(payload.get("params_semantics", "")),
+        representative_fold_id=(
+            None
+            if payload.get("representative_fold_id", None) in ("", None)
+            else int(payload.get("representative_fold_id"))
+        ),
+        representative_heldout_group_id=str(payload.get("representative_heldout_group_id", "")),
+    )
+
+
+def _write_mode_manifest(motion_dir: Path, result: _ModeOptimisation) -> Path:
+    mode_dir = _mode_artifact_dir(motion_dir, result)
+    mode_dir.mkdir(parents=True, exist_ok=True)
+    history_path = _mode_history_path(motion_dir, result)
+    result.history_path = str(history_path)
+    manifest_path = mode_dir / "mode_result.json"
+    result.mode_manifest_path = str(manifest_path)
+    manifest_path.write_text(
+        json.dumps(_jsonify(_mode_manifest_payload(result)), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+def _read_motion_checkpoint(motion_dir: Path) -> dict[str, Any]:
+    path = motion_dir / "_checkpoint.json"
+    if not path.exists():
+        return {"motion_type": motion_dir.name, "modes": {}}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"motion_type": motion_dir.name, "modes": {}}
+    if not isinstance(payload, dict):
+        return {"motion_type": motion_dir.name, "modes": {}}
+    modes = payload.get("modes", {})
+    return {
+        "motion_type": str(payload.get("motion_type", motion_dir.name)),
+        "modes": dict(modes) if isinstance(modes, dict) else {},
+    }
+
+
+def _write_motion_checkpoint(motion_dir: Path, checkpoint: dict[str, Any]) -> Path:
+    path = motion_dir / "_checkpoint.json"
+    path.write_text(json.dumps(_jsonify(checkpoint), ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def _update_mode_checkpoint_entry(
+    motion_dir: Path,
+    result: _ModeOptimisation,
+    *,
+    checkpoint_status: str,
+    manifest_path: Path | None = None,
+    history_path: Path | None = None,
+) -> Path:
+    checkpoint = _read_motion_checkpoint(motion_dir)
+    checkpoint["modes"][result.mode_key] = {
+        "status": str(checkpoint_status),
+        "mode_manifest_path": str(manifest_path or result.mode_manifest_path or ""),
+        "history_path": str(history_path or result.history_path or ""),
+    }
+    return _write_motion_checkpoint(motion_dir, checkpoint)
+
+
+def _persist_mode_artifacts(
+    motion_dir: Path,
+    result: _ModeOptimisation,
+    *,
+    checkpoint_status: str,
+) -> Path:
+    mode_dir = _mode_artifact_dir(motion_dir, result)
+    mode_dir.mkdir(parents=True, exist_ok=True)
+    history_path = _mode_history_path(motion_dir, result)
+    pd.DataFrame(result.history).to_csv(history_path, index=False, encoding="utf-8-sig")
+    result.history_path = str(history_path)
+    if result.per_group_rows:
+        per_group_path = _mode_per_group_path(motion_dir, result)
+        pd.DataFrame(result.per_group_rows).to_csv(per_group_path, index=False, encoding="utf-8-sig")
+        result.per_group_path = str(per_group_path)
+    for fold in result.fold_results:
+        fold_history_path = _fold_history_path(motion_dir, result, fold)
+        pd.DataFrame(fold.history).to_csv(fold_history_path, index=False, encoding="utf-8-sig")
+        fold.history_path = str(fold_history_path)
+        fold_per_group_path = _fold_per_group_path(motion_dir, result, fold)
+        pd.DataFrame(fold.per_group_rows).to_csv(fold_per_group_path, index=False, encoding="utf-8-sig")
+        fold.per_group_path = str(fold_per_group_path)
+    manifest_path = _write_mode_manifest(motion_dir, result)
+    _update_mode_checkpoint_entry(
+        motion_dir,
+        result,
+        checkpoint_status=checkpoint_status,
+        manifest_path=manifest_path,
+        history_path=history_path,
+    )
+    return manifest_path
+
+
+def _load_completed_mode_results(motion_dir: Path) -> list[_ModeOptimisation]:
+    checkpoint = _read_motion_checkpoint(motion_dir)
+    restored: list[_ModeOptimisation] = []
+    for mode_key in sorted(checkpoint.get("modes", {})):
+        item = checkpoint["modes"].get(mode_key, {})
+        if not isinstance(item, dict) or str(item.get("status", "")) != "done":
+            continue
+        manifest_text = str(item.get("mode_manifest_path", ""))
+        if not manifest_text:
+            continue
+        manifest_path = Path(manifest_text)
+        if not manifest_path.exists():
+            continue
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            continue
+        restored.append(_mode_result_from_manifest_payload(payload))
+    return restored
+
+
 def _coerce_protocol_param_value(value: Any, item: Any) -> Any:
     """Coerce one record value according to the ProtocolTrialParams default."""
 
@@ -1840,6 +2069,52 @@ def _append_history(
     history.append(row)
 
 
+def _load_history_rows_from_path(path_text: str) -> list[dict[str, Any]]:
+    if not path_text:
+        return []
+    path = Path(path_text)
+    if not path.exists():
+        return []
+    try:
+        df = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return []
+    return df.to_dict(orient="records")
+
+
+def _load_per_group_rows_from_path(path_text: str) -> list[dict[str, Any]]:
+    if not path_text:
+        return []
+    path = Path(path_text)
+    if not path.exists():
+        return []
+    try:
+        df = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return []
+    return df.to_dict(orient="records")
+
+
+def _collect_mode_history_rows(results: list[_ModeOptimisation]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in results:
+        if result.history:
+            rows.extend(result.history)
+            continue
+        rows.extend(_load_history_rows_from_path(result.history_path))
+    return rows
+
+
+def _collect_per_group_rows(results: list[_ModeOptimisation]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in results:
+        if result.per_group_rows:
+            rows.extend(result.per_group_rows)
+        else:
+            rows.extend(_load_per_group_rows_from_path(result.per_group_path))
+    return rows
+
+
 def _emit_trial_progress(
     on_progress: Callable[[dict[str, Any]], None],
     cfg: ProtocolParams,
@@ -1888,6 +2163,8 @@ def _write_motion_type_outputs(
     motion_dir: Path,
     motion_type: str,
     results: list[_ModeOptimisation],
+    *,
+    write_best_params_all: bool = True,
 ) -> None:
     """Write all required per-motion_type CSV/JSON files."""
 
@@ -1903,7 +2180,7 @@ def _write_motion_type_outputs(
     fold_summary.to_csv(motion_dir / "fold_summary_aae.csv", index=False, encoding="utf-8-sig")
     fold_summary.to_csv(motion_dir / "fold_summary_accuracy.csv", index=False, encoding="utf-8-sig")
 
-    per_group = pd.DataFrame([row for r in results for row in r.per_group_rows])
+    per_group = pd.DataFrame(_collect_per_group_rows(results))
     per_group.to_csv(motion_dir / "per_group_aae.csv", index=False, encoding="utf-8-sig")
     per_group.to_csv(motion_dir / "per_group_accuracy.csv", index=False, encoding="utf-8-sig")
 
@@ -1920,67 +2197,104 @@ def _write_motion_type_outputs(
             encoding="utf-8-sig",
         )
 
-    payload = {
-        r.mode_key: {
-            "motion_type": motion_type,
-            "target_scope": r.target_scope.value,
-            "cascade_scheme": r.cascade_scheme.value,
-            "adaptive_filter": r.adaptive_filter,
-            "objective_mode": r.objective_mode,
-            "data_split_mode": r.data_split_mode,
-            "result_level": r.result_level,
-            "aggregation": r.aggregation,
-            "params_semantics": r.params_semantics,
-            "representative_fold_id": r.representative_fold_id,
-            "representative_heldout_group_id": r.representative_heldout_group_id,
-            "best_repeat_idx": r.best_repeat_idx,
-            "best_trial_idx": r.best_trial_idx,
-            "n_trials": r.n_trials,
-            "n_repeats": r.n_repeats,
-            "best_params": r.best_params.to_dict(),
-            "representative_best_params": (
-                r.best_params.to_dict() if r.result_level == "aggregate" else None
-            ),
-            "train_metrics": r.train_metrics,
-            "val_metrics": r.val_metrics,
-            "test_metrics": r.test_metrics,
-            "fold_results": [
-                {
-                    "fold_id": fold.fold_id,
-                    "heldout_group_id": fold.heldout_group_id,
-                    "result_level": fold.result_level,
-                    "aggregation": fold.aggregation,
-                    "params_semantics": fold.params_semantics,
-                    "train_group_ids": fold.train_group_ids,
-                    "test_group_id": fold.test_group_id,
-                    "best_repeat_idx": fold.best_repeat_idx,
-                    "best_trial_idx": fold.best_trial_idx,
-                    "n_trials": fold.n_trials,
-                    "n_repeats": fold.n_repeats,
-                    "best_params": fold.best_params.to_dict(),
-                    "train_metrics": fold.train_metrics,
-                    "val_metrics": fold.val_metrics,
-                    "test_metrics": fold.test_metrics,
-                    "success": fold.success,
-                    "reason": fold.reason,
-                    "trial_history": fold.history,
-                }
-                for fold in r.fold_results
-            ],
-            "success": r.success,
-            "reason": r.reason,
-            "trial_history": r.history,
+    if write_best_params_all:
+        payload = {
+            r.mode_key: {
+                "motion_type": motion_type,
+                "target_scope": r.target_scope.value,
+                "cascade_scheme": r.cascade_scheme.value,
+                "adaptive_filter": r.adaptive_filter,
+                "objective_mode": r.objective_mode,
+                "data_split_mode": r.data_split_mode,
+                "result_level": r.result_level,
+                "aggregation": r.aggregation,
+                "params_semantics": r.params_semantics,
+                "representative_fold_id": r.representative_fold_id,
+                "representative_heldout_group_id": r.representative_heldout_group_id,
+                "best_repeat_idx": r.best_repeat_idx,
+                "best_trial_idx": r.best_trial_idx,
+                "n_trials": r.n_trials,
+                "n_repeats": r.n_repeats,
+                "best_params": r.best_params.to_dict(),
+                "representative_best_params": (
+                    r.best_params.to_dict() if r.result_level == "aggregate" else None
+                ),
+                "train_metrics": r.train_metrics,
+                "val_metrics": r.val_metrics,
+                "test_metrics": r.test_metrics,
+                "fold_results": [
+                    {
+                        "fold_id": fold.fold_id,
+                        "heldout_group_id": fold.heldout_group_id,
+                        "result_level": fold.result_level,
+                        "aggregation": fold.aggregation,
+                        "params_semantics": fold.params_semantics,
+                        "train_group_ids": fold.train_group_ids,
+                        "test_group_id": fold.test_group_id,
+                        "best_repeat_idx": fold.best_repeat_idx,
+                        "best_trial_idx": fold.best_trial_idx,
+                        "n_trials": fold.n_trials,
+                        "n_repeats": fold.n_repeats,
+                        "best_params": fold.best_params.to_dict(),
+                        "train_metrics": fold.train_metrics,
+                        "val_metrics": fold.val_metrics,
+                        "test_metrics": fold.test_metrics,
+                        "success": fold.success,
+                        "reason": fold.reason,
+                        "trial_history": fold.history if fold.history else _load_history_rows_from_path(fold.history_path),
+                    }
+                    for fold in r.fold_results
+                ],
+                "success": r.success,
+                "reason": r.reason,
+                "trial_history": r.history if r.history else _load_history_rows_from_path(r.history_path),
+            }
+            for r in results
         }
-        for r in results
-    }
-    (motion_dir / "best_params_all.json").write_text(
-        json.dumps(_jsonify(payload), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+        (motion_dir / "best_params_all.json").write_text(
+            json.dumps(_jsonify(payload), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
-    bayes_df = pd.DataFrame([row for r in results for row in r.history])
+    bayes_df = pd.DataFrame(_collect_mode_history_rows(results))
     bayes_df.to_csv(motion_dir / "bayes_curve_data.csv", index=False, encoding="utf-8-sig")
     _write_stage6_record_files(motion_dir, motion_type, results)
+
+
+def _clear_mode_heavy_fields(result: _ModeOptimisation) -> None:
+    result.history = []
+    result.metric_arrays_by_split = {}
+    if result.fold_results:
+        result.per_group_rows = []
+        for fold in result.fold_results:
+            fold.history = []
+            fold.per_group_rows = []
+            fold.metric_arrays_by_split = {}
+
+
+def _finalize_completed_mode(
+    motion_dir: Path,
+    motion_type: str,
+    mode_results: list[_ModeOptimisation],
+    result: _ModeOptimisation,
+    *,
+    write_best_params_all: bool,
+) -> None:
+    manifest_path = _persist_mode_artifacts(motion_dir, result, checkpoint_status="running")
+    _write_motion_type_outputs(
+        motion_dir,
+        motion_type,
+        mode_results,
+        write_best_params_all=write_best_params_all,
+    )
+    _update_mode_checkpoint_entry(
+        motion_dir,
+        result,
+        checkpoint_status="done",
+        manifest_path=manifest_path,
+        history_path=Path(result.history_path) if result.history_path else None,
+    )
+    _clear_mode_heavy_fields(result)
 
 
 def _write_stage6_record_files(
@@ -2401,7 +2715,7 @@ def _plot_bayes_curves(
     for ax in flat[n:]:
         ax.axis("off")
     for ax, result in zip(flat, results, strict=False):
-        hist = result.history
+        hist = result.history if result.history else _load_history_rows_from_path(result.history_path)
         ax.grid(True, alpha=0.25)
         ax.set_title(f"{result.target_scope.value} / {result.cascade_scheme.value} / {result.adaptive_filter}")
         ax.set_xlabel("trial index")
