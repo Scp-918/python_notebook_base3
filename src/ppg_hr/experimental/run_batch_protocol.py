@@ -1424,6 +1424,7 @@ def _failed_mode_optimisation(
             else "best_params_for_this_split"
         ),
     )
+    return result
 
 
 def _aggregate_logo_fold_results(
@@ -1491,7 +1492,7 @@ def _aggregate_logo_fold_results(
     for fold in fold_results:
         fold.metric_arrays_by_split = {}
 
-    return _ModeOptimisation(
+    result = _ModeOptimisation(
         motion_type=motion_type,
         target_scope=scope,
         cascade_scheme=scheme,

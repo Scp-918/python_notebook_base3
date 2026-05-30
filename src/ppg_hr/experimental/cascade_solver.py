@@ -1135,7 +1135,8 @@ def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) 
     """
 
     mode = str(getattr(params, "normalization_mode", "minmax")).lower()
-    key = ("normalised_protocol_windows_v2", mode)
+    tw_f = max(0.0, float(getattr(params, "TW_F", 0.0)))
+    key = ("normalised_protocol_windows_v2", mode, round(tw_f, 8))
     cached = base.norm_window_cache.get(key)
     if isinstance(cached, _NormalisedWindowCache):
         return cached
@@ -1163,7 +1164,7 @@ def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) 
     ds = aligned.dataset
     fs = int(ds.fs)
     win_len = int(round(float(params.TW) * fs))
-    tw_f_len = max(0, int(round(float(getattr(params, "TW_F", 0.0)) * fs)))
+    tw_f_len = max(0, int(round(tw_f * fs)))
     adaptive_win_len = win_len + tw_f_len
     starts = np.rint(aligned.window_starts_s.astype(float) * fs).astype(int)
     valid = starts + win_len <= len(ds.time_s)

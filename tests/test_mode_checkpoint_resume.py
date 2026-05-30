@@ -244,6 +244,36 @@ def test_finalize_completed_logo_mode_writes_fold_files_and_clears_fold_heavy_fi
     assert result.per_group_rows == []
 
 
+def test_aggregate_logo_fold_results_keeps_non_acc3_compare_metrics() -> None:
+    fold0 = _logo_fold_result(0, "g0", 2.0)
+    fold1 = _logo_fold_result(1, "g1", 1.0)
+    for fold in (fold0, fold1):
+        fold.cascade_scheme = CascadeScheme.HF2
+        fold.acc3_compare_metrics = {
+            "acc3_compare_aae_bpm": 1.0,
+            "acc3_compare_accuracy_pct": 100.0,
+            "acc3_compare_num_windows": 2,
+            "acc3_compare_status": "ok",
+            "acc3_compare_reason": "",
+        }
+        fold.acc3_compare_arrays = fold.metric_arrays_by_split["test"]
+
+    result = rbp._aggregate_logo_fold_results(
+        motion_type="tiaosheng",
+        scope=TargetScope.MOTION_ONLY,
+        scheme=CascadeScheme.HF2,
+        adaptive_filter="lms",
+        objective_mode="aae",
+        data_split_mode="leave_one_group_out",
+        fold_results=[fold0, fold1],
+        n_trials=1,
+        n_repeats=1,
+    )
+
+    assert result.acc3_compare_metrics["acc3_compare_status"] == "ok"
+    assert result.acc3_compare_metrics["acc3_compare_num_windows"] == 4
+
+
 def test_plot_bayes_curves_uses_saved_history_after_history_is_cleared(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -326,6 +356,27 @@ def test_load_history_rows_from_empty_file_returns_empty_list(tmp_path: Path) ->
     rows = rbp._load_history_rows_from_path(str(empty_csv))
 
     assert rows == []
+
+
+def test_failed_mode_optimisation_returns_checkpointable_result() -> None:
+    result = rbp._failed_mode_optimisation(
+        motion_type="tiaosheng",
+        scope=TargetScope.MOTION_ONLY,
+        scheme=CascadeScheme.HF2,
+        adaptive_filter="lms",
+        objective_mode="aae",
+        data_split_mode="leave_one_group_out",
+        delay_estimation_mode="envelope",
+        space=rbp.default_protocol_search_space(),
+        n_trials=1,
+        n_repeats=1,
+        reason="not enough groups",
+    )
+
+    assert isinstance(result, rbp._ModeOptimisation)
+    assert result.success is False
+    assert result.acc3_compare_metrics["acc3_compare_status"] == "failed"
+    assert result.acc3_compare_metrics["acc3_compare_reason"] == "not enough groups"
 
 
 def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(

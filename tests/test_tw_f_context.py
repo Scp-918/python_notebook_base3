@@ -5,7 +5,7 @@ import json
 import numpy as np
 
 from ppg_hr.experimental.alignment import AlignedDataset, AlignmentInfo
-from ppg_hr.experimental.cascade_solver import _TrialBase, _run_windows
+from ppg_hr.experimental.cascade_solver import _TrialBase, _get_normalised_window_cache, _run_windows
 from ppg_hr.experimental.preprocess_protocol import ProtocolDataset
 from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams
 from ppg_hr.experimental.segmentation import SegmentInfo
@@ -114,3 +114,16 @@ def test_tw_f_zero_uses_legacy_window_lengths() -> None:
     assert frame["adaptive_input_samples"].tolist() == [40, 40, 40]
     np.testing.assert_allclose(frame["adaptive_start_s"], frame["fft_start_s"])
     assert set(frame["tw_f_context_status"]) == {"full"}
+
+
+def test_normalised_window_cache_is_isolated_by_tw_f() -> None:
+    base = _twf_base()
+    params0 = ProtocolTrialParams(Fs_Target=20, TW=2, TW_F=0.0, max_order=4, M_base=1, K_max=2)
+    params1 = ProtocolTrialParams(Fs_Target=20, TW=2, TW_F=1.0, max_order=4, M_base=1, K_max=2)
+
+    cache0 = _get_normalised_window_cache(base, params0)
+    cache1 = _get_normalised_window_cache(base, params1)
+
+    assert cache0.adaptive_win_len == 40
+    assert cache1.adaptive_win_len == 60
+    assert cache0 is not cache1
