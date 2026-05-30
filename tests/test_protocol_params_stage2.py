@@ -140,8 +140,33 @@ def test_output_run_name_contains_tw_f_label() -> None:
         tw_f_s=2.5,
     )
 
-    assert name0.endswith("__TW_F0s")
-    assert "global__ACC3__lms__accuracy__split__TW_F2p5s" == name25
+    assert name0.endswith("__TW_F0s__hr_fft")
+    assert "global__ACC3__lms__accuracy__split__TW_F2p5s__hr_fft" == name25
+
+
+def test_output_run_name_is_isolated_by_postprocess_method() -> None:
+    fft_name = build_output_run_name(
+        [TargetScope.MOTION_ONLY],
+        [CascadeScheme.ACC3],
+        ["lms"],
+        "aae",
+        "split",
+        tw_f_s=0.0,
+        postprocess_method="fft",
+    )
+    ssr_name = build_output_run_name(
+        [TargetScope.MOTION_ONLY],
+        [CascadeScheme.ACC3],
+        ["lms"],
+        "aae",
+        "split",
+        tw_f_s=0.0,
+        postprocess_method="ssr",
+    )
+
+    assert fft_name != ssr_name
+    assert fft_name.endswith("__TW_F0s__hr_fft")
+    assert ssr_name.endswith("__TW_F0s__hr_ssr")
 
 
 def test_normalisation_modes_keep_minmax_default_and_support_zscore_none() -> None:

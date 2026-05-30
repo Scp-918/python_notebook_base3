@@ -151,13 +151,17 @@ def build_output_run_name(
     objective_mode: str,
     data_split_mode: str,
     tw_f_s: float = 0.0,
+    postprocess_method: str = "fft",
 ) -> str:
     """Build the run_name required by the Notebook output layout."""
 
     scopes = "-".join(TargetScope(x).value for x in target_scopes)
     schemes = "-".join(CascadeScheme(x).value for x in cascade_schemes)
     filters = "-".join(str(x) for x in adaptive_filters)
-    return f"{scopes}__{schemes}__{filters}__{objective_mode}__{data_split_mode}__{_tw_f_run_label(tw_f_s)}"
+    return (
+        f"{scopes}__{schemes}__{filters}__{objective_mode}__{data_split_mode}"
+        f"__{_tw_f_run_label(tw_f_s)}__{_postprocess_run_label(postprocess_method)}"
+    )
 
 
 def _tw_f_run_label(value: float) -> str:
@@ -168,6 +172,14 @@ def _tw_f_run_label(value: float) -> str:
         return f"TW_F{int(value_f)}s"
     text = f"{value_f:g}".replace(".", "p").replace("-", "m")
     return f"TW_F{text}s"
+
+
+def _postprocess_run_label(value: str) -> str:
+    """Return a path-safe output-folder label for HR postprocess method."""
+
+    text = str(value or "fft").strip().lower()
+    safe = "".join(ch if ch.isalnum() else "_" for ch in text).strip("_")
+    return f"hr_{safe or 'fft'}"
 
 
 def safe_prepare_output_dir(
@@ -276,6 +288,7 @@ def run_batch_adaptive_protocol(
                 objective_mode,
                 data_split_mode,
                 tw_f_s=float(trial_overrides.get("TW_F", 0.0)),
+                postprocess_method=str(trial_overrides.get("postprocess_method", "fft")),
             )
             root_out = input_path.parent / "outputs" / run_name
     else:
