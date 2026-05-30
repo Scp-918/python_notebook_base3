@@ -17,6 +17,7 @@ __all__ = [
     "discover_sample_pairs",
     "quality_filter_sample",
     "redraw_best_param_hr_curves",
+    "run_batch_reference_compare",
     "run_batch_adaptive_protocol",
     "safe_prepare_output_dir",
 ]
@@ -27,6 +28,7 @@ def __getattr__(name: str):
         "BatchProtocolResult",
         "build_output_run_name",
         "redraw_best_param_hr_curves",
+        "run_batch_reference_compare",
         "run_batch_adaptive_protocol",
         "safe_prepare_output_dir",
     }:
@@ -34,6 +36,7 @@ def __getattr__(name: str):
             BatchProtocolResult,
             build_output_run_name,
             redraw_best_param_hr_curves,
+            run_batch_reference_compare,
             run_batch_adaptive_protocol,
             safe_prepare_output_dir,
         )
@@ -42,6 +45,7 @@ def __getattr__(name: str):
             "BatchProtocolResult": BatchProtocolResult,
             "build_output_run_name": build_output_run_name,
             "redraw_best_param_hr_curves": redraw_best_param_hr_curves,
+            "run_batch_reference_compare": run_batch_reference_compare,
             "run_batch_adaptive_protocol": run_batch_adaptive_protocol,
             "safe_prepare_output_dir": safe_prepare_output_dir,
         }[name]

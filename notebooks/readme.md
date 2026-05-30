@@ -1,20 +1,20 @@
 
-# change3 三阶段批量自适应滤波协议说明
+# change5 批量自适应滤波协议说明
 
-本文档说明 `python_notebook_base` 当前 `change3` 分支中，`notebooks/run_batch_adaptive_protocol.ipynb` 与 `src/ppg_hr/` 相关代码的使用方式、数据格式、处理流程、贝叶斯训练参数、输出结果和重绘/重输出方法。
+本文档说明 `python_notebook_base` 当前 `change5` 分支中，`notebooks/run_batch_adaptive_protocol.ipynb` 与 `src/ppg_hr/` 相关代码的使用方式、数据格式、处理流程、贝叶斯训练参数、输出结果和重绘/重输出方法。
 
 本文面向第一次使用该工程的人，重点说明“应该改哪里、运行后会发生什么、输出在哪里看”。
 
 ---
 
-## 0. change3 三阶段改造速览
+## 0. change5 改造速览
 
 当前 notebook 已同步三阶段改造，核心变化如下：
 
 ```text
 阶段 1:
     收缩 Optuna 搜索空间，减少低价值组合。
-    RFF-LMS 默认改为特征空间 NLMS，KLMS 默认使用归一化距离、字典上限和冻结新中心策略。
+    RFF-LMS 默认改为特征空间 NLMS；新训练搜索 `rff_sigma_scale`，并按当前 tap 窗口 robust 距离生成 `sigma_eff`。旧结果只有 `rff_sigma` 时仍按 fixed sigma 回放。KLMS 默认使用归一化距离、字典上限和冻结新中心策略。
 
 阶段 2:
     新增 PPG 输入策略 ppg_input_transform。
@@ -24,7 +24,7 @@
 
 阶段 3:
     训练输出统一增加 param_* 分列。
-    replay 和 diagnostics 统一通过 protocol_params_from_record 读取参数，优先 param_*，再兼容 best_params_json / params JSON。
+    replay 和 diagnostics 统一通过 protocol_params_from_record 读取参数，优先 param_*，再兼容 best_params_json / params JSON。HR 后处理默认 `postprocess_method="fft"`；可切换为 SSR 峰值提取分支，SSR 失败会按配置回退 FFT。
     窗口诊断图增加权重/诊断图，并在启用 guard 时区分完整级联输出和 guard 后实际使用输出。
 ```
 
@@ -979,7 +979,7 @@ RFF-LMS 专属搜索项：
 ```text
 RFF_LMS_Mu_Base: [0.001, 0.002, 0.004, 0.006]
 rff_D: [50, 100, 200]
-rff_sigma: [0.5, 1.0, 2.0, 5.0]
+    rff_sigma_scale: [0.5, 1.0, 2.0, 4.0]
 ```
 
 注意：RFF-LMS 采样的是 `RFF_LMS_Mu_Base`，但解码后仍写回统一字段：
@@ -987,6 +987,18 @@ rff_sigma: [0.5, 1.0, 2.0, 5.0]
 ```text
 LMS_Mu_Base
 ```
+
+`rff_sigma` 现在是 deprecated 兼容字段。新训练不再搜索绝对 sigma，而是搜索
+`rff_sigma_scale`。每个 RFF 窗口会先根据 tap matrix 中相邻 tap 向量或有限
+pairwise L2 距离的 median 估计 `sigma_base`，再计算：
+
+```text
+sigma_eff = max(min_sigma, rff_sigma_scale * sigma_base)
+```
+
+Stage JSON / CSV 中会记录 `rff_sigma_scale` 与实际 `sigma_eff`。旧 CSV 或旧
+JSON 只有 `rff_sigma`、没有 `rff_sigma_scale` 时，重绘会自动进入 fixed sigma
+fallback，不会因为缺新字段而中断。
 
 这样下游求解器可以统一读取。
 
@@ -3270,3 +3282,79 @@ Notebook 共 15 个代码块，按流水线组织为"环境初始化 — 诊断�
 3. 看代码块 10 的 replay HR 曲线 --- Adaptive HR 是否优于 Baseline？Final HR 是否合理？
 4. 看代码块 11 的窗口频谱 --- 是否锁错峰？滤波后波形是否发散？如果是，调整第六类参数（训练组合与搜索预算）
 5. 全局参数调整回代码块 0，训练参数调整回代码块 7，重复训练
+
+## 8. change5 新增：FFT/SSR、ACC3 对比与批参考源对比
+
+### 8.1 HR 后处理配置
+
+Notebook 第 0 块新增：
+
+```python
+TRAIN_HR_POSTPROCESS_METHOD = "fft"
+REDRAW_HR_POSTPROCESS_METHOD = "fft"
+SSR_NUM_ATOMS = 5
+SSR_LAMBDA = 0.15
+SSR_HARMONIC_TOL_BPM = 5.0
+SSR_FALLBACK_TO_FFT = True
+SSR_GRID_RESOLUTION_BPM = 1.0
+```
+
+默认训练仍使用 FFT，保证旧逻辑一致。把 `TRAIN_HR_POSTPROCESS_METHOD` 改为
+`"ssr"` 后，SSR 只作为 HR peak extraction/postprocess 分支：它只使用 PPG、
+运动参考和上一窗预测 HR，不使用 `ref_hr_bpm` 参与选峰，避免标签泄漏。SSR
+候选为空或失败时，若 `SSR_FALLBACK_TO_FFT=True`，会记录
+`postprocess_fallback="fft"` 并安全回退 FFT。
+
+### 8.2 ACC3 参考源诊断对比
+
+每个 motion_type 的每个 mode 在 best_params 确定后，会额外用同一 best_params
+把实际 `cascade_scheme` 替换为 `ACC3` 做 test split 复评估。该对比只用于诊断，
+不重新优化，不改变原 mode 的 best_params，也不参与 objective。
+
+新增输出列：
+
+```text
+acc3_compare_aae_bpm
+acc3_compare_accuracy_pct
+acc3_compare_num_windows
+acc3_compare_status
+acc3_compare_reason
+```
+
+这些列会出现在 `mode_summary_*.csv`、`best_params_*.csv`、
+`best_params_all.json` 和 `best_params_and_alignment.csv` 中。若原方案本来就是
+`ACC3`，状态为 `same_as_original`，直接复用原 test 指标。
+
+### 8.3 批参考源对比
+
+Notebook 第 15 块调用：
+
+```python
+run_batch_reference_compare(
+    motion_type=MOTION_TYPE,
+    best_param_source_cascade_scheme=BEST_PARAM_SOURCE_CASCADE_SCHEME,
+    actual_reference_cascade_scheme=ACTUAL_REFERENCE_CASCADE_SCHEME,
+    target_scope=TARGET_SCOPE,
+    adaptive_filter=ADAPTIVE_FILTER,
+    best_param_csv_path=BEST_PARAM_CSV_PATH,
+    output_dir=OUTPUT_DIR,
+)
+```
+
+该函数读取 `best_params_and_alignment.csv` 和同目录的 `split_files.csv`，默认使用
+test split，对“参数来源参考源”和“实际参考源”分别用同一 best_params 复评估，
+输出：
+
+```text
+batch_reference_compare_<motion_type>.csv
+```
+
+CSV 使用 `utf-8-sig`，包含 source/actual 两套 `AAE`、`accuracy`、
+`num_windows`、`success` 和 `reason` 字段。
+
+### 8.4 旧结果兼容
+
+旧 CSV 缺少 `rff_sigma_scale`、`postprocess_method`、SSR 参数或
+`acc3_compare_*` 字段时，读取逻辑会回退到 `ProtocolTrialParams` 默认值；旧 RFF
+结果只有 `rff_sigma` 时使用 fixed sigma fallback。正式复现实验仍建议优先使用
+包含 `param_*` 分列的新 Stage-6 输出。

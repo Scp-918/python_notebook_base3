@@ -64,6 +64,7 @@ __all__ = [
     "protocol_params_from_record",
     "replay_best_record_hr_curves",
     "redraw_best_param_hr_curves",
+    "run_batch_reference_compare",
     "run_batch_adaptive_protocol",
     "safe_prepare_output_dir",
 ]
@@ -2987,6 +2988,7 @@ def redraw_best_param_hr_curves(
     time_bias_after_range_s: tuple[float, float] | None = None,
     time_bias_after_step_s: float | None = None,
     time_bias_after_mode: str | None = None,
+    postprocess_method_override: str | None = None,
 ) -> dict[str, Path]:
     """Re-run one sample with one best-param row and draw HR curves.
 
@@ -3014,6 +3016,8 @@ def redraw_best_param_hr_curves(
         fold_id=fold_id,
         heldout_group_id=heldout_group_id,
     )
+    if postprocess_method_override:
+        params = replace(params, postprocess_method=str(postprocess_method_override))
     dataset = load_and_preprocess_protocol(sensor_csv_path, ref_csv_path, fs_origin=fs_origin)
     run = run_protocol_trial(dataset, scheme, scope, params)
     if not run.success or run.frame.empty:
@@ -3087,6 +3091,155 @@ def redraw_best_param_hr_curves(
     )
     _write_manual_global_hr_csv(global_frame, global_csv_path)
     return {"training_scope": train_path, "global": global_path, "global_csv": global_csv_path}
+
+
+def run_batch_reference_compare(
+    *,
+    motion_type: str,
+    best_param_source_cascade_scheme: str,
+    actual_reference_cascade_scheme: str,
+    target_scope: str,
+    adaptive_filter: str,
+    best_param_csv_path: str | Path,
+    output_dir: str | Path,
+    group_ids: list[str] | None = None,
+    fs_origin: int = 100,
+) -> dict[str, Path]:
+    """Re-evaluate one motion type with source and actual reference schemes.
+
+    中文说明：该函数只读取已有 best_params 与 split_files.csv，不启动 Optuna。
+    同一套 best_params 会分别在来源 cascade 和实际 cascade 上复评估 test split。
+    """
+
+    scope = TargetScope(target_scope)
+    source_scheme = CascadeScheme(best_param_source_cascade_scheme)
+    actual_scheme = CascadeScheme(actual_reference_cascade_scheme)
+    adaptive_filter = str(adaptive_filter)
+    best_path = Path(best_param_csv_path)
+    params = _params_from_best_csv(
+        best_path,
+        scope,
+        source_scheme,
+        adaptive_filter,
+    )
+    motion_dir = best_path.parent
+    split_path = motion_dir / "split_files.csv"
+    if not split_path.exists():
+        raise FileNotFoundError(f"Cannot find split_files.csv next to best params: {split_path}")
+    split_df = pd.read_csv(split_path)
+    candidates = split_df.copy()
+    if "motion_type" in candidates.columns:
+        narrowed = candidates[candidates["motion_type"].astype(str) == str(motion_type)]
+        if not narrowed.empty:
+            candidates = narrowed
+    if "split" in candidates.columns:
+        narrowed = candidates[candidates["split"].astype(str) == "test"]
+        if not narrowed.empty:
+            candidates = narrowed
+    if group_ids is not None:
+        group_set = {str(item) for item in group_ids}
+        candidates = candidates[candidates.get("group_id", pd.Series([], dtype=object)).astype(str).isin(group_set)]
+    candidates = candidates[
+        candidates.get("data_file", pd.Series([], dtype=object)).astype(str).str.len().gt(0)
+        & candidates.get("ref_file", pd.Series([], dtype=object)).astype(str).str.len().gt(0)
+    ]
+    if candidates.empty:
+        raise ValueError("No split/test rows with data_file/ref_file are available for batch reference compare")
+
+    rows: list[dict[str, Any]] = []
+    for _, row in candidates.iterrows():
+        group_id = str(row.get("group_id", ""))
+        sensor_csv = Path(str(row.get("data_file", "")))
+        ref_csv = Path(str(row.get("ref_file", "")))
+        try:
+            dataset = load_and_preprocess_protocol(sensor_csv, ref_csv, fs_origin=fs_origin)
+            source_run = run_protocol_trial(dataset, source_scheme, scope, params, collect_frame=False)
+            actual_run = run_protocol_trial(dataset, actual_scheme, scope, params, collect_frame=False)
+            rows.append(
+                {
+                    "motion_type": str(motion_type),
+                    "group_id": group_id,
+                    "target_scope": scope.value,
+                    "adaptive_filter": adaptive_filter,
+                    "source_cascade_scheme": source_scheme.value,
+                    "actual_reference_cascade_scheme": actual_scheme.value,
+                    **_batch_compare_run_fields("source", source_run),
+                    **_batch_compare_run_fields("actual", actual_run),
+                }
+            )
+        except Exception as exc:
+            rows.append(
+                {
+                    "motion_type": str(motion_type),
+                    "group_id": group_id,
+                    "target_scope": scope.value,
+                    "adaptive_filter": adaptive_filter,
+                    "source_cascade_scheme": source_scheme.value,
+                    "actual_reference_cascade_scheme": actual_scheme.value,
+                    **_empty_batch_compare_run_fields("source", str(exc)),
+                    **_empty_batch_compare_run_fields("actual", str(exc)),
+                }
+            )
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    csv_path = out / f"batch_reference_compare_{motion_type}.csv"
+    columns = _batch_reference_compare_columns()
+    pd.DataFrame(rows, columns=columns).to_csv(csv_path, index=False, encoding="utf-8-sig")
+    return {"csv": csv_path}
+
+
+def _batch_compare_run_fields(prefix: str, run: ProtocolRunResult) -> dict[str, Any]:
+    arrays = getattr(run, "metric_arrays", {}) or {}
+    n_windows = int(np.asarray(arrays.get("ref_hr_bpm", []), dtype=float).size)
+    if n_windows == 0:
+        n_windows = int(getattr(run, "posthoc_n_valid_windows", 0) or 0)
+    return {
+        f"{prefix}_success": bool(run.success),
+        f"{prefix}_reason": str(run.reason),
+        f"{prefix}_final_aae_bpm": float(run.final_aae_bpm),
+        f"{prefix}_final_accuracy_pct": float(run.final_acc_pct),
+        f"{prefix}_adaptive_aae_bpm": float(run.adaptive_aae_bpm),
+        f"{prefix}_adaptive_accuracy_pct": float(run.adaptive_acc_pct),
+        f"{prefix}_num_windows": n_windows,
+    }
+
+
+def _empty_batch_compare_run_fields(prefix: str, reason: str) -> dict[str, Any]:
+    return {
+        f"{prefix}_success": False,
+        f"{prefix}_reason": str(reason),
+        f"{prefix}_final_aae_bpm": float("nan"),
+        f"{prefix}_final_accuracy_pct": float("nan"),
+        f"{prefix}_adaptive_aae_bpm": float("nan"),
+        f"{prefix}_adaptive_accuracy_pct": float("nan"),
+        f"{prefix}_num_windows": 0,
+    }
+
+
+def _batch_reference_compare_columns() -> list[str]:
+    return [
+        "motion_type",
+        "group_id",
+        "target_scope",
+        "adaptive_filter",
+        "source_cascade_scheme",
+        "actual_reference_cascade_scheme",
+        "source_success",
+        "source_reason",
+        "source_final_aae_bpm",
+        "source_final_accuracy_pct",
+        "source_adaptive_aae_bpm",
+        "source_adaptive_accuracy_pct",
+        "source_num_windows",
+        "actual_success",
+        "actual_reason",
+        "actual_final_aae_bpm",
+        "actual_final_accuracy_pct",
+        "actual_adaptive_aae_bpm",
+        "actual_adaptive_accuracy_pct",
+        "actual_num_windows",
+    ]
 
 
 def _time_bias_after_for_redraw(
@@ -3713,6 +3866,7 @@ def plot_window_diagnostics_from_records(
     guard_ratio_max_override: float | None = None,
     guard_flat_std_eps_override: float | None = None,
     guard_use_finite_zscore_override: bool | None = None,
+    postprocess_method_override: str | None = None,
 ) -> dict[str, Any]:
     """Draw waveform and spectrum diagnostics for one aligned FFT sub-window.
 
@@ -3737,6 +3891,8 @@ def plot_window_diagnostics_from_records(
         TW_F=TW_F,
     )
     params = _params_from_stage6_record(best_row, adaptive_filter=adaptive_filter, TW_F=TW_F)
+    if postprocess_method_override:
+        params = replace(params, postprocess_method=str(postprocess_method_override))
     scheme_text = str(cascade_scheme or _stage6_row_text(best_row, "cascade_scheme") or adaptive_data_type)
     scheme_to_run = override_cascade_scheme if override_cascade_scheme else scheme_text
     scheme = CascadeScheme(scheme_to_run)
@@ -4373,6 +4529,7 @@ def replay_best_record_hr_curves(
     guard_ratio_max_override: float | None = None,
     guard_flat_std_eps_override: float | None = None,
     guard_use_finite_zscore_override: bool | None = None,
+    postprocess_method_override: str | None = None,
 ) -> dict[str, Path]:
     """Replay one sample from compact Stage-6 result records without retraining.
 
@@ -4397,6 +4554,8 @@ def replay_best_record_hr_curves(
         TW_F=TW_F,
     )
     params = _params_from_stage6_record(best_row, adaptive_filter=adaptive_filter, TW_F=TW_F)
+    if postprocess_method_override:
+        params = replace(params, postprocess_method=str(postprocess_method_override))
     scheme_text = _stage6_row_text(best_row, "cascade_scheme")
     if cascade_scheme:
         scheme_text = str(cascade_scheme)
