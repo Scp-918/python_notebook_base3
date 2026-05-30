@@ -71,11 +71,18 @@ def test_motion_type_outputs_include_stage6_record_files(tmp_path: Path) -> None
         "TW_F",
         "normalization_mode",
         "best_tdelay_s",
+        "acc3_compare_aae_bpm",
+        "acc3_compare_accuracy_pct",
+        "acc3_compare_num_windows",
+        "acc3_compare_status",
+        "acc3_compare_reason",
         "param_TW_F",
         "param_ppg_input_transform",
         "param_global_objective_strategy",
         "param_cascade_guard_policy",
     }.issubset(params_df.columns)
+    assert params_df.loc[0, "acc3_compare_status"] == "same_as_original"
+    assert float(params_df.loc[0, "acc3_compare_aae_bpm"]) == 3.0
     assert json.loads(params_df.loc[0, "best_params_json"])["TW_F"] == 1.5
 
     metrics_df = pd.read_csv(tmp_path / "best_metrics.csv")
@@ -191,3 +198,27 @@ def test_best_params_all_json_can_be_rebuilt_from_saved_history_paths(tmp_path: 
 
     payload = json.loads((tmp_path / "best_params_all.json").read_text(encoding="utf-8"))
     assert payload[result.mode_key]["trial_history"][0]["trial_idx"] == 0
+
+
+def test_acc3_compare_fields_are_written_for_non_acc3_result(tmp_path: Path) -> None:
+    result = _stage6_result()
+    result.cascade_scheme = CascadeScheme.HF2
+    result.acc3_compare_metrics = {
+        "acc3_compare_aae_bpm": 6.5,
+        "acc3_compare_accuracy_pct": 66.0,
+        "acc3_compare_num_windows": 9,
+        "acc3_compare_status": "ok",
+        "acc3_compare_reason": "",
+    }
+
+    rbp._write_motion_type_outputs(tmp_path, "tiaosheng", [result])
+
+    summary = pd.read_csv(tmp_path / "mode_summary_aae.csv")
+    params = pd.read_csv(tmp_path / "best_params_lms.csv")
+    assert summary.loc[0, "acc3_compare_status"] == "ok"
+    assert float(summary.loc[0, "acc3_compare_aae_bpm"]) == 6.5
+    assert int(summary.loc[0, "acc3_compare_num_windows"]) == 9
+    assert params.loc[0, "acc3_compare_status"] == "ok"
+
+    payload = json.loads((tmp_path / "best_params_all.json").read_text(encoding="utf-8"))
+    assert payload[result.mode_key]["acc3_compare_metrics"]["acc3_compare_accuracy_pct"] == 66.0

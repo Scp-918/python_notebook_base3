@@ -130,6 +130,8 @@ class _ModeOptimisation:
     mode_manifest_path: str = ""
     fold_results: list["_ModeOptimisation"] = field(default_factory=list, repr=False)
     metric_arrays_by_split: dict[str, MetricArrays] = field(default_factory=dict, repr=False)
+    acc3_compare_metrics: dict[str, Any] = field(default_factory=dict)
+    acc3_compare_arrays: MetricArrays = field(default_factory=dict, repr=False)
     result_level: str = "fold"
     aggregation: str = ""
     params_semantics: str = ""
@@ -1256,7 +1258,7 @@ def _optimise_group_mode(
     train_metrics, val_metrics, test_metrics, per_group_rows, arrays_by_split = _evaluate_params_full(best_params)
     success = bool((val_metrics if data_split_mode == "split" else train_metrics).get("success", False))
     reason = str((val_metrics if data_split_mode == "split" else train_metrics).get("reason", ""))
-    return _ModeOptimisation(
+    result = _ModeOptimisation(
         motion_type=motion_type,
         target_scope=scope,
         cascade_scheme=scheme,
@@ -1283,6 +1285,13 @@ def _optimise_group_mode(
         result_level="fold" if data_split_mode == "leave_one_group_out" else "single_split",
         params_semantics="fold_best_params" if data_split_mode == "leave_one_group_out" else "best_params_for_this_split",
     )
+    _attach_acc3_compare(
+        result,
+        test_sets=test_sets,
+        trial_cache=trial_cache,
+        trial_cache_max_entries=trial_cache_max_entries,
+    )
+    return result
 
 
 def _normalise_trial_param_overrides(overrides: dict[str, Any] | None) -> dict[str, Any]:
@@ -1380,7 +1389,7 @@ def _failed_mode_optimisation(
     """
 
     metrics = _failed_metrics("test", reason)
-    return _ModeOptimisation(
+    result = _ModeOptimisation(
         motion_type=motion_type,
         target_scope=scope,
         cascade_scheme=scheme,
@@ -1405,6 +1414,7 @@ def _failed_mode_optimisation(
         history=[],
         success=False,
         reason=reason,
+        acc3_compare_metrics=_empty_acc3_compare_fields("failed", reason),
         result_level="aggregate" if data_split_mode == "leave_one_group_out" else "single_split",
         aggregation="logo_window_concat" if data_split_mode == "leave_one_group_out" else "",
         params_semantics=(
@@ -1454,6 +1464,7 @@ def _aggregate_logo_fold_results(
             history=[],
             success=False,
             reason=reason,
+            acc3_compare_metrics=_empty_acc3_compare_fields("failed", reason),
             result_level="aggregate",
             aggregation="logo_window_concat",
             params_semantics="representative_fold_best_params_not_global",
@@ -1505,6 +1516,24 @@ def _aggregate_logo_fold_results(
         representative_fold_id=best_fold.fold_id,
         representative_heldout_group_id=best_fold.heldout_group_id,
     )
+    if scheme == CascadeScheme.ACC3:
+        result.acc3_compare_metrics = _acc3_compare_fields(test_metrics, status="same_as_original", reason="")
+        result.acc3_compare_arrays = test_arrays
+    else:
+        acc3_arrays = _concat_metric_arrays([r.acc3_compare_arrays for r in fold_results])
+        failures = [
+            str(r.acc3_compare_metrics.get("acc3_compare_reason", ""))
+            for r in fold_results
+            if str(r.acc3_compare_metrics.get("acc3_compare_status", "")) not in {"ok", "same_as_original"}
+        ]
+        acc3_metrics = _metrics_from_arrays_with_status(acc3_arrays, "test", failures)
+        result.acc3_compare_metrics = _acc3_compare_fields(
+            acc3_metrics,
+            status="ok" if bool(acc3_metrics.get("success", False)) else "failed",
+            reason=str(acc3_metrics.get("reason", "")),
+        )
+        result.acc3_compare_arrays = acc3_arrays
+    return result
 
 
 def _evaluate_dataset_map(
@@ -1627,6 +1656,66 @@ def _aggregate_runs(
         "final_acc_pct": metrics["final_acc_pct"],
         "num_windows": metrics["num_windows"],
         **_posthoc_metrics_from(metrics),
+    }
+
+
+def _attach_acc3_compare(
+    result: _ModeOptimisation,
+    *,
+    test_sets: dict[str, ProtocolDataset],
+    trial_cache: OrderedDict[tuple[Any, ...], ProtocolRunResult] | dict[tuple[Any, ...], ProtocolRunResult],
+    trial_cache_max_entries: int,
+) -> None:
+    """Attach same-best-params ACC3 diagnostic test metrics to one completed mode."""
+
+    if result.cascade_scheme == CascadeScheme.ACC3:
+        result.acc3_compare_metrics = _acc3_compare_fields(
+            result.test_metrics,
+            status="same_as_original",
+            reason="",
+        )
+        result.acc3_compare_arrays = result.metric_arrays_by_split.get("test", {})
+        return
+    try:
+        metrics, _, arrays = _evaluate_dataset_map(
+            test_sets,
+            result.target_scope,
+            CascadeScheme.ACC3,
+            result.best_params,
+            "test",
+            trial_cache,
+            eval_mode="light",
+            trial_cache_max_entries=trial_cache_max_entries,
+        )
+        status = "ok" if bool(metrics.get("success", False)) else "failed"
+        result.acc3_compare_metrics = _acc3_compare_fields(
+            metrics,
+            status=status,
+            reason=str(metrics.get("reason", "")),
+        )
+        result.acc3_compare_arrays = arrays
+    except Exception as exc:
+        result.acc3_compare_metrics = _empty_acc3_compare_fields("failed", str(exc))
+        result.acc3_compare_arrays = {}
+
+
+def _acc3_compare_fields(metrics: dict[str, Any], *, status: str, reason: str) -> dict[str, Any]:
+    return {
+        "acc3_compare_aae_bpm": metrics.get("final_aae_bpm", metrics.get("adaptive_aae_bpm", float("nan"))),
+        "acc3_compare_accuracy_pct": metrics.get("final_acc_pct", metrics.get("adaptive_acc_pct", float("nan"))),
+        "acc3_compare_num_windows": int(metrics.get("num_windows", 0) or 0),
+        "acc3_compare_status": str(status),
+        "acc3_compare_reason": str(reason),
+    }
+
+
+def _empty_acc3_compare_fields(status: str = "", reason: str = "") -> dict[str, Any]:
+    return {
+        "acc3_compare_aae_bpm": float("nan"),
+        "acc3_compare_accuracy_pct": float("nan"),
+        "acc3_compare_num_windows": 0,
+        "acc3_compare_status": str(status),
+        "acc3_compare_reason": str(reason),
     }
 
 
@@ -1861,6 +1950,7 @@ def _mode_manifest_payload(result: _ModeOptimisation) -> dict[str, Any]:
         "history_path": result.history_path,
         "per_group_path": result.per_group_path,
         "mode_manifest_path": result.mode_manifest_path,
+        "acc3_compare_metrics": result.acc3_compare_metrics,
         "result_level": result.result_level,
         "aggregation": result.aggregation,
         "params_semantics": result.params_semantics,
@@ -1897,6 +1987,7 @@ def _mode_result_from_manifest_payload(payload: dict[str, Any]) -> _ModeOptimisa
         history_path=str(payload.get("history_path", "")),
         per_group_path=str(payload.get("per_group_path", "")),
         mode_manifest_path=str(payload.get("mode_manifest_path", "")),
+        acc3_compare_metrics=dict(payload.get("acc3_compare_metrics", {})),
         fold_results=[
             _mode_result_from_manifest_payload(dict(item))
             for item in payload.get("fold_results", [])
@@ -2238,6 +2329,7 @@ def _write_motion_type_outputs(
                 "train_metrics": r.train_metrics,
                 "val_metrics": r.val_metrics,
                 "test_metrics": r.test_metrics,
+                "acc3_compare_metrics": _acc3_compare_metrics_for(r),
                 "fold_results": [
                     {
                         "fold_id": fold.fold_id,
@@ -2255,6 +2347,7 @@ def _write_motion_type_outputs(
                         "train_metrics": fold.train_metrics,
                         "val_metrics": fold.val_metrics,
                         "test_metrics": fold.test_metrics,
+                        "acc3_compare_metrics": _acc3_compare_metrics_for(fold),
                         "success": fold.success,
                         "reason": fold.reason,
                         "trial_history": fold.history if fold.history else _load_history_rows_from_path(fold.history_path),
@@ -2411,6 +2504,7 @@ def _best_params_alignment_record(result: _ModeOptimisation) -> dict[str, Any]:
         "adaptive_aae_bpm": metrics.get("adaptive_aae_bpm"),
         "adaptive_acc_pct": metrics.get("adaptive_acc_pct"),
     }
+    row.update(_acc3_compare_metrics_for(result))
     row.update(flatten_params_for_record(params))
     return row
 
@@ -2480,6 +2574,8 @@ def _best_params_alignment_columns() -> list[str]:
         "no_posthoc_final_aae_bpm", "no_posthoc_final_acc_pct",
         "posthoc_final_aae_bpm", "posthoc_final_acc_pct",
         "baseline_aae_bpm", "baseline_acc_pct", "adaptive_aae_bpm", "adaptive_acc_pct",
+        "acc3_compare_aae_bpm", "acc3_compare_accuracy_pct", "acc3_compare_num_windows",
+        "acc3_compare_status", "acc3_compare_reason",
         *_param_record_columns(),
     ]
 
@@ -2581,7 +2677,19 @@ def _summary_row(result: _ModeOptimisation) -> dict[str, Any]:
     # 对多样本聚合若不存在唯一 bias，聚合函数会保留 NaN，避免伪装成全局泛化参数。
     for key, value in _posthoc_metrics_from(result.test_metrics).items():
         row[key] = value
+    row.update(_acc3_compare_metrics_for(result))
     return row
+
+
+def _acc3_compare_metrics_for(result: _ModeOptimisation) -> dict[str, Any]:
+    metrics = dict(getattr(result, "acc3_compare_metrics", {}) or {})
+    required = _empty_acc3_compare_fields()
+    if metrics:
+        required.update({key: metrics.get(key, required[key]) for key in required})
+        return required
+    if result.cascade_scheme == CascadeScheme.ACC3:
+        return _acc3_compare_fields(result.test_metrics, status="same_as_original", reason="")
+    return required
 
 
 def _best_param_row(result: _ModeOptimisation) -> dict[str, Any]:
@@ -2710,6 +2818,11 @@ def _summary_columns() -> list[str]:
         "test_posthoc_baseline_aae_bpm",
         "test_posthoc_baseline_acc_pct",
         "test_posthoc_n_valid_windows",
+        "acc3_compare_aae_bpm",
+        "acc3_compare_accuracy_pct",
+        "acc3_compare_num_windows",
+        "acc3_compare_status",
+        "acc3_compare_reason",
     ]
 
 
