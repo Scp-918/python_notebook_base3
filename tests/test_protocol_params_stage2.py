@@ -47,7 +47,8 @@ def test_stage1_search_space_uses_stabilized_candidate_lists() -> None:
     assert space.options("M2") == [2, 3]
     assert space.options("RFF_LMS_Mu_Base") == [0.001, 0.002, 0.004, 0.006]
     assert space.options("rff_D") == [50, 100, 200]
-    assert space.options("rff_sigma") == [0.5, 1.0, 2.0, 5.0]
+    assert space.options("rff_sigma_scale") == [0.5, 1.0, 2.0, 4.0]
+    assert "rff_sigma" not in space.names_for_filter("rff_lms")
     assert space.options("klms_step_size") == [0.005, 0.01, 0.02, 0.05]
     assert space.options("klms_sigma") == [0.5, 1.0, 2.0, 5.0]
     assert space.options("klms_epsilon") == [0.005, 0.01, 0.02, 0.05, 0.1]
@@ -92,6 +93,7 @@ def test_klms_has_independent_search_parameters_and_is_batch_selectable() -> Non
     assert "RFF_LMS_Mu_Base" not in names
     assert "rff_D" not in names
     assert "rff_sigma" not in names
+    assert "rff_sigma_scale" not in names
     assert "alpha_u" not in names
     assert "M2" not in names
     assert space.options("klms_step_size") == [0.005, 0.01, 0.02, 0.05]

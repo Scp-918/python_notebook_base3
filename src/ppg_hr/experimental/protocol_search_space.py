@@ -88,12 +88,14 @@ class ProtocolTrialParams:
     alpha_u: float = 0.1
     M2: int = 3
     rff_D: int = 100
+    rff_sigma_scale: float | None = 1.0
+    # Deprecated fixed sigma fallback for old records that do not contain rff_sigma_scale.
     rff_sigma: float = 1.0
     rff_seed: int = 0
     # 中文说明：RFF-LMS 默认使用特征空间 NLMS，避免普通 LMS 在高维随机特征下
     # 因特征能量和大步长组合发散；字段不进入搜索空间，只作为工程固定策略。
     rff_update_mode: str = "nlms"
-    rff_nlms_eps: float = 1e-6
+    rff_nlms_eps: float = 1e-9
     rff_leakage: float = 0.0
     rff_err_clip: float | None = None
     rff_theta_norm_guard: float | None = None

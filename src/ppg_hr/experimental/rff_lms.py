@@ -13,7 +13,7 @@ import numpy as np
 
 from .tap_matrix import build_noncausal_tap_matrix
 
-__all__ = ["get_rff_weights", "noncausal_rff_lms_filter"]
+__all__ = ["estimate_rff_sigma_base", "get_rff_weights", "noncausal_rff_lms_filter"]
 
 
 @lru_cache(maxsize=64)
@@ -45,9 +45,11 @@ def noncausal_rff_lms_filter(
     D: int,
     sigma: float,
     rff_seed: int,
+    sigma_scale: float | None = None,
+    min_sigma: float = 1e-6,
     mu_min: float = 1e-5,
     update_mode: str = "nlms",
-    nlms_eps: float = 1e-6,
+    nlms_eps: float = 1e-9,
     leakage: float = 0.0,
     err_clip: float | None = None,
     theta_norm_guard: float | None = None,
@@ -60,6 +62,7 @@ def noncausal_rff_lms_filter(
     - ``W ~ Normal(0, 1/sigma^2)``，``b ~ Uniform(0, 2*pi)``；
     - 特征 ``z(x)=sqrt(2/D)*cos(W@x+b)``；
     - 默认更新 ``theta = (1-leakage)*theta + mu*e*z/(z@z+nlms_eps)``；
+    - 新训练可传入 ``sigma_scale``，核宽会按当前 tap matrix 的 robust 距离自适应；
     - 如需复现实验旧逻辑，可显式传入 ``update_mode="lms"``，使用普通 LMS 更新；
     - ``err_clip`` 和 ``theta_norm_guard`` 是工程保护项，只在非 None 时生效；
     - ``return_diagnostics=True`` 时返回短诊断序列，默认仍只返回 ``out``。
@@ -77,7 +80,7 @@ def noncausal_rff_lms_filter(
     M = max(1, int(M))
     K = max(0, int(K))
     D = max(1, int(D))
-    sigma = max(float(sigma), 1e-6)
+    sigma = max(float(sigma), float(min_sigma), 1e-12)
     out = d_arr.copy()
     X, valid_indices = build_noncausal_tap_matrix(u_arr, M, K)
     if valid_indices.size == 0:
@@ -85,7 +88,16 @@ def noncausal_rff_lms_filter(
             return out, _empty_diagnostics()
         return out
 
-    W, b = get_rff_weights(D, X.shape[1], sigma, int(rff_seed))
+    sigma_base = estimate_rff_sigma_base(X, min_sigma=min_sigma)
+    if sigma_scale is None:
+        sigma_eff = sigma
+        sigma_mode = "fixed_deprecated_rff_sigma"
+    else:
+        scale_value = float(sigma_scale) if np.isfinite(float(sigma_scale)) else 1.0
+        sigma_eff = max(float(min_sigma), abs(scale_value) * float(sigma_base))
+        sigma_mode = "adaptive"
+
+    W, b = get_rff_weights(D, X.shape[1], sigma_eff, int(rff_seed))
     scale = float(np.sqrt(2.0 / D))
     # 中文注释：RFF 特征矩阵只在单窗口单级内批量计算，随后按时间顺序递推 theta。
     Z = scale * np.cos(X @ W.T + b)
@@ -94,7 +106,7 @@ def noncausal_rff_lms_filter(
     mode = str(update_mode or "nlms").lower()
     if mode not in {"nlms", "lms"}:
         raise ValueError("update_mode must be 'nlms' or 'lms'")
-    eps = float(nlms_eps) if np.isfinite(float(nlms_eps)) and float(nlms_eps) > 0.0 else 1e-6
+    eps = float(nlms_eps) if np.isfinite(float(nlms_eps)) and float(nlms_eps) > 0.0 else 1e-9
     leak = float(leakage) if np.isfinite(float(leakage)) else 0.0
     leak = min(max(leak, 0.0), 1.0)
     clip_value = None if err_clip is None else abs(float(err_clip))
@@ -144,11 +156,45 @@ def noncausal_rff_lms_filter(
             "max_abs_theta_t": np.asarray(max_abs_theta_t, dtype=float),
             "guard_triggered_count": int(guard_triggered_count),
             "err_clip_count": int(err_clip_count),
+            "sigma_base": float(sigma_base),
+            "sigma_eff": float(sigma_eff),
+            "sigma_mode": sigma_mode,
         }
         diagnostics["theta_norm_t"][~np.isfinite(diagnostics["theta_norm_t"])] = 0.0
         diagnostics["max_abs_theta_t"][~np.isfinite(diagnostics["max_abs_theta_t"])] = 0.0
         return out, diagnostics
     return out
+
+
+def estimate_rff_sigma_base(X: np.ndarray, *, min_sigma: float = 1e-6, max_pairs: int = 2048) -> float:
+    """Estimate a robust tap-space distance scale for adaptive RFF sigma."""
+
+    mat = np.asarray(X, dtype=float)
+    if mat.ndim != 2 or mat.shape[0] == 0:
+        return float(min_sigma)
+    finite_rows = np.isfinite(mat).all(axis=1)
+    mat = mat[finite_rows]
+    if mat.shape[0] == 0:
+        return float(min_sigma)
+    if mat.shape[0] >= 2:
+        adjacent = np.linalg.norm(np.diff(mat, axis=0), axis=1)
+        adjacent = adjacent[np.isfinite(adjacent) & (adjacent > 0.0)]
+        if adjacent.size:
+            return max(float(min_sigma), float(np.median(adjacent)))
+    if mat.shape[0] >= 2:
+        step = max(1, int(np.ceil(mat.shape[0] / max(2, min(int(max_pairs), mat.shape[0])))))
+        sample = mat[::step]
+        if sample.shape[0] > 1:
+            diffs = sample[:, None, :] - sample[None, :, :]
+            tri = np.triu_indices(sample.shape[0], k=1)
+            dists = np.linalg.norm(diffs[tri], axis=1)
+            dists = dists[np.isfinite(dists) & (dists > 0.0)]
+            if dists.size:
+                return max(float(min_sigma), float(np.median(dists)))
+    spread = float(np.linalg.norm(np.nanstd(mat, axis=0)))
+    if np.isfinite(spread) and spread > 0.0:
+        return max(float(min_sigma), spread)
+    return float(min_sigma)
 
 
 def _empty_diagnostics() -> dict[str, np.ndarray | int]:
@@ -159,6 +205,9 @@ def _empty_diagnostics() -> dict[str, np.ndarray | int]:
         "max_abs_theta_t": np.asarray([], dtype=float),
         "guard_triggered_count": 0,
         "err_clip_count": 0,
+        "sigma_base": float("nan"),
+        "sigma_eff": float("nan"),
+        "sigma_mode": "empty",
     }
 
 

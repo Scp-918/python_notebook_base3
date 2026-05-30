@@ -104,6 +104,8 @@ class ProtocolSearchParams:
     alpha_u: list[float] = field(default_factory=lambda: [0.005, 0.01, 0.03, 0.05, 0.1])
     M2: list[int] = field(default_factory=lambda: [2, 3])
     rff_D: list[int] = field(default_factory=lambda: [50, 100, 200])
+    rff_sigma_scale: list[float] = field(default_factory=lambda: [0.5, 1.0, 2.0, 4.0])
+    # Deprecated: kept for old CSV/JSON replay. New training searches rff_sigma_scale.
     rff_sigma: list[float] = field(default_factory=lambda: [0.5, 1.0, 2.0, 5.0])
     klms_step_size: list[float] = field(default_factory=lambda: [0.005, 0.01, 0.02, 0.05])
     klms_sigma: list[float] = field(default_factory=lambda: [0.5, 1.0, 2.0, 5.0])
@@ -138,7 +140,7 @@ class ProtocolSearchParams:
         if adaptive_filter == "volterra":
             return [*common, "LMS_Mu_Base", "alpha_u", "M2"]
         if adaptive_filter == "rff_lms":
-            return [*common, "RFF_LMS_Mu_Base", "rff_D", "rff_sigma"]
+            return [*common, "RFF_LMS_Mu_Base", "rff_D", "rff_sigma_scale"]
         if adaptive_filter == "klms":
             return [*common, "klms_step_size", "klms_sigma", "klms_epsilon"]
         raise ValueError(f"Unsupported adaptive_filter: {adaptive_filter}")

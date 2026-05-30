@@ -121,6 +121,44 @@ def _ref_rff(
     return out
 
 
+def _ref_rff_nlms(
+    u: np.ndarray,
+    d: np.ndarray,
+    M: int,
+    K: int,
+    mu: float,
+    D: int,
+    sigma: float,
+    rff_seed: int,
+    eps: float = 1e-9,
+    mu_min: float = 1e-5,
+) -> np.ndarray:
+    u_arr = _zscore(u)
+    d_arr = _zscore(d)
+    n = min(u_arr.size, d_arr.size)
+    u_arr = u_arr[:n]
+    d_arr = d_arr[:n]
+    M = max(1, int(M))
+    K = max(0, int(K))
+    out = d_arr.copy()
+    if n - K < M:
+        return out
+    D = max(1, int(D))
+    W, b = get_rff_weights(D, M + K, max(float(sigma), 1e-6), int(rff_seed))
+    theta = np.zeros(D, dtype=float)
+    scale = float(np.sqrt(2.0 / D))
+    mu = max(float(mu_min), float(mu) if np.isfinite(mu) else float(mu_min))
+    for idx in range(M - 1, n - K):
+        x = u_arr[idx - M + 1 : idx + K + 1][::-1]
+        z = scale * np.cos(W @ x + b)
+        y = float(theta @ z)
+        err = float(d_arr[idx] - y)
+        out[idx] = err
+        theta += (mu / (float(z @ z) + float(eps))) * err * z
+    out[~np.isfinite(out)] = 0.0
+    return out
+
+
 def _ref_klms(
     u: np.ndarray,
     d: np.ndarray,
@@ -209,6 +247,67 @@ def test_vectorized_filters_match_reference_loops() -> None:
             _ref_klms(u, d, M, K, mu=0.05, sigma=1.5, epsilon=0.1),
             atol=1e-12,
         )
+
+
+def test_rff_lms_default_matches_normalized_reference_formula() -> None:
+    rng = np.random.default_rng(2025)
+    u = rng.normal(size=96)
+    d = rng.normal(size=96)
+
+    out = noncausal_rff_lms_filter(
+        u,
+        d,
+        M=5,
+        K=2,
+        mu=0.05,
+        D=24,
+        sigma=1.25,
+        rff_seed=99,
+        nlms_eps=1e-9,
+    )
+
+    np.testing.assert_allclose(
+        out,
+        _ref_rff_nlms(u, d, M=5, K=2, mu=0.05, D=24, sigma=1.25, rff_seed=99, eps=1e-9),
+        atol=1e-12,
+    )
+
+
+def test_rff_lms_adaptive_sigma_reports_effective_value_and_keeps_seed_deterministic() -> None:
+    rng = np.random.default_rng(2026)
+    u = np.cumsum(rng.normal(size=128))
+    d = rng.normal(size=128)
+
+    out1, diag1 = noncausal_rff_lms_filter(
+        u,
+        d,
+        M=6,
+        K=3,
+        mu=0.01,
+        D=32,
+        sigma=9.9,
+        sigma_scale=2.0,
+        rff_seed=17,
+        return_diagnostics=True,
+    )
+    out2, diag2 = noncausal_rff_lms_filter(
+        u,
+        d,
+        M=6,
+        K=3,
+        mu=0.01,
+        D=32,
+        sigma=9.9,
+        sigma_scale=2.0,
+        rff_seed=17,
+        return_diagnostics=True,
+    )
+
+    assert diag1["sigma_mode"] == "adaptive"
+    assert float(diag1["sigma_base"]) > 0.0
+    assert np.isclose(float(diag1["sigma_eff"]), 2.0 * float(diag1["sigma_base"]))
+    np.testing.assert_allclose(out1, out2)
+    assert diag1["sigma_eff"] == diag2["sigma_eff"]
 
 
 def test_rff_lms_default_nlms_stays_finite_and_reports_diagnostics() -> None:

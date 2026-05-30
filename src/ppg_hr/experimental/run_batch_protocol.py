@@ -1750,18 +1750,34 @@ def protocol_params_from_record(row: Any) -> ProtocolTrialParams:
 
     record = _record_to_dict(row)
     values: dict[str, Any] = {}
+    saw_rff_sigma = False
+    saw_rff_sigma_scale = False
     for json_column in ("best_params_json", "params"):
         payload = _parse_stage6_params_json(record.get(json_column, ""))
+        saw_rff_sigma = saw_rff_sigma or "rff_sigma" in payload
+        saw_rff_sigma_scale = saw_rff_sigma_scale or "rff_sigma_scale" in payload
         values.update({name: payload[name] for name in _protocol_param_names() if name in payload})
     for item in fields(ProtocolTrialParams):
         if item.name in record and not _record_value_missing(record[item.name]):
             values[item.name] = _coerce_protocol_param_value(record[item.name], item)
+            if item.name == "rff_sigma":
+                saw_rff_sigma = True
+            if item.name == "rff_sigma_scale":
+                saw_rff_sigma_scale = True
     for item in fields(ProtocolTrialParams):
         param_name = f"param_{item.name}"
         if param_name in record and not _record_value_missing(record[param_name]):
             values[item.name] = _coerce_protocol_param_value(record[param_name], item)
+            if item.name == "rff_sigma":
+                saw_rff_sigma = True
+            if item.name == "rff_sigma_scale":
+                saw_rff_sigma_scale = True
         elif param_name in record and _record_value_missing(record[param_name]) and item.default is None:
             values[item.name] = None
+            if item.name == "rff_sigma_scale":
+                saw_rff_sigma_scale = True
+    if saw_rff_sigma and not saw_rff_sigma_scale:
+        values["rff_sigma_scale"] = None
     return ProtocolTrialParams(**values)
 
 

@@ -1275,9 +1275,10 @@ def _cascade_filter_window(
             elif filter_type == "rff_lms":
                 rff_D = int(getattr(params, "rff_D", 100))
                 rff_sigma = float(getattr(params, "rff_sigma", 1.0))
+                rff_sigma_scale = getattr(params, "rff_sigma_scale", 1.0)
                 rff_seed = int(getattr(params, "rff_seed", 0))
                 rff_update_mode = str(getattr(params, "rff_update_mode", "nlms"))
-                rff_nlms_eps = float(getattr(params, "rff_nlms_eps", 1e-6))
+                rff_nlms_eps = float(getattr(params, "rff_nlms_eps", 1e-9))
                 rff_leakage = float(getattr(params, "rff_leakage", 0.0))
                 rff_err_clip = getattr(params, "rff_err_clip", None)
                 rff_theta_norm_guard = getattr(params, "rff_theta_norm_guard", None)
@@ -1289,6 +1290,7 @@ def _cascade_filter_window(
                     mu=design.u,
                     D=rff_D,
                     sigma=rff_sigma,
+                    sigma_scale=rff_sigma_scale,
                     rff_seed=rff_seed,
                     mu_min=float(getattr(params, "LMS_Mu_Min", 1e-6)),
                     update_mode=rff_update_mode,
@@ -1306,6 +1308,8 @@ def _cascade_filter_window(
                     {
                         "D": rff_D,
                         "sigma": rff_sigma,
+                        "rff_sigma": rff_sigma,
+                        "rff_sigma_scale": rff_sigma_scale,
                         "rff_seed": rff_seed,
                         "update_mode": rff_update_mode,
                         "nlms_eps": rff_nlms_eps,

@@ -132,6 +132,18 @@ def test_protocol_params_from_record_prefers_param_columns_over_json() -> None:
     assert restored.adaptive_filter == "klms"
 
 
+def test_protocol_params_from_old_rff_record_uses_fixed_sigma_fallback() -> None:
+    old_params = ProtocolTrialParams(adaptive_filter="rff_lms", rff_sigma=2.5).to_dict()
+    old_params.pop("rff_sigma_scale", None)
+    row = {"best_params_json": json.dumps(old_params)}
+
+    restored = rbp.protocol_params_from_record(row)
+
+    assert restored.adaptive_filter == "rff_lms"
+    assert restored.rff_sigma == 2.5
+    assert restored.rff_sigma_scale is None
+
+
 def test_append_history_includes_params_json_and_param_columns() -> None:
     history: list[dict[str, object]] = []
     params = ProtocolTrialParams(ppg_input_transform="log_absorbance", cascade_guard_policy="rms_guard")
