@@ -48,6 +48,12 @@ class ProtocolTrialParams:
     hr_range_hz: float = 25.0 / 60.0
     slew_limit_bpm: int = 10
     slew_step_bpm: int = 7
+    postprocess_method: str = "fft"
+    SSR_Num_Atoms: int = 5
+    SSR_Lambda: float = 0.15
+    SSR_Harmonic_Tol_BPM: float = 5.0
+    SSR_Fallback_To_FFT: bool = True
+    SSR_Grid_Resolution_BPM: float = 1.0
     LMS_Mu_Base: float = 0.01
     LMS_Mu_Min: float = 1e-6
     adaptive_filter: str = "lms"

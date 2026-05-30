@@ -40,7 +40,7 @@ from .preprocess_protocol import (
 from .protocol_search_space import ProtocolTrialParams
 from .rff_lms import noncausal_rff_lms_filter
 from .segmentation import SegmentInfo, detect_activity_segments
-from .spectral_utils import compute_power_spectrum, dominant_frequency_in_band
+from .spectral_utils import compute_power_spectrum, dominant_frequency_in_band, sparse_spectrum_hr_candidates
 from .volterra import noncausal_volterra_filter
 
 __all__ = [
@@ -52,6 +52,7 @@ __all__ = [
     "clear_trial_heavy_caches",
     "extract_hr_with_penalty",
     "extract_plain_fft_hr",
+    "_extract_hr_result",
     "run_protocol_trial",
 ]
 
@@ -814,6 +815,8 @@ def _run_windows(
     ref_out: list[float] = []
     baseline_out: list[float] = []
     adaptive_out: list[float] = []
+    baseline_postprocess_out: list[dict[str, Any]] = []
+    adaptive_postprocess_out: list[dict[str, Any]] = []
     qc_status_out: list[str] = []
     qc_reason_out: list[str] = []
     qc_stat_rows: list[dict[str, Any]] = []
@@ -841,17 +844,21 @@ def _run_windows(
         if baseline_spectrum is None:
             baseline_spectrum = _spectrum(norm["ppg_green"], fs)
             base.spectral_cache[spec_key] = baseline_spectrum
-        baseline_hr = extract_plain_fft_hr(
+        baseline_post = _extract_hr_result(
             norm["ppg_green"],
+            fs,
             prev_baseline,
             params,
-            fs,
+            enable_penalty=False,
+            penalty_ref=None,
             precomputed_spectrum=baseline_spectrum,
         )
+        baseline_hr = float(baseline_post["hr_bpm"])
         prev_baseline = baseline_hr if np.isfinite(baseline_hr) else prev_baseline
 
         if qc_should_skip:
             adaptive_hr = float("nan") if qc_status in {"dropped", "interpolate_pending"} else baseline_hr
+            adaptive_post = dict(baseline_post)
             adaptive_stages = []
         elif _window_in_scope(str(label), scope, float(center_s), aligned.segment_info):
             filtered_context, penalty_ref_context, adaptive_stages, penalty_ref_channel = _cascade_filter_window(
@@ -870,9 +877,18 @@ def _run_windows(
             fft_stop_idx = fft_offset_idx + int(norm_cache.win_len)
             filtered = np.asarray(filtered_context, dtype=float)[fft_offset_idx:fft_stop_idx]
             penalty_ref = np.asarray(penalty_ref_context, dtype=float)[fft_offset_idx:fft_stop_idx]
-            adaptive_hr = extract_hr_with_penalty(filtered, penalty_ref, prev_adaptive, params, fs)
+            adaptive_post = _extract_hr_result(
+                filtered,
+                fs,
+                prev_adaptive,
+                params,
+                enable_penalty=True,
+                penalty_ref=penalty_ref,
+            )
+            adaptive_hr = float(adaptive_post["hr_bpm"])
         else:
             adaptive_hr = baseline_hr
+            adaptive_post = dict(baseline_post)
             adaptive_stages = []
 
         if np.isfinite(adaptive_hr):
@@ -884,6 +900,8 @@ def _run_windows(
         ref_out.append(float(ref_hr))
         baseline_out.append(float(baseline_hr))
         adaptive_out.append(float(adaptive_hr))
+        baseline_postprocess_out.append(baseline_post)
+        adaptive_postprocess_out.append(adaptive_post)
         qc_status_out.append(qc_status)
         qc_reason_out.append(qc_reason)
         qc_stat_rows.append(qc_stats)
@@ -913,6 +931,14 @@ def _run_windows(
                     "ref_hr_bpm": float(ref_hr),
                     "baseline_ppg_hr_bpm": float(baseline_hr),
                     "adaptive_hr_bpm": float(adaptive_hr),
+                    "baseline_postprocess_method": str(baseline_post.get("postprocess_method", "")),
+                    "adaptive_postprocess_method": str(adaptive_post.get("postprocess_method", "")),
+                    "adaptive_postprocess_fallback": str(adaptive_post.get("postprocess_fallback", "")),
+                    "adaptive_postprocess_reason": str(adaptive_post.get("postprocess_reason", "")),
+                    "adaptive_postprocess_candidates_json": json.dumps(
+                        _json_ready_postprocess_candidates(adaptive_post),
+                        ensure_ascii=False,
+                    ),
                     "penalty_ref_channel": penalty_ref_channel,
                     "adaptive_stages_json": stages_json,
                     "lms_stages_json": stages_json,
@@ -942,6 +968,18 @@ def _run_windows(
         "ref_hr_bpm": np.asarray(ref_out, dtype=float),
         "baseline_hr_bpm": np.asarray(baseline_out, dtype=float),
         "adaptive_hr_bpm": np.asarray(adaptive_out, dtype=float),
+        "baseline_postprocess_method": np.asarray(
+            [str(item.get("postprocess_method", "")) for item in baseline_postprocess_out],
+            dtype=object,
+        ),
+        "adaptive_postprocess_method": np.asarray(
+            [str(item.get("postprocess_method", "")) for item in adaptive_postprocess_out],
+            dtype=object,
+        ),
+        "adaptive_postprocess_fallback": np.asarray(
+            [str(item.get("postprocess_fallback", "")) for item in adaptive_postprocess_out],
+            dtype=object,
+        ),
         "center_s": np.asarray(time_out, dtype=float),
         "fft_start_s": norm_cache.start_s.astype(float),
         "fft_end_s": norm_cache.start_s.astype(float) + float(params.TW),
@@ -1574,6 +1612,107 @@ def _extract_hr(
 ) -> float:
     """Extract HR using Hamming FFT, optional spectral penalty, and slew limit."""
 
+    return float(
+        _extract_hr_result(
+            signal,
+            fs,
+            previous_hr,
+            params,
+            enable_penalty=enable_penalty,
+            penalty_ref=penalty_ref,
+            precomputed_spectrum=precomputed_spectrum,
+        )["hr_bpm"]
+    )
+
+
+def _extract_hr_result(
+    signal: np.ndarray,
+    fs: int,
+    previous_hr: float | None,
+    params: ProtocolTrialParams,
+    *,
+    enable_penalty: bool,
+    penalty_ref: np.ndarray | None,
+    precomputed_spectrum: tuple[np.ndarray, np.ndarray] | None = None,
+) -> dict[str, Any]:
+    """Extract HR and return postprocessing diagnostics."""
+
+    method = str(getattr(params, "postprocess_method", "fft") or "fft").lower()
+    fft_hr = _extract_fft_hr(
+        signal,
+        fs,
+        previous_hr,
+        params,
+        enable_penalty=enable_penalty,
+        penalty_ref=penalty_ref,
+        precomputed_spectrum=precomputed_spectrum,
+    )
+    if method == "fft":
+        return {
+            "hr_bpm": float(fft_hr),
+            "postprocess_method": "fft",
+            "postprocess_fallback": "",
+            "postprocess_reason": "",
+            "candidate_bpm": [],
+            "candidate_score": [],
+            "harmonic_adjusted": False,
+        }
+    if method != "ssr":
+        raise ValueError("postprocess_method must be 'fft' or 'ssr'")
+
+    ssr = sparse_spectrum_hr_candidates(
+        signal,
+        fs,
+        previous_hr=previous_hr,
+        hr_band_bpm=(0.5 * 60.0, 4.0 * 60.0),
+        penalty_ref=penalty_ref if enable_penalty else None,
+        penalty_width_hz=float(getattr(params, "Spec_Penalty_Width", 0.2)),
+        penalty_weight=float(getattr(params, "Spec_Penalty_Weight", 0.4)),
+        num_atoms=int(getattr(params, "SSR_Num_Atoms", 5)),
+        lambda_threshold=float(getattr(params, "SSR_Lambda", 0.15)),
+        harmonic_tol_bpm=float(getattr(params, "SSR_Harmonic_Tol_BPM", 5.0)),
+        grid_resolution_bpm=float(getattr(params, "SSR_Grid_Resolution_BPM", 1.0)),
+        slew_limit_bpm=float(getattr(params, "slew_limit_bpm", 10.0)),
+        slew_step_bpm=float(getattr(params, "slew_step_bpm", 7.0)),
+    )
+    hr = float(ssr.get("hr_bpm", float("nan")))
+    if np.isfinite(hr):
+        return {
+            **ssr,
+            "hr_bpm": hr,
+            "postprocess_method": "ssr",
+            "postprocess_fallback": "",
+            "postprocess_reason": str(ssr.get("reason", "")),
+        }
+    if bool(getattr(params, "SSR_Fallback_To_FFT", True)):
+        return {
+            **ssr,
+            "hr_bpm": float(fft_hr),
+            "postprocess_method": "ssr",
+            "postprocess_fallback": "fft",
+            "postprocess_reason": str(ssr.get("reason", "ssr failed")),
+        }
+    return {
+        **ssr,
+        "hr_bpm": float("nan"),
+        "postprocess_method": "ssr",
+        "postprocess_fallback": "",
+        "postprocess_reason": str(ssr.get("reason", "ssr failed")),
+    }
+
+
+def _extract_fft_hr(
+    signal: np.ndarray,
+    fs: int,
+    previous_hr: float | None,
+    params: ProtocolTrialParams,
+    *,
+    enable_penalty: bool,
+    penalty_ref: np.ndarray | None,
+    precomputed_spectrum: tuple[np.ndarray, np.ndarray] | None = None,
+) -> float:
+    """Extract HR using Hamming FFT, optional spectral penalty, and slew limit."""
+
     freq, amp = precomputed_spectrum if precomputed_spectrum is not None else _spectrum(signal, fs)
     band = (freq >= 0.5) & (freq <= 4.0)
     if not band.any():
@@ -1615,6 +1754,33 @@ def _extract_hr(
 
     idx = candidates[int(np.argmax(amp_work[candidates]))]
     return float(freq[idx] * 60.0)
+
+
+def _json_ready_postprocess_candidates(result: dict[str, Any]) -> dict[str, Any]:
+    """Return compact JSON-safe candidate diagnostics for one HR window."""
+
+    out = {
+        "candidate_bpm": result.get("candidate_bpm", []),
+        "candidate_score": result.get("candidate_score", []),
+        "harmonic_adjusted": bool(result.get("harmonic_adjusted", False)),
+        "penalty_freq_hz": result.get("penalty_freq_hz", float("nan")),
+    }
+    return _jsonify_postprocess(out)
+
+
+def _jsonify_postprocess(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _jsonify_postprocess(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonify_postprocess(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return [_jsonify_postprocess(v) for v in value.tolist()]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        value_f = float(value)
+        return value_f if np.isfinite(value_f) else None
+    return value
 
 
 def _spectrum(signal: np.ndarray, fs: int) -> tuple[np.ndarray, np.ndarray]:
