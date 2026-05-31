@@ -73,6 +73,8 @@ def test_motion_type_outputs_include_stage6_record_files(tmp_path: Path) -> None
         "best_tdelay_s",
         "acc3_compare_aae_bpm",
         "acc3_compare_accuracy_pct",
+        "acc3_compare_posthoc_final_aae_bpm",
+        "acc3_compare_posthoc_final_acc_pct",
         "acc3_compare_num_windows",
         "acc3_compare_status",
         "acc3_compare_reason",
@@ -83,6 +85,7 @@ def test_motion_type_outputs_include_stage6_record_files(tmp_path: Path) -> None
     }.issubset(params_df.columns)
     assert params_df.loc[0, "acc3_compare_status"] == "same_as_original"
     assert float(params_df.loc[0, "acc3_compare_aae_bpm"]) == 3.0
+    assert float(params_df.loc[0, "acc3_compare_posthoc_final_aae_bpm"]) == 2.0
     assert json.loads(params_df.loc[0, "best_params_json"])["TW_F"] == 1.5
 
     metrics_df = pd.read_csv(tmp_path / "best_metrics.csv")
@@ -206,6 +209,8 @@ def test_acc3_compare_fields_are_written_for_non_acc3_result(tmp_path: Path) -> 
     result.acc3_compare_metrics = {
         "acc3_compare_aae_bpm": 6.5,
         "acc3_compare_accuracy_pct": 66.0,
+        "acc3_compare_posthoc_final_aae_bpm": 4.5,
+        "acc3_compare_posthoc_final_acc_pct": 77.0,
         "acc3_compare_num_windows": 9,
         "acc3_compare_status": "ok",
         "acc3_compare_reason": "",
@@ -217,8 +222,10 @@ def test_acc3_compare_fields_are_written_for_non_acc3_result(tmp_path: Path) -> 
     params = pd.read_csv(tmp_path / "best_params_lms.csv")
     assert summary.loc[0, "acc3_compare_status"] == "ok"
     assert float(summary.loc[0, "acc3_compare_aae_bpm"]) == 6.5
+    assert float(summary.loc[0, "acc3_compare_posthoc_final_aae_bpm"]) == 4.5
     assert int(summary.loc[0, "acc3_compare_num_windows"]) == 9
     assert params.loc[0, "acc3_compare_status"] == "ok"
 
     payload = json.loads((tmp_path / "best_params_all.json").read_text(encoding="utf-8"))
     assert payload[result.mode_key]["acc3_compare_metrics"]["acc3_compare_accuracy_pct"] == 66.0
+    assert payload[result.mode_key]["acc3_compare_metrics"]["acc3_compare_posthoc_final_acc_pct"] == 77.0

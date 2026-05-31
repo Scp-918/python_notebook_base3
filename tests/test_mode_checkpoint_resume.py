@@ -83,6 +83,8 @@ def test_mode_done_progress_payload_reports_current_and_acc3_metrics() -> None:
     result.acc3_compare_metrics = {
         "acc3_compare_aae_bpm": 6.5,
         "acc3_compare_accuracy_pct": 66.0,
+        "acc3_compare_posthoc_final_aae_bpm": 4.5,
+        "acc3_compare_posthoc_final_acc_pct": 77.0,
         "acc3_compare_num_windows": 9,
         "acc3_compare_status": "ok",
         "acc3_compare_reason": "",
@@ -97,8 +99,12 @@ def test_mode_done_progress_payload_reports_current_and_acc3_metrics() -> None:
     assert payload["cascade_scheme"] == "HF2"
     assert payload["current_final_aae_bpm"] == 3.0
     assert payload["current_final_acc_pct"] == 90.0
+    assert payload["current_posthoc_final_aae_bpm"] == 2.0
+    assert payload["current_posthoc_final_acc_pct"] == 95.0
     assert payload["acc3_compare_aae_bpm"] == 6.5
     assert payload["acc3_compare_accuracy_pct"] == 66.0
+    assert payload["acc3_compare_posthoc_final_aae_bpm"] == 4.5
+    assert payload["acc3_compare_posthoc_final_acc_pct"] == 77.0
     assert payload["acc3_compare_status"] == "ok"
     assert payload["resumed"] is False
 
@@ -494,7 +500,37 @@ def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
     assert first_done[0]["resumed"] is False
     assert second_done[0]["resumed"] is True
     assert second_done[0]["current_final_aae_bpm"] == 3.0
+    assert second_done[0]["current_posthoc_final_aae_bpm"] == 2.0
+    assert second_done[0]["current_posthoc_final_acc_pct"] == 95.0
     assert second_done[0]["acc3_compare_status"] == "same_as_original"
+
+
+def test_acc3_compare_fields_include_posthoc_metrics() -> None:
+    fields = rbp._acc3_compare_fields(
+        {
+            "final_aae_bpm": 3.0,
+            "final_acc_pct": 90.0,
+            "posthoc_final_aae_bpm": 2.0,
+            "posthoc_final_acc_pct": 95.0,
+            "num_windows": 12,
+        },
+        status="ok",
+        reason="",
+    )
+
+    assert fields["acc3_compare_aae_bpm"] == 3.0
+    assert fields["acc3_compare_accuracy_pct"] == 90.0
+    assert fields["acc3_compare_posthoc_final_aae_bpm"] == 2.0
+    assert fields["acc3_compare_posthoc_final_acc_pct"] == 95.0
+
+
+def test_empty_acc3_compare_fields_include_posthoc_metrics() -> None:
+    fields = rbp._empty_acc3_compare_fields("failed", "missing")
+
+    assert "acc3_compare_posthoc_final_aae_bpm" in fields
+    assert "acc3_compare_posthoc_final_acc_pct" in fields
+    assert fields["acc3_compare_status"] == "failed"
+    assert fields["acc3_compare_reason"] == "missing"
 
 
 def test_run_batch_adaptive_protocol_emits_mode_done_after_checkpoint_done(

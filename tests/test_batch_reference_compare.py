@@ -40,6 +40,8 @@ def _dataset() -> ProtocolDataset:
 def _run_result(scheme: CascadeScheme, params: ProtocolTrialParams) -> rbp.ProtocolRunResult:
     aae = 4.0 if scheme == CascadeScheme.HF2 else 6.0
     acc = 88.0 if scheme == CascadeScheme.HF2 else 77.0
+    posthoc_aae = 2.5 if scheme == CascadeScheme.HF2 else 5.5
+    posthoc_acc = 92.0 if scheme == CascadeScheme.HF2 else 81.0
     return rbp.ProtocolRunResult(
         success=True,
         reason="",
@@ -54,6 +56,8 @@ def _run_result(scheme: CascadeScheme, params: ProtocolTrialParams) -> rbp.Proto
         baseline_acc_pct=50.0,
         adaptive_acc_pct=acc - 1.0,
         final_acc_pct=acc,
+        posthoc_final_aae_bpm=posthoc_aae,
+        posthoc_final_acc_pct=posthoc_acc,
         frame=pd.DataFrame(),
         segment_info=None,
         alignment_info=None,
@@ -125,4 +129,8 @@ def test_run_batch_reference_compare_reads_split_and_writes_utf8_sig_csv(tmp_pat
     assert out.loc[0, "actual_reference_cascade_scheme"] == "ACC3"
     assert float(out.loc[0, "source_final_aae_bpm"]) == 4.0
     assert float(out.loc[0, "actual_final_accuracy_pct"]) == 77.0
+    assert float(out.loc[0, "source_posthoc_final_aae_bpm"]) == 2.5
+    assert float(out.loc[0, "source_posthoc_final_accuracy_pct"]) == 92.0
+    assert float(out.loc[0, "actual_posthoc_final_aae_bpm"]) == 5.5
+    assert float(out.loc[0, "actual_posthoc_final_accuracy_pct"]) == 81.0
     assert int(out.loc[0, "actual_num_windows"]) == 3
