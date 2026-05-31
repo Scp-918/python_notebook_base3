@@ -472,6 +472,14 @@ def run_batch_adaptive_protocol(
                     resumed = restored_by_key.get(mode_key)
                     if resumed is not None:
                         mode_results.append(resumed)
+                        _progress(
+                            _mode_done_progress_payload(
+                                resumed,
+                                mode_idx=mode_counter,
+                                mode_total=total_modes,
+                                resumed=True,
+                            )
+                        )
                         gc.collect()
                         continue
                     if not valid_folds:
@@ -585,6 +593,13 @@ def run_batch_adaptive_protocol(
                         mode_results,
                         result,
                         write_best_params_all=False,
+                    )
+                    _progress(
+                        _mode_done_progress_payload(
+                            result,
+                            mode_idx=mode_counter,
+                            mode_total=total_modes,
+                        )
                     )
                     gc.collect()
         all_mode_results[motion_type] = mode_results
@@ -2235,6 +2250,42 @@ def _collect_per_group_rows(results: list[_ModeOptimisation]) -> list[dict[str, 
         else:
             rows.extend(_load_per_group_rows_from_path(result.per_group_path))
     return rows
+
+
+def _mode_done_progress_payload(
+    result: _ModeOptimisation,
+    *,
+    mode_idx: int,
+    mode_total: int,
+    resumed: bool = False,
+) -> dict[str, Any]:
+    """Build the post-best-params progress event for one completed mode."""
+
+    metrics = result.test_metrics
+    acc3_metrics = _acc3_compare_metrics_for(result)
+    return {
+        "stage": "optimization_mode_done",
+        "motion_type": result.motion_type,
+        "mode_idx": int(mode_idx),
+        "mode_current": int(mode_idx),
+        "mode_total": int(mode_total),
+        "target_scope": result.target_scope.name,
+        "target_scope_value": result.target_scope.value,
+        "cascade_scheme": result.cascade_scheme.value,
+        "adaptive_filter": result.adaptive_filter,
+        "objective_mode": result.objective_mode,
+        "data_split_mode": result.data_split_mode,
+        "best_repeat_idx": int(result.best_repeat_idx),
+        "best_trial_idx": int(result.best_trial_idx),
+        "current_final_aae_bpm": metrics.get("final_aae_bpm"),
+        "current_final_acc_pct": metrics.get("final_acc_pct"),
+        "acc3_compare_aae_bpm": acc3_metrics.get("acc3_compare_aae_bpm"),
+        "acc3_compare_accuracy_pct": acc3_metrics.get("acc3_compare_accuracy_pct"),
+        "acc3_compare_num_windows": acc3_metrics.get("acc3_compare_num_windows"),
+        "acc3_compare_status": acc3_metrics.get("acc3_compare_status"),
+        "acc3_compare_reason": acc3_metrics.get("acc3_compare_reason"),
+        "resumed": bool(resumed),
+    }
 
 
 def _emit_trial_progress(

@@ -77,6 +77,32 @@ def _single_split_result() -> rbp._ModeOptimisation:
     )
 
 
+def test_mode_done_progress_payload_reports_current_and_acc3_metrics() -> None:
+    result = _single_split_result()
+    result.cascade_scheme = CascadeScheme.HF2
+    result.acc3_compare_metrics = {
+        "acc3_compare_aae_bpm": 6.5,
+        "acc3_compare_accuracy_pct": 66.0,
+        "acc3_compare_num_windows": 9,
+        "acc3_compare_status": "ok",
+        "acc3_compare_reason": "",
+    }
+
+    payload = rbp._mode_done_progress_payload(result, mode_idx=2, mode_total=7)
+
+    assert payload["stage"] == "optimization_mode_done"
+    assert payload["motion_type"] == "tiaosheng"
+    assert payload["mode_idx"] == 2
+    assert payload["mode_total"] == 7
+    assert payload["cascade_scheme"] == "HF2"
+    assert payload["current_final_aae_bpm"] == 3.0
+    assert payload["current_final_acc_pct"] == 90.0
+    assert payload["acc3_compare_aae_bpm"] == 6.5
+    assert payload["acc3_compare_accuracy_pct"] == 66.0
+    assert payload["acc3_compare_status"] == "ok"
+    assert payload["resumed"] is False
+
+
 def _logo_fold_result(fold_id: int, heldout: str, aae: float) -> rbp._ModeOptimisation:
     params = ProtocolTrialParams(TW=6 + fold_id, TW_F=1.5, Fs_Target=50, adaptive_filter="lms")
     arrays = {
@@ -396,6 +422,8 @@ def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
     )
     dataset = SimpleNamespace(_trial_base_cache={}, _global_tdelay_cache={})
     calls: list[str] = []
+    first_progress: list[dict[str, object]] = []
+    second_progress: list[dict[str, object]] = []
 
     monkeypatch.setattr(
         rbp,
@@ -442,6 +470,7 @@ def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
         adaptive_filters=["lms"],
         data_split_mode="split",
         verbose=False,
+        progress_callback=lambda info: first_progress.append(info),
     )
     second = rbp.run_batch_adaptive_protocol(
         input_dir=input_dir,
@@ -451,9 +480,91 @@ def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
         adaptive_filters=["lms"],
         data_split_mode="split",
         verbose=False,
+        progress_callback=lambda info: second_progress.append(info),
     )
 
     assert len(calls) == 1
     assert "tiaosheng" in first.mode_results
     assert "tiaosheng" in second.mode_results
     assert second.mode_results["tiaosheng"][0].history == []
+    first_done = [item for item in first_progress if item.get("stage") == "optimization_mode_done"]
+    second_done = [item for item in second_progress if item.get("stage") == "optimization_mode_done"]
+    assert len(first_done) == 1
+    assert len(second_done) == 1
+    assert first_done[0]["resumed"] is False
+    assert second_done[0]["resumed"] is True
+    assert second_done[0]["current_final_aae_bpm"] == 3.0
+    assert second_done[0]["acc3_compare_status"] == "same_as_original"
+
+
+def test_run_batch_adaptive_protocol_emits_mode_done_after_checkpoint_done(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    output_root = tmp_path / "outputs" / "checkpoint_order"
+    pair = SimpleNamespace(
+        sensor_csv=input_dir / "multi_tiaosheng1.csv",
+        ref_csv=input_dir / "multi_tiaosheng1_ref.csv",
+        motion_type="tiaosheng",
+        motion_index=1,
+        motion_id="tiaosheng1",
+        stem="multi_tiaosheng1",
+    )
+    dataset = SimpleNamespace(_trial_base_cache={}, _global_tdelay_cache={})
+    checkpoint_statuses: list[str] = []
+
+    monkeypatch.setattr(
+        rbp,
+        "discover_sample_pairs_with_unpaired",
+        lambda _input_dir: SimpleNamespace(pairs=[pair], unpaired=[]),
+    )
+    monkeypatch.setattr(rbp, "quality_filter_sample", lambda *args, **kwargs: SimpleNamespace(is_good=True))
+    monkeypatch.setattr(rbp, "write_qc_tables", lambda *args, **kwargs: {})
+    monkeypatch.setattr(rbp, "load_and_preprocess_protocol", lambda *args, **kwargs: dataset)
+    monkeypatch.setattr(rbp, "detect_activity_segments", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(rbp, "plot_signal_figures", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        rbp,
+        "_build_split_plan",
+        lambda *args, **kwargs: {
+            "tiaosheng": [
+                {
+                    "status": "ok",
+                    "fold_id": 0,
+                    "train": ["tiaosheng1"],
+                    "val": [],
+                    "test": ["tiaosheng1"],
+                    "heldout_group_id": "",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(rbp, "_optimise_group_mode", lambda **kwargs: _single_split_result())
+    monkeypatch.setattr(rbp, "_write_final_summary", lambda *args, **kwargs: {})
+    monkeypatch.setattr(rbp, "_write_batch_summary", lambda path, rows: Path(path))
+    monkeypatch.setattr(rbp, "clear_all_caches", lambda _dataset: None)
+    monkeypatch.setattr(rbp, "clear_trial_heavy_caches", lambda _dataset: None)
+
+    def _progress(info: dict[str, object]) -> None:
+        if info.get("stage") != "optimization_mode_done":
+            return
+        checkpoint = json.loads(
+            (output_root / "motion_types" / "tiaosheng" / "_checkpoint.json").read_text(encoding="utf-8")
+        )
+        mode_key = "motion_only__ACC3__lms"
+        checkpoint_statuses.append(checkpoint["modes"][mode_key]["status"])
+
+    rbp.run_batch_adaptive_protocol(
+        input_dir=input_dir,
+        output_root=output_root,
+        target_scopes=[TargetScope.MOTION_ONLY],
+        cascade_schemes=[CascadeScheme.ACC3],
+        adaptive_filters=["lms"],
+        data_split_mode="split",
+        verbose=False,
+        progress_callback=_progress,
+    )
+
+    assert checkpoint_statuses == ["done"]
