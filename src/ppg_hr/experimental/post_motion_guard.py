@@ -38,12 +38,16 @@ def post_motion_switch_policy(
     post_start = int(post_indices[0])
     stable_count = 0
     min_elapsed = float(getattr(params, "post_motion_guard_min_elapsed_s", 5.0))
-    max_guard = float(getattr(params, "post_motion_guard_seconds", 10.0))
+    configured_timeout = getattr(params, "post_motion_guard_seconds", None)
+    max_guard = None if configured_timeout is None else float(configured_timeout)
 
     for idx in range(post_start, n):
         elapsed = float(time[idx] - motion_end_s)
-        if elapsed > max_guard + 1e-9:
-            event = _event(idx, time, adaptive, reset_fft, "guard_timeout", 0, 0, hard=True)
+        if max_guard is not None and elapsed > max_guard + 1e-9:
+            event = _event(
+                idx, time, adaptive, reset_fft, "guard_timeout", 0, 0,
+                rising_count=0, reachable=False, hard=True,
+            )
             use_adaptive[idx:] = False
             reason[idx] = "guard_timeout"
             events.append(event)
@@ -64,6 +68,7 @@ def post_motion_switch_policy(
             if diff >= 0
             else abs(diff) <= float(getattr(params, "post_motion_guard_recovery_step_down_bpm", 3.0)) + 1e-9
         )
+        rising_count = _rising_count(adaptive, idx, post_start, params)
         gap_ok = (
             diff <= float(getattr(params, "post_motion_guard_upward_gap_bpm", 1.5)) + 1e-9
             if diff >= 0
@@ -71,7 +76,10 @@ def post_motion_switch_policy(
         )
         stable_count = stable_count + 1 if reachable and gap_ok else 0
         if stable_count >= int(getattr(params, "post_motion_guard_stable_windows", 3)):
-            event = _event(idx, time, adaptive, reset_fft, "stable_crossover", stable_count, 0)
+            event = _event(
+                idx, time, adaptive, reset_fft, "stable_crossover", stable_count, 0,
+                rising_count=rising_count, reachable=reachable,
+            )
             use_adaptive[idx:] = False
             reason[idx] = "stable_crossover"
             events.append(event)
@@ -81,11 +89,23 @@ def post_motion_switch_policy(
             adaptive, reset_fft, idx, post_start, params
         )
         if rescue_ok:
-            event = _event(idx, time, adaptive, reset_fft, "gap_rescue", stable_count, hits, hard=True)
+            event = _event(
+                idx, time, adaptive, reset_fft, "gap_rescue", stable_count, hits,
+                rising_count=rising_count, reachable=reachable, hard=True,
+            )
             event["fft_stable_count"] = fft_count
             event["fft_stable_delta_bpm"] = fft_delta
             use_adaptive[idx:] = False
             reason[idx] = "gap_rescue"
+            events.append(event)
+            break
+        if _rising_rescue_ok(adaptive, reset_fft, idx, post_start, params, rising_count):
+            event = _event(
+                idx, time, adaptive, reset_fft, "adaptive_rising_rescue", stable_count, 0,
+                rising_count=rising_count, reachable=reachable,
+            )
+            use_adaptive[idx:] = False
+            reason[idx] = "adaptive_rising_rescue"
             events.append(event)
             break
     return use_adaptive, reason, events
@@ -118,7 +138,37 @@ def _gap_rescue(adaptive, fft, idx, start, params):
     return bool(ok), hits, int(stable.size), delta
 
 
-def _event(idx, time, adaptive, fft, reason, stable_count, rescue_count, *, hard=False):
+def _rising_count(adaptive, idx, start, params):
+    count = max(1, int(getattr(params, "post_motion_guard_rising_windows", 3)))
+    begin = max(start, idx - count + 1)
+    if idx - begin + 1 < count:
+        return 0
+    values = np.asarray(adaptive[begin : idx + 1], dtype=float)
+    if not np.all(np.isfinite(values)):
+        return 0
+    slope = float(getattr(params, "post_motion_guard_rising_slope_bpm_per_window", 1.5))
+    return int(np.sum(np.diff(values) >= slope))
+
+
+def _rising_rescue_ok(adaptive, fft, idx, start, params, rising_count):
+    count = max(1, int(getattr(params, "post_motion_guard_rising_windows", 3)))
+    if idx - start + 1 < count:
+        return False
+    adapt = float(adaptive[idx])
+    reset = float(fft[idx])
+    if not (np.isfinite(adapt) and np.isfinite(reset)):
+        return False
+    if reset < float(getattr(params, "post_motion_guard_fft_floor_bpm", 55.0)):
+        return False
+    if adapt - reset < float(getattr(params, "post_motion_guard_rescue_gap_bpm", 20.0)):
+        return False
+    return int(rising_count) >= count - 1
+
+
+def _event(
+    idx, time, adaptive, fft, reason, stable_count, rescue_count, *,
+    rising_count, reachable, hard=False,
+):
     return {
         "window_idx": int(idx),
         "center_s": float(time[idx]),
@@ -127,6 +177,8 @@ def _event(idx, time, adaptive, fft, reason, stable_count, rescue_count, *, hard
         "fft_bpm": float(fft[idx]),
         "gap_bpm": float(adaptive[idx] - fft[idx]),
         "stable_count": int(stable_count),
+        "rising_count": int(rising_count),
+        "reachable": bool(reachable),
         "gap_rescue_count": int(rescue_count),
         "hard_switch": bool(hard),
     }

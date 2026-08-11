@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 
 from ppg_hr.experimental.fusion import fuse_final_hr
 from ppg_hr.experimental.post_motion_guard import post_motion_switch_policy
@@ -50,6 +51,97 @@ def test_post_motion_guard_gap_rescue_requires_stable_reset_fft() -> None:
     assert reasons[7] == "gap_rescue"
     assert events[0]["hard_switch"] is True
     assert events[0]["gap_rescue_count"] == 4
+
+
+def test_post_motion_guard_has_no_default_timeout_and_keeps_adaptive_without_evidence() -> None:
+    params = ProtocolTrialParams(
+        post_motion_guard_min_elapsed_s=0.0,
+        post_motion_guard_gap_rescue_enable=False,
+    )
+    time = np.asarray([100.0, 106.0, 112.0, 118.0, 124.0])
+    adaptive = np.asarray([120.0, 120.0, 120.0, 120.0, 120.0])
+    reset_fft = np.asarray([80.0, 80.0, 80.0, 80.0, 80.0])
+
+    mask, reasons, events = post_motion_switch_policy(
+        time,
+        adaptive,
+        reset_fft,
+        motion_start_s=80.0,
+        motion_end_s=100.0,
+        params=params,
+    )
+
+    assert params.post_motion_guard_seconds is None
+    assert mask.tolist() == [True, True, True, True, True]
+    assert not np.any(reasons == "guard_timeout")
+    assert events == []
+
+
+def test_post_motion_guard_explicit_timeout_remains_available_for_callers() -> None:
+    mask, reasons, events = post_motion_switch_policy(
+        np.asarray([100.0, 111.0]),
+        np.asarray([120.0, 120.0]),
+        np.asarray([80.0, 80.0]),
+        motion_start_s=80.0,
+        motion_end_s=100.0,
+        params=ProtocolTrialParams(
+            post_motion_guard_seconds=10.0,
+            post_motion_guard_gap_rescue_enable=False,
+        ),
+    )
+
+    assert mask.tolist() == [True, False]
+    assert reasons[1] == "guard_timeout"
+    assert events[0]["hard_switch"] is True
+
+
+def test_post_motion_guard_can_switch_on_stable_crossover_after_ten_seconds() -> None:
+    time = np.asarray([100.0, 111.0, 112.0, 113.0, 114.0])
+    adaptive = np.asarray([110.0, 100.0, 99.0, 98.0, 97.0])
+    reset_fft = np.asarray([108.0, 99.0, 98.0, 97.0, 96.0])
+
+    mask, reasons, events = post_motion_switch_policy(
+        time,
+        adaptive,
+        reset_fft,
+        motion_start_s=80.0,
+        motion_end_s=100.0,
+        params=ProtocolTrialParams(
+            post_motion_guard_min_elapsed_s=0.0,
+            post_motion_guard_stable_windows=3,
+            post_motion_guard_gap_rescue_enable=False,
+        ),
+    )
+
+    assert mask.tolist() == [True, True, True, False, False]
+    assert reasons[3] == "stable_crossover"
+    assert events[0]["center_s"] == pytest.approx(113.0)
+
+
+def test_post_motion_guard_rising_rescue_is_one_way() -> None:
+    time = np.asarray([100.0, 106.0, 107.0, 108.0, 109.0])
+    adaptive = np.asarray([105.0, 110.0, 112.0, 114.0, 116.0])
+    reset_fft = np.asarray([90.0, 80.0, 80.0, 80.0, 120.0])
+
+    mask, reasons, events = post_motion_switch_policy(
+        time,
+        adaptive,
+        reset_fft,
+        motion_start_s=80.0,
+        motion_end_s=100.0,
+        params=ProtocolTrialParams(
+            post_motion_guard_gap_rescue_enable=False,
+            post_motion_guard_rising_windows=3,
+            post_motion_guard_rising_slope_bpm_per_window=1.5,
+            post_motion_guard_rescue_gap_bpm=20.0,
+        ),
+    )
+
+    assert mask.tolist() == [True, True, True, False, False]
+    assert reasons[3] == "adaptive_rising_rescue"
+    assert events[0]["switch_reason"] == "adaptive_rising_rescue"
+    assert events[0]["rising_count"] == 2
+    assert events[0]["hard_switch"] is False
 
 
 def test_fusion_uses_reset_fft_after_guard_without_reference_hr() -> None:
