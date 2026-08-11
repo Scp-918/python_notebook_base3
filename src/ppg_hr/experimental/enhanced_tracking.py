@@ -53,6 +53,8 @@ class SpectrumTrackingTrace:
     tracked_hr_bpm: float
     slew_limited_hr_bpm: float
     candidate_source: str = "raw_local_peaks"
+    candidate_peak_threshold_ratio: float = 0.30
+    full_candidate_peak_threshold_ratio: float = 0.15
     penalty_applied: bool = False
     penalty_centers_bpm: tuple[float, ...] = ()
     penalty_weight_min: float = 1.0
@@ -102,7 +104,8 @@ def track_spectrum_candidates(
     band = np.isfinite(freq) & np.isfinite(amps) & (freq >= 0.5) & (freq <= 4.0)
     freq = freq[band]
     amps = amps[band]
-    peak_idx = _candidate_peak_indices(amps)
+    candidate_threshold, full_candidate_threshold = _candidate_thresholds(params)
+    peak_idx = _candidate_peak_indices(amps, threshold_ratio=full_candidate_threshold)
     if peak_idx.size == 0 and amps.size:
         peak_idx = np.asarray([int(np.nanargmax(amps))])
     raw_order = peak_idx[np.argsort(-amps[peak_idx], kind="stable")]
@@ -221,6 +224,8 @@ def track_spectrum_candidates(
         tracked_hr_bpm=tracked,
         slew_limited_hr_bpm=float(limited),
         candidate_source=source,
+        candidate_peak_threshold_ratio=candidate_threshold,
+        full_candidate_peak_threshold_ratio=full_candidate_threshold,
         penalty_applied=penalty_enabled,
         penalty_centers_bpm=penalty_centers,
         penalty_weight_min=float(np.min(weights)) if weights.size else 1.0,
@@ -248,7 +253,18 @@ def track_spectrum_candidates(
     return float(limited), trace
 
 
-def _candidate_peak_indices(amps: np.ndarray) -> np.ndarray:
+def _candidate_thresholds(params: object) -> tuple[float, float]:
+    candidate = float(getattr(params, "candidate_peak_threshold_ratio", 0.30))
+    full = float(getattr(params, "full_candidate_peak_threshold_ratio", 0.15))
+    if not (0.0 < candidate <= 1.0 and 0.0 < full <= candidate):
+        raise ValueError(
+            "candidate peak threshold ratios must satisfy "
+            "0 < full_candidate_peak_threshold_ratio <= candidate_peak_threshold_ratio <= 1"
+        )
+    return candidate, full
+
+
+def _candidate_peak_indices(amps: np.ndarray, *, threshold_ratio: float) -> np.ndarray:
     peaks, _ = find_peaks(amps)
     if not peaks.size:
         return peaks.astype(int)
@@ -256,7 +272,7 @@ def _candidate_peak_indices(amps: np.ndarray) -> np.ndarray:
     peaks = peaks[finite]
     if not peaks.size:
         return peaks.astype(int)
-    return peaks[amps[peaks] > float(np.max(amps[peaks])) * 0.15]
+    return peaks[amps[peaks] > float(np.max(amps[peaks])) * float(threshold_ratio)]
 
 
 def _finite_positive(value: float | None) -> float | None:

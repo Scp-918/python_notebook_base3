@@ -1850,6 +1850,15 @@ def _extract_fft_hr(
             ]
             if local.size == 0:
                 local = np.asarray([ref_indices[int(np.argmax(ref_amp[ref_indices]))]])
+            local_amp = np.asarray(ref_amp[local], dtype=float)
+            finite_local = np.isfinite(local_amp)
+            local = local[finite_local]
+            local_amp = local_amp[finite_local]
+            if local.size:
+                threshold_ratio = float(
+                    getattr(params, "candidate_peak_threshold_ratio", 0.30)
+                )
+                local = local[local_amp > float(np.max(local_amp)) * threshold_ratio]
             penalty_freqs = ref_freq[local]
             penalty_amps = ref_amp[local]
     value, trace_obj = track_spectrum_candidates(

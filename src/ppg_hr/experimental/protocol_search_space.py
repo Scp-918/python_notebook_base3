@@ -157,6 +157,8 @@ class ProtocolTrialParams:
     recovery_tracking_slew_step_up_bpm: float = 1.5
     recovery_tracking_slew_limit_down_bpm: float = 3.5
     recovery_tracking_slew_step_down_bpm: float = 3.0
+    candidate_peak_threshold_ratio: float = 0.30
+    full_candidate_peak_threshold_ratio: float = 0.15
     low_lock_min_bpm: float = 50.0
     low_lock_max_bpm: float = 80.0
     low_lock_min_windows: int = 4

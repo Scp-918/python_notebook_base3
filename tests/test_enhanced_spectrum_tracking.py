@@ -194,6 +194,58 @@ def test_dynamic_penalty_uses_confidence_and_only_existing_harmonic() -> None:
     assert no_harmonic.penalty_centers_bpm == pytest.approx((60.0,))
 
 
+def test_reference_candidate_thresholds_keep_full_ppg_but_filter_motion_peaks() -> None:
+    fs = 100
+    seconds = 8
+    t = np.arange(fs * seconds, dtype=float) / fs
+    penalty_ref = np.sin(2.0 * np.pi * 1.0 * t) + 0.2 * np.sin(2.0 * np.pi * 1.5 * t)
+    freq, amp = _spectrum({60: 1.0, 90: 0.2})
+    params = ProtocolTrialParams(
+        candidate_peak_threshold_ratio=0.30,
+        full_candidate_peak_threshold_ratio=0.15,
+    )
+
+    _, trace = _extract_fft_hr(
+        np.ones(t.size),
+        fs,
+        None,
+        params,
+        enable_penalty=True,
+        penalty_ref=penalty_ref,
+        precomputed_spectrum=(freq, amp),
+        tracking_state=SpectrumTrackingState(),
+        window_kind="motion",
+        path="adaptive",
+        return_trace=True,
+    )
+
+    assert any(value == pytest.approx(90.0) for value in trace["candidate_peaks_bpm"])
+    assert trace["penalty_confidence"] == pytest.approx(1.0)
+    assert trace["candidate_peak_threshold_ratio"] == pytest.approx(0.30)
+    assert trace["full_candidate_peak_threshold_ratio"] == pytest.approx(0.15)
+
+
+@pytest.mark.parametrize(
+    ("candidate_ratio", "full_ratio"),
+    [(0.0, 0.15), (1.1, 0.15), (0.3, 0.0), (0.2, 0.3)],
+)
+def test_candidate_thresholds_reject_invalid_hierarchy(candidate_ratio: float, full_ratio: float) -> None:
+    freq, amp = _spectrum({60: 1.0})
+    with pytest.raises(ValueError, match="candidate peak threshold"):
+        track_spectrum_candidates(
+            freq,
+            amp,
+            previous_hr_bpm=None,
+            params=ProtocolTrialParams(
+                candidate_peak_threshold_ratio=candidate_ratio,
+                full_candidate_peak_threshold_ratio=full_ratio,
+            ),
+            state=SpectrumTrackingState(),
+            window_kind="motion",
+            path="adaptive",
+        )
+
+
 def test_continuity_protection_can_yield_to_strong_non_penalty_challenger() -> None:
     freq, amp = _spectrum({117: 0.55, 138: 1.0})
     hr, trace = track_spectrum_candidates(
