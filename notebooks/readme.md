@@ -27,12 +27,53 @@ Notebook 首个代码单元提供 `legacy/enhanced` 总开关和六项独立开�
 `enhanced` 且全部开启。这些字段会进入参数 JSON/CSV、cache key、模式 checkpoint
 指纹和 replay 参数恢复。
 
+## 输出与断点目录
+
+Notebook 和 Python 后端统一使用以下确定性目录：
+
+```text
+SUBJECT_DIR.parent/
+└── outputs/
+    └── {subject}__{run_signature}/
+        ├── motion_types/              # 四类运动的 Stage-6 记录和模式级断点
+        ├── qc/
+        ├── signal_figures/
+        ├── final_summary/
+        ├── replay/
+        ├── window_diagnostics/
+        ├── summary_tables/
+        ├── cross_replay/
+        ├── cross_window_diagnostics/
+        └── batch_reference_compare/
+```
+
+`run_signature` 包含 scope、scheme、filter、objective、split、`TW_F` 和 HR 后处理方式。
+重复使用相同配置时路径保持不变，因此可以恢复模式级 checkpoint。默认
+`CLEAN_OUTPUTS=False`；不要在需要续跑时打开清理开关。
+
+## Notebook 章节
+
+- 第 0 节：四层配置，包括核心路径、预处理/对齐、滤波/追踪和执行/输出。
+- 第 1–2 节：严格配对、`ck.mat`、静态 QC、单样本预处理、分段和对齐预览。
+- 第 3–4、6 节：Tdelay、全段 PPG-HR 和原始 PPG 双轴诊断图。
+- 第 5 节：统一训练包装器。
+- 第 7 节：正式 `all_train` 优化。
+- 第 8 节：按当前组合动态计算模式数的连通性检查。
+- 第 9 节：Stage-6、history 和 checkpoint 完整性检查。
+- 第 10–12 节：单样本 replay、窗口诊断和跨运动汇总。
+- 第 13–15 节：跨 scheme replay/窗口诊断和批量参考通道对比。
+
+replay 和诊断通过 `motion_type + motion_index` 从当前 `SUBJECT_DIR` 的配对结果选择
+样本，不再填写独立的传感器或 HR CSV 路径。
+
 ## 推荐运行顺序
 
 1. 设置环境变量 `PPG_SUBJECT_DIR`，或在首个单元修改 `SUBJECT_DIR`。
 2. 运行“只读发现、严格配对与标定检查”。
 3. 运行单对静态预处理，检查 CF2/HF2/HF2comp/UD2、序号 QC 与标定元数据。
-4. 明确需要正式优化后，把 `RUN_TRAINING` 改为 `True`。
+4. 如需训练，先核对 `RUN_OUTPUT_DIR`，再把 `RUN_ALL_TRAIN` 改为 `True`。
+5. 训练完成后，按需打开第 9–15 节各自的 `RUN_*` 开关。
 
-默认 `RUN_TRAINING=False`，因此静态检查不会创建 Optuna study，也不会生成或保存
-滤波权重。训练仍按模式级保存 history、manifest 和 checkpoint，不增加权重级存档。
+默认所有训练、写图、回放和诊断开关均为 `False`，因此顺序执行 Notebook 不会创建
+Optuna study 或输出目录。训练仍只按模式保存 history、manifest 和 checkpoint，
+不增加滤波权重级存档。

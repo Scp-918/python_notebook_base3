@@ -118,6 +118,8 @@ DATA_SPLIT_MODE = "all_train"
 MAX_ITERATIONS = 200
 NUM_REPEATS = 1
 RANDOM_STATE = 42
+TW_F = 0.0
+TRAIN_HR_POSTPROCESS_METHOD = "fft"  # 可选 fft/ssr，并进入运行目录名
 
 # 总开关：legacy 完全使用旧追踪；enhanced 再由下面六个布尔开关逐项控制。
 TRACKER_MODE = "enhanced"
@@ -135,8 +137,8 @@ RUN_OUTPUT_DIR = build_subject_output_dir(
     adaptive_filters=ADAPTIVE_FILTERS,
     objective_mode=OBJECTIVE_MODE,
     data_split_mode=DATA_SPLIT_MODE,
-    tw_f_s=0.0,
-    postprocess_method="fft",
+    tw_f_s=TW_F,
+    postprocess_method=TRAIN_HR_POSTPROCESS_METHOD,
 )
 RESULTS_ROOT = RUN_OUTPUT_DIR
 print("SUBJECT_DIR:", SUBJECT_DIR)
@@ -153,7 +155,6 @@ print("RUN_OUTPUT_DIR:", RUN_OUTPUT_DIR)
 FS_ORIGIN = 100
 FS_TARGET = 100
 TW = 8
-TW_F = 0.0
 NORMALIZATION_MODE = "minmax"
 QC_POLICY = "fallback_baseline"
 DELAY_ESTIMATION_MODE = "envelope"  # 可选 envelope/direct
@@ -209,7 +210,6 @@ REST_HR_KWARGS = {
 # 输出：滤波与追踪配置变量。
 # 是否写文件：否。
 # 耗时风险：无；启用 SSR、Volterra、RFF-LMS 或 KLMS 会增加后续训练耗时。
-TRAIN_HR_POSTPROCESS_METHOD = "fft"  # 可选 fft/ssr
 REDRAW_HR_POSTPROCESS_METHOD = None   # None 表示按训练记录恢复
 SSR_NUM_ATOMS = 5
 SSR_LAMBDA = 0.15
@@ -217,21 +217,15 @@ SSR_HARMONIC_TOL_BPM = 5.0
 SSR_FALLBACK_TO_FFT = True
 SSR_GRID_RESOLUTION_BPM = 1.0
 
-LMS_MU_BASE = 0.01
 LMS_MU_MIN = 1e-6
-VOLTERRA_ALPHA_U = 0.1
-VOLTERRA_M2 = 3
-RFF_D = 100
-RFF_SIGMA_SCALE = 1.0
+TRACKING_SMOOTH_WIN_LEN = 7
+SPEC_PENALTY_WEIGHT = 0.4
 RFF_SIGMA = 1.0  # 仅用于兼容缺少 sigma_scale 的旧记录
 RFF_UPDATE_MODE = "nlms"
 RFF_NLMS_EPS = 1e-9
 RFF_LEAKAGE = 0.0
 RFF_ERR_CLIP = None
 RFF_THETA_NORM_GUARD = None
-KLMS_STEP_SIZE = 0.05
-KLMS_SIGMA = 1.0
-KLMS_EPSILON = 0.1
 KLMS_MAX_DICTIONARY_SIZE = 300
 KLMS_CENTER_PRUNE_POLICY = "freeze_new_centers"
 KLMS_DISTANCE_MODE = "normalized"
@@ -282,6 +276,32 @@ POST_MOTION_GUARD_GAP_RESCUE_WINDOWS = 4
 POST_MOTION_GUARD_GAP_RESCUE_MIN_HITS = 3
 POST_MOTION_GUARD_FFT_STABLE_WINDOWS = 3
 POST_MOTION_GUARD_FFT_STABLE_BPM = 6.0
+
+# Optuna 离散搜索空间。需要收缩或扩展候选值时直接修改对应列表。
+SEARCH_SPACE = default_protocol_search_space()
+SEARCH_SPACE.Fs_Target = [25, 50]
+SEARCH_SPACE.TW = [6, 8, 10]
+SEARCH_SPACE.Kstop = [0.2, 0.3, 0.5]
+SEARCH_SPACE.max_order = [8, 12, 16, 20]
+SEARCH_SPACE.M_base = [1, 2]
+SEARCH_SPACE.C_scale = [0.6, 0.9, 1.2, 1.5]
+SEARCH_SPACE.K_max = [8, 12, 16, 20, 30]
+SEARCH_SPACE.Spec_Penalty_Width = [0.1, 0.2, 0.3]
+SEARCH_SPACE.hr_range_hz = [value / 60.0 for value in (20, 25, 30, 35, 40)]
+SEARCH_SPACE.slew_limit_bpm = [8, 10, 12, 14]
+SEARCH_SPACE.slew_step_bpm = [5, 7, 9]
+SEARCH_SPACE.Rest_HR_Track_Band_BPM = [20.0, 30.0, 50.0, 60.0, 80.0]
+SEARCH_SPACE.Rest_HR_Slew_Limit_BPM = [1.0, 3.0, 5.0, 6.0, 8.0, 25.0]
+SEARCH_SPACE.Rest_HR_Slew_Step_BPM = [0.5, 2.0, 4.0, 5.0, 8.0, 12.0]
+SEARCH_SPACE.LMS_Mu_Base = [0.004, 0.006, 0.008]
+SEARCH_SPACE.RFF_LMS_Mu_Base = [0.001, 0.002, 0.004, 0.006]
+SEARCH_SPACE.alpha_u = [0.005, 0.01, 0.03, 0.05, 0.1]
+SEARCH_SPACE.M2 = [2, 3]
+SEARCH_SPACE.rff_D = [50, 100, 200]
+SEARCH_SPACE.rff_sigma_scale = [0.5, 1.0, 2.0, 4.0]
+SEARCH_SPACE.klms_step_size = [0.005, 0.01, 0.02, 0.05]
+SEARCH_SPACE.klms_sigma = [0.5, 1.0, 2.0, 5.0]
+SEARCH_SPACE.klms_epsilon = [0.005, 0.01, 0.02, 0.05, 0.1]
 '''
         ),
         code(
@@ -291,7 +311,6 @@ POST_MOTION_GUARD_FFT_STABLE_BPM = 6.0
 # 输出：SEARCH_SPACE、TRIAL_PARAM_OVERRIDES 和运行控制变量。
 # 是否写文件：否。
 # 耗时风险：无；所有昂贵或写文件的 RUN_* 开关默认 False。
-SEARCH_SPACE = default_protocol_search_space()
 NUM_SEED_POINTS = 10
 N_JOBS = 1
 PARALLEL_REPEATS = 1
@@ -304,25 +323,22 @@ TEST_GROUPS_PER_TYPE = 1
 CASCADE_TRAIN_BUDGETS = None
 
 TRIAL_PARAM_OVERRIDES = {
-    "Fs_Target": FS_TARGET,
     "TW_F": TW_F,
     "normalization_mode": NORMALIZATION_MODE,
+    "smooth_win_len": TRACKING_SMOOTH_WIN_LEN,
+    "Spec_Penalty_Weight": SPEC_PENALTY_WEIGHT,
     "postprocess_method": TRAIN_HR_POSTPROCESS_METHOD,
     "SSR_Num_Atoms": SSR_NUM_ATOMS,
     "SSR_Lambda": SSR_LAMBDA,
     "SSR_Harmonic_Tol_BPM": SSR_HARMONIC_TOL_BPM,
     "SSR_Fallback_To_FFT": SSR_FALLBACK_TO_FFT,
     "SSR_Grid_Resolution_BPM": SSR_GRID_RESOLUTION_BPM,
-    "LMS_Mu_Base": LMS_MU_BASE,
     "LMS_Mu_Min": LMS_MU_MIN,
     "qc_policy": QC_POLICY,
     "delay_estimation_mode": DELAY_ESTIMATION_MODE,
     "Alignment_TW": ALIGNMENT_TW,
     "Alignment_Step": ALIGNMENT_STEP_S,
     "Rest_HR_Band_BPM": REST_HR_BAND_BPM,
-    "Rest_HR_Track_Band_BPM": REST_HR_TRACK_BAND_BPM,
-    "Rest_HR_Slew_Limit_BPM": REST_HR_SLEW_LIMIT_BPM,
-    "Rest_HR_Slew_Step_BPM": REST_HR_SLEW_STEP_BPM,
     "Rest_HR_Smooth_Method": REST_HR_SMOOTH_METHOD,
     "Rest_HR_Smooth_Win": REST_HR_SMOOTH_WIN,
     "Rest_HR_Peak_Percent": REST_HR_PEAK_PERCENT,
@@ -337,19 +353,12 @@ TRIAL_PARAM_OVERRIDES = {
     "Recovery_Grace_S": RECOVERY_GRACE_S,
     "Recovery_Diff_Bpm": RECOVERY_DIFF_BPM,
     "Recovery_Cross_Diff_Bpm": RECOVERY_CROSS_DIFF_BPM,
-    "alpha_u": VOLTERRA_ALPHA_U,
-    "M2": VOLTERRA_M2,
-    "rff_D": RFF_D,
-    "rff_sigma_scale": RFF_SIGMA_SCALE,
     "rff_sigma": RFF_SIGMA,
     "rff_update_mode": RFF_UPDATE_MODE,
     "rff_nlms_eps": RFF_NLMS_EPS,
     "rff_leakage": RFF_LEAKAGE,
     "rff_err_clip": RFF_ERR_CLIP,
     "rff_theta_norm_guard": RFF_THETA_NORM_GUARD,
-    "klms_step_size": KLMS_STEP_SIZE,
-    "klms_sigma": KLMS_SIGMA,
-    "klms_epsilon": KLMS_EPSILON,
     "klms_max_dictionary_size": KLMS_MAX_DICTIONARY_SIZE,
     "klms_center_prune_policy": KLMS_CENTER_PRUNE_POLICY,
     "klms_distance_mode": KLMS_DISTANCE_MODE,
@@ -421,6 +430,12 @@ RUN_RAW_PPG_PLOT = False
 RUN_ALL_TRAIN = False
 RUN_CONNECTIVITY_CHECK = False
 RUN_OUTPUT_CHECK = False
+RUN_STAGE7_REPLAY = False
+RUN_WINDOW_DIAGNOSTICS = False
+RUN_CROSS_MOTION_SUMMARY = False
+RUN_CROSS_STAGE7_REPLAY = False
+RUN_CROSS_WINDOW_DIAGNOSTICS = False
+RUN_BATCH_REFERENCE_COMPARE = False
 CONNECTIVITY_MAX_ITERATIONS = 1
 '''
         ),
@@ -733,6 +748,262 @@ if RUN_OUTPUT_CHECK:
     display(output_inventory)
 else:
     print("RUN_OUTPUT_CHECK=False，跳过结果目录检查。")
+''',
+    )
+    cells += section(
+        10,
+        "对单个样本执行 best-params HR 曲线回放",
+        "从当前受试者的配对结果选择文件，从 Stage-6 记录恢复参数，不重新执行 Optuna。",
+        r'''
+# 用途：按 motion/index 选择当前受试者样本，回放完整级联和 guard 后两套 HR 曲线。
+# 输入：RESULTS_ROOT、REPLAY_MOTION_TYPE/INDEX、scope/filter/scheme 选择器。
+# 输出：RESULTS_ROOT/replay 下的 CSV 和 PNG。
+# 是否写文件：是，仅在 RUN_STAGE7_REPLAY=True 时。
+# 耗时风险：中；重新执行一次已保存参数的信号滤波，但不会训练或创建 study。
+REPLAY_MOTION_TYPE = "write"
+REPLAY_MOTION_INDEX = 1
+REPLAY_TARGET_SCOPE = TargetScope.MOTION_POST10.value
+REPLAY_ADAPTIVE_FILTER = "lms"
+REPLAY_CASCADE_SCHEME = CascadeScheme.ACC.value
+REPLAY_ADAPTIVE_DATA_TYPE = ""
+REPLAY_TW_F = TW_F
+REPLAY_SPLIT = ""
+REPLAY_MODE = ""
+REPLAY_GUARD_RATIO_MIN_OVERRIDE = None
+REPLAY_GUARD_RATIO_MAX_OVERRIDE = None
+REPLAY_GUARD_FLAT_STD_EPS_OVERRIDE = None
+REPLAY_GUARD_USE_FINITE_ZSCORE_OVERRIDE = None
+REPLAY_OUTPUT_DIR = Path(RESULTS_ROOT) / "replay"
+
+def select_subject_pair(motion_type, motion_index):
+    """Return one strict pair from the current subject discovery result."""
+    if discovery is None:
+        raise RuntimeError("请先运行第 1 节完成受试者文件发现。")
+    matches = [
+        pair for pair in discovery.pairs
+        if pair.motion_type == str(motion_type) and pair.motion_index == int(motion_index)
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"样本选择必须唯一，当前匹配数={len(matches)}: {motion_type}/{motion_index}")
+    return matches[0]
+
+replay_paths = {}
+replay_pair = None
+if RUN_STAGE7_REPLAY:
+    replay_pair = select_subject_pair(REPLAY_MOTION_TYPE, REPLAY_MOTION_INDEX)
+    replay_paths = replay_best_record_hr_curves(
+        signal_csv=replay_pair.sensor_csv,
+        ref_csv=replay_pair.ref_csv,
+        results_root=RESULTS_ROOT,
+        output_dir=REPLAY_OUTPUT_DIR,
+        motion_type=REPLAY_MOTION_TYPE,
+        split=REPLAY_SPLIT,
+        mode=REPLAY_MODE,
+        target_scope=REPLAY_TARGET_SCOPE,
+        adaptive_filter=REPLAY_ADAPTIVE_FILTER,
+        adaptive_data_type=REPLAY_ADAPTIVE_DATA_TYPE,
+        cascade_scheme=REPLAY_CASCADE_SCHEME,
+        TW_F=REPLAY_TW_F,
+        fs_origin=FS_ORIGIN,
+        guard_ratio_min_override=REPLAY_GUARD_RATIO_MIN_OVERRIDE,
+        guard_ratio_max_override=REPLAY_GUARD_RATIO_MAX_OVERRIDE,
+        guard_flat_std_eps_override=REPLAY_GUARD_FLAT_STD_EPS_OVERRIDE,
+        guard_use_finite_zscore_override=REPLAY_GUARD_USE_FINITE_ZSCORE_OVERRIDE,
+        postprocess_method_override=REDRAW_HR_POSTPROCESS_METHOD,
+    )
+    print(replay_paths)
+    display(Image(filename=str(replay_paths["plot_guarded"])))
+else:
+    print("RUN_STAGE7_REPLAY=False，跳过单样本回放。")
+''',
+    )
+    cells += section(
+        11,
+        "对单个样本输出窗口级波形与频谱诊断",
+        "复用第 10 节的样本和参数选择器，查看指定对齐窗口的输入、频谱、权重和追踪状态。",
+        r'''
+# 用途：从 Stage-6 参数记录重建一个窗口的完整诊断图和状态摘要。
+# 输入：第 10 节 REPLAY_* 配置以及 MANUAL_ALIGNED_FFT_START_S。
+# 输出：RESULTS_ROOT/window_diagnostics 下的图表和诊断信息。
+# 是否写文件：是，仅在 RUN_WINDOW_DIAGNOSTICS=True 时。
+# 耗时风险：中；执行单样本回放和单窗口诊断，不启动 Optuna。
+DIAGNOSTIC_OUTPUT_DIR = Path(RESULTS_ROOT) / "window_diagnostics"
+MANUAL_ALIGNED_FFT_START_S = 80.0
+window_diagnostics = {}
+if RUN_WINDOW_DIAGNOSTICS:
+    diagnostic_pair = select_subject_pair(REPLAY_MOTION_TYPE, REPLAY_MOTION_INDEX)
+    window_diagnostics = plot_window_diagnostics_from_records(
+        signal_csv=diagnostic_pair.sensor_csv,
+        ref_csv=diagnostic_pair.ref_csv,
+        results_root=RESULTS_ROOT,
+        output_dir=DIAGNOSTIC_OUTPUT_DIR,
+        aligned_fft_start_s=MANUAL_ALIGNED_FFT_START_S,
+        motion_type=REPLAY_MOTION_TYPE,
+        split=REPLAY_SPLIT,
+        mode=REPLAY_MODE,
+        target_scope=REPLAY_TARGET_SCOPE,
+        adaptive_filter=REPLAY_ADAPTIVE_FILTER,
+        adaptive_data_type=REPLAY_ADAPTIVE_DATA_TYPE,
+        cascade_scheme=REPLAY_CASCADE_SCHEME,
+        TW_F=REPLAY_TW_F,
+        fs_origin=FS_ORIGIN,
+        guard_ratio_min_override=REPLAY_GUARD_RATIO_MIN_OVERRIDE,
+        guard_ratio_max_override=REPLAY_GUARD_RATIO_MAX_OVERRIDE,
+        guard_flat_std_eps_override=REPLAY_GUARD_FLAT_STD_EPS_OVERRIDE,
+        guard_use_finite_zscore_override=REPLAY_GUARD_USE_FINITE_ZSCORE_OVERRIDE,
+        postprocess_method_override=REDRAW_HR_POSTPROCESS_METHOD,
+    )
+    print(window_diagnostics)
+else:
+    print("RUN_WINDOW_DIAGNOSTICS=False，跳过窗口诊断。")
+''',
+    )
+    cells += section(
+        12,
+        "输出指定模式的跨运动汇总表",
+        "只读取四类运动已有 Stage-6 紧凑记录，并按 write/gripper/run/rope 顺序汇总。",
+        r'''
+# 用途：比较同一 filter/scheme/scope 在四类运动上的 AAE、准确率和最终来源分布。
+# 输入：RESULTS_ROOT 和 SUMMARY_* 模式选择器。
+# 输出：RESULTS_ROOT/summary_tables 下的 CSV。
+# 是否写文件：是，仅在 RUN_CROSS_MOTION_SUMMARY=True 时。
+# 耗时风险：低；只读取结果记录，不回放、不训练。
+SUMMARY_ADAPTIVE_FILTER = "lms"
+SUMMARY_CASCADE_SCHEME = CascadeScheme.ACC.value
+SUMMARY_ADAPTIVE_DATA_TYPE = ""
+SUMMARY_TARGET_SCOPE = TargetScope.MOTION_POST10.value
+SUMMARY_TW_F = TW_F
+SUMMARY_TABLE_OUTPUT_DIR = Path(RESULTS_ROOT) / "summary_tables"
+summary_path = None
+if RUN_CROSS_MOTION_SUMMARY:
+    summary_path = build_cross_motion_summary_table(
+        table_output_dir=SUMMARY_TABLE_OUTPUT_DIR,
+        results_root=RESULTS_ROOT,
+        adaptive_filter=SUMMARY_ADAPTIVE_FILTER,
+        adaptive_data_type=SUMMARY_ADAPTIVE_DATA_TYPE,
+        cascade_scheme=SUMMARY_CASCADE_SCHEME,
+        target_scope=SUMMARY_TARGET_SCOPE,
+        TW_F=SUMMARY_TW_F,
+    )
+    print(summary_path)
+    display(pd.read_csv(summary_path))
+else:
+    print("RUN_CROSS_MOTION_SUMMARY=False，跳过跨运动汇总。")
+''',
+    )
+    cells += section(
+        13,
+        "跨 scheme 参数来源与实际滤波回放",
+        "使用 scheme A 保存的最优参数运行 scheme B，检查参考通道架构变化的影响。",
+        r'''
+# 用途：从一个 scheme 恢复参数，但用另一个 change6 scheme 实际执行滤波。
+# 输入：CROSS_PARAM_SCHEME、CROSS_APPLIED_SCHEME 和当前受试者 motion/index。
+# 输出：RESULTS_ROOT/cross_replay 下的 CSV 和 PNG。
+# 是否写文件：是，仅在 RUN_CROSS_STAGE7_REPLAY=True 时。
+# 耗时风险：中；执行两种 guard 变体的单样本回放，不启动 Optuna。
+CROSS_MOTION_TYPE = "write"
+CROSS_MOTION_INDEX = 1
+CROSS_TARGET_SCOPE = TargetScope.MOTION_POST10.value
+CROSS_ADAPTIVE_FILTER = "lms"
+CROSS_PARAM_SCHEME = CascadeScheme.HF2.value
+CROSS_APPLIED_SCHEME = CascadeScheme.ACC.value
+CROSS_TW_F = TW_F
+CROSS_OUTPUT_DIR = Path(RESULTS_ROOT) / "cross_replay"
+cross_replay_paths = {}
+if RUN_CROSS_STAGE7_REPLAY:
+    cross_pair = select_subject_pair(CROSS_MOTION_TYPE, CROSS_MOTION_INDEX)
+    cross_replay_paths = replay_best_record_hr_curves(
+        signal_csv=cross_pair.sensor_csv,
+        ref_csv=cross_pair.ref_csv,
+        results_root=RESULTS_ROOT,
+        output_dir=CROSS_OUTPUT_DIR,
+        motion_type=CROSS_MOTION_TYPE,
+        target_scope=CROSS_TARGET_SCOPE,
+        adaptive_filter=CROSS_ADAPTIVE_FILTER,
+        cascade_scheme=CROSS_PARAM_SCHEME,
+        override_cascade_scheme=CROSS_APPLIED_SCHEME,
+        TW_F=CROSS_TW_F,
+        fs_origin=FS_ORIGIN,
+        postprocess_method_override=REDRAW_HR_POSTPROCESS_METHOD,
+    )
+    print(cross_replay_paths)
+else:
+    print("RUN_CROSS_STAGE7_REPLAY=False，跳过跨 scheme 回放。")
+''',
+    )
+    cells += section(
+        14,
+        "跨 scheme 窗口级诊断",
+        "对第 13 节的参数来源 scheme 与实际运行 scheme 生成相同窗口的波形、频谱和状态诊断。",
+        r'''
+# 用途：定位跨 scheme 回放在指定窗口中的通道、频谱峰和追踪选择差异。
+# 输入：第 13 节 CROSS_* 配置和 CROSS_ALIGNED_FFT_START_S。
+# 输出：RESULTS_ROOT/cross_window_diagnostics 下的诊断图和摘要。
+# 是否写文件：是，仅在 RUN_CROSS_WINDOW_DIAGNOSTICS=True 时。
+# 耗时风险：中；执行单样本、单窗口诊断，不启动 Optuna。
+CROSS_DIAGNOSTIC_OUTPUT_DIR = Path(RESULTS_ROOT) / "cross_window_diagnostics"
+CROSS_ALIGNED_FFT_START_S = 80.0
+cross_window_diagnostics = {}
+if RUN_CROSS_WINDOW_DIAGNOSTICS:
+    cross_diagnostic_pair = select_subject_pair(CROSS_MOTION_TYPE, CROSS_MOTION_INDEX)
+    cross_window_diagnostics = plot_window_diagnostics_from_records(
+        signal_csv=cross_diagnostic_pair.sensor_csv,
+        ref_csv=cross_diagnostic_pair.ref_csv,
+        results_root=RESULTS_ROOT,
+        output_dir=CROSS_DIAGNOSTIC_OUTPUT_DIR,
+        aligned_fft_start_s=CROSS_ALIGNED_FFT_START_S,
+        motion_type=CROSS_MOTION_TYPE,
+        target_scope=CROSS_TARGET_SCOPE,
+        adaptive_filter=CROSS_ADAPTIVE_FILTER,
+        cascade_scheme=CROSS_PARAM_SCHEME,
+        override_cascade_scheme=CROSS_APPLIED_SCHEME,
+        TW_F=CROSS_TW_F,
+        fs_origin=FS_ORIGIN,
+        postprocess_method_override=REDRAW_HR_POSTPROCESS_METHOD,
+    )
+    print(cross_window_diagnostics)
+else:
+    print("RUN_CROSS_WINDOW_DIAGNOSTICS=False，跳过跨 scheme 窗口诊断。")
+''',
+    )
+    cells += section(
+        15,
+        "批量参考通道 scheme 对比",
+        "对一个运动类型的既有 split 记录复用同一套最优参数，比较参数来源 scheme 与实际参考 scheme。",
+        r'''
+# 用途：批量比较同一参数在两个 change6 scheme 下的最终与 adaptive 指标。
+# 输入：REFERENCE_COMPARE_* 配置及对应 motion 的 best_params_and_alignment.csv。
+# 输出：RESULTS_ROOT/batch_reference_compare 下的 CSV。
+# 是否写文件：是，仅在 RUN_BATCH_REFERENCE_COMPARE=True 时。
+# 耗时风险：中到高；逐样本复评估两套 scheme，但不会运行 Optuna。
+REFERENCE_COMPARE_MOTION_TYPE = "write"
+REFERENCE_COMPARE_PARAM_SCHEME = CascadeScheme.HF2.value
+REFERENCE_COMPARE_APPLIED_SCHEME = CascadeScheme.ACC.value
+REFERENCE_COMPARE_TARGET_SCOPE = TargetScope.MOTION_POST10.value
+REFERENCE_COMPARE_ADAPTIVE_FILTER = "lms"
+REFERENCE_COMPARE_BEST_PARAMS_CSV = (
+    Path(RESULTS_ROOT)
+    / "motion_types"
+    / REFERENCE_COMPARE_MOTION_TYPE
+    / "best_params_and_alignment.csv"
+)
+REFERENCE_COMPARE_OUTPUT_DIR = Path(RESULTS_ROOT) / "batch_reference_compare"
+reference_compare_paths = {}
+if RUN_BATCH_REFERENCE_COMPARE:
+    reference_compare_paths = run_batch_reference_compare(
+        motion_type=REFERENCE_COMPARE_MOTION_TYPE,
+        best_param_source_cascade_scheme=REFERENCE_COMPARE_PARAM_SCHEME,
+        actual_reference_cascade_scheme=REFERENCE_COMPARE_APPLIED_SCHEME,
+        target_scope=REFERENCE_COMPARE_TARGET_SCOPE,
+        adaptive_filter=REFERENCE_COMPARE_ADAPTIVE_FILTER,
+        best_param_csv_path=REFERENCE_COMPARE_BEST_PARAMS_CSV,
+        output_dir=REFERENCE_COMPARE_OUTPUT_DIR,
+        fs_origin=FS_ORIGIN,
+    )
+    print(reference_compare_paths)
+    display(pd.read_csv(reference_compare_paths["csv"]))
+else:
+    print("RUN_BATCH_REFERENCE_COMPARE=False，跳过批量参考通道对比。")
 ''',
     )
 
