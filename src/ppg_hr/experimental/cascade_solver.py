@@ -92,6 +92,7 @@ class ProtocolRunResult:
     posthoc_baseline_acc_pct: float = float("nan")
     posthoc_n_valid_windows: int = 0
     time_bias_after: TimeBiasAfterResult | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -223,10 +224,16 @@ def run_protocol_trial(
         fusion = fuse_final_hr(
             time_s=arrays["time_s"].astype(float),
             baseline_hr_bpm=arrays["baseline_hr_bpm"].astype(float),
+            reset_fft_hr_bpm=arrays.get("reset_fft_hr_bpm", arrays["baseline_hr_bpm"]).astype(float),
             adaptive_hr_bpm=adaptive,
             segment_label=arrays["segment_label"].astype(object),
             qc_status=arrays.get("qc_status", np.full(adaptive.size, "ok", dtype=object)),
             adaptive_filter=adaptive_filter,
+            motion_start_s=(
+                float(base.aligned.segment_info.motion_start_s)
+                if base.aligned.segment_info is not None
+                else float("nan")
+            ),
             motion_end_s=(
                 float(base.aligned.segment_info.motion_end_s)
                 if base.aligned.segment_info is not None
@@ -244,6 +251,9 @@ def run_protocol_trial(
             "final_hr_bpm": fusion.final_hr_bpm,
             "final_source": fusion.final_source,
             "fusion_reason": fusion.fusion_reason,
+            "reset_fft_hr_bpm": fusion.reset_fft_hr_bpm,
+            "post_motion_guard_state": fusion.guard_state,
+            "post_motion_switch_reason": fusion.switch_reason,
             "baseline_abs_err_bpm": baseline_abs_err,
             "adaptive_abs_err_bpm": adaptive_abs_err,
             "final_abs_err_bpm": final_abs_err,
@@ -272,6 +282,9 @@ def run_protocol_trial(
             frame["final_hr_bpm"] = fusion.final_hr_bpm
             frame["final_source"] = fusion.final_source
             frame["fusion_reason"] = fusion.fusion_reason
+            frame["reset_fft_hr_bpm"] = fusion.reset_fft_hr_bpm
+            frame["post_motion_guard_state"] = fusion.guard_state
+            frame["post_motion_switch_reason"] = fusion.switch_reason
             frame["is_recovery"] = frame["segment_label"].astype(str) == "recovery"
             frame["baseline_abs_err_bpm"] = baseline_abs_err
             frame["adaptive_abs_err_bpm"] = adaptive_abs_err
@@ -335,6 +348,19 @@ def run_protocol_trial(
             posthoc_baseline_acc_pct=float(metrics.get("posthoc_baseline_acc_pct", float("nan"))),
             posthoc_n_valid_windows=int(metrics.get("posthoc_n_valid_windows", 0) or 0),
             time_bias_after=time_bias_after,
+            metadata={
+                "tracking_config": {
+                    name: value
+                    for name, value in params.to_dict().items()
+                    if name == "tracker_mode"
+                    or name.startswith("enable_")
+                    or name.startswith("tracking_")
+                    or name.startswith("low_lock_")
+                    or name.startswith("high_lock_")
+                    or name.startswith("post_motion_guard_")
+                },
+                "post_motion_switch_events": list(fusion.switch_events),
+            },
         )
     except Exception as exc:
         return ProtocolRunResult(
@@ -815,6 +841,7 @@ def _run_windows(
     labels_out: list[str] = []
     ref_out: list[float] = []
     baseline_out: list[float] = []
+    reset_fft_out: list[float] = []
     adaptive_out: list[float] = []
     baseline_postprocess_out: list[dict[str, Any]] = []
     adaptive_postprocess_out: list[dict[str, Any]] = []
@@ -825,6 +852,8 @@ def _run_windows(
     prev_adaptive: float | None = None
     baseline_tracking_state = SpectrumTrackingState()
     adaptive_tracking_state = SpectrumTrackingState()
+    reset_fft_tracking_state = SpectrumTrackingState()
+    prev_reset_fft: float | None = None
     for row_idx, window_idx in enumerate(norm_cache.window_idx):
         start_idx = int(norm_cache.start_idx[row_idx])
         adaptive_source_start_idx = int(norm_cache.adaptive_source_start_idx[row_idx])
@@ -861,6 +890,28 @@ def _run_windows(
         )
         baseline_hr = float(baseline_post["hr_bpm"])
         prev_baseline = baseline_hr if np.isfinite(baseline_hr) else prev_baseline
+        reset_fft_post = dict(baseline_post)
+        reset_fft_hr = baseline_hr
+        if (
+            label == "recovery"
+            and str(getattr(params, "tracker_mode", "enhanced")).lower() == "enhanced"
+            and bool(getattr(params, "enable_post_motion_protection", True))
+        ):
+            reset_fft_post = _extract_hr_result(
+                norm["ppg_green"],
+                fs,
+                prev_reset_fft,
+                params,
+                enable_penalty=False,
+                penalty_ref=None,
+                precomputed_spectrum=baseline_spectrum,
+                tracking_state=reset_fft_tracking_state,
+                window_kind=label,
+                path="fft_post_motion_reset",
+            )
+            reset_fft_hr = float(reset_fft_post["hr_bpm"])
+            if np.isfinite(reset_fft_hr):
+                prev_reset_fft = reset_fft_hr
 
         if qc_should_skip:
             adaptive_hr = float("nan") if qc_status in {"dropped", "interpolate_pending"} else baseline_hr
@@ -908,6 +959,7 @@ def _run_windows(
         labels_out.append(str(label))
         ref_out.append(float(ref_hr))
         baseline_out.append(float(baseline_hr))
+        reset_fft_out.append(float(reset_fft_hr))
         adaptive_out.append(float(adaptive_hr))
         baseline_postprocess_out.append(baseline_post)
         adaptive_postprocess_out.append(adaptive_post)
@@ -939,6 +991,7 @@ def _run_windows(
                     "segment_label": str(label),
                     "ref_hr_bpm": float(ref_hr),
                     "baseline_ppg_hr_bpm": float(baseline_hr),
+                    "reset_fft_hr_bpm": float(reset_fft_hr),
                     "adaptive_hr_bpm": float(adaptive_hr),
                     "baseline_postprocess_method": str(baseline_post.get("postprocess_method", "")),
                     "adaptive_postprocess_method": str(adaptive_post.get("postprocess_method", "")),
@@ -950,6 +1003,10 @@ def _run_windows(
                     ),
                     "baseline_spectrum_tracking_json": json.dumps(
                         _jsonify_postprocess(baseline_post.get("spectrum_tracking", {})),
+                        ensure_ascii=False,
+                    ),
+                    "reset_fft_spectrum_tracking_json": json.dumps(
+                        _jsonify_postprocess(reset_fft_post.get("spectrum_tracking", {})),
                         ensure_ascii=False,
                     ),
                     "adaptive_spectrum_tracking_json": json.dumps(
@@ -984,6 +1041,7 @@ def _run_windows(
         "segment_label": np.asarray(labels_out, dtype=object),
         "ref_hr_bpm": np.asarray(ref_out, dtype=float),
         "baseline_hr_bpm": np.asarray(baseline_out, dtype=float),
+        "reset_fft_hr_bpm": np.asarray(reset_fft_out, dtype=float),
         "adaptive_hr_bpm": np.asarray(adaptive_out, dtype=float),
         "baseline_postprocess_method": np.asarray(
             [str(item.get("postprocess_method", "")) for item in baseline_postprocess_out],

@@ -161,6 +161,20 @@ class ProtocolTrialParams:
     high_lock_penalty_exclusion_bpm: float = 10.0
     high_lock_down_step_bpm: float = 20.0
     high_lock_up_step_bpm: float = 3.0
+    post_motion_guard_seconds: float = 10.0
+    post_motion_guard_min_elapsed_s: float = 5.0
+    post_motion_guard_stable_windows: int = 3
+    post_motion_guard_crossover_gap_bpm: float = 2.0
+    post_motion_guard_upward_gap_bpm: float = 1.5
+    post_motion_guard_fft_floor_bpm: float = 55.0
+    post_motion_guard_recovery_step_up_bpm: float = 1.5
+    post_motion_guard_recovery_step_down_bpm: float = 3.0
+    post_motion_guard_rescue_gap_bpm: float = 20.0
+    post_motion_guard_gap_rescue_enable: bool = True
+    post_motion_guard_gap_rescue_windows: int = 4
+    post_motion_guard_gap_rescue_min_hits: int = 3
+    post_motion_guard_fft_stable_windows: int = 3
+    post_motion_guard_fft_stable_bpm: float = 6.0
 
     def to_dict(self) -> dict[str, Any]:
         """Return parameter values as plain Python scalars."""

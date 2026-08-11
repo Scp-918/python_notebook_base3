@@ -11,6 +11,8 @@ from typing import Any
 
 import numpy as np
 
+from .post_motion_guard import post_motion_switch_policy
+
 __all__ = ["FinalFusionResult", "fuse_final_hr"]
 
 
@@ -21,6 +23,10 @@ class FinalFusionResult:
     final_hr_bpm: np.ndarray
     final_source: np.ndarray
     fusion_reason: np.ndarray
+    reset_fft_hr_bpm: np.ndarray
+    guard_state: np.ndarray
+    switch_reason: np.ndarray
+    switch_events: tuple[dict[str, Any], ...] = ()
 
 
 def fuse_final_hr(
@@ -33,6 +39,8 @@ def fuse_final_hr(
     adaptive_filter: str,
     motion_end_s: float,
     params: Any,
+    reset_fft_hr_bpm: np.ndarray | None = None,
+    motion_start_s: float = float("nan"),
     target_scope: str = "",
 ) -> FinalFusionResult:
     """Fuse baseline/adaptive HR without using reference HR.
@@ -51,6 +59,11 @@ def fuse_final_hr(
     labels = np.asarray(segment_label, dtype=object).astype(str)
     qc = np.asarray(qc_status, dtype=object).astype(str)
     n = min(time.size, baseline.size, adaptive.size, labels.size, qc.size)
+    reset_fft = (
+        np.asarray(reset_fft_hr_bpm, dtype=float)[:n]
+        if reset_fft_hr_bpm is not None
+        else baseline[:n].copy()
+    )
     final = np.full(n, np.nan, dtype=float)
     source = np.full(n, "", dtype=object)
     reason = np.full(n, "", dtype=object)
@@ -62,6 +75,24 @@ def fuse_final_hr(
     objective_strategy = str(getattr(params, "global_objective_strategy", "current_global_adaptive")).lower()
     scope = str(target_scope or "").lower()
     deployment_global = scope == "global" and objective_strategy == "deployment_global"
+    guard_enabled = bool(
+        str(getattr(params, "tracker_mode", "enhanced")).lower() == "enhanced"
+        and getattr(params, "enable_post_motion_protection", True)
+    )
+    if guard_enabled:
+        guard_mask, switch_reason, switch_events = post_motion_switch_policy(
+            time[:n],
+            adaptive[:n],
+            reset_fft,
+            motion_start_s=float(motion_start_s),
+            motion_end_s=motion_end,
+            params=params,
+        )
+    else:
+        guard_mask = np.zeros(n, dtype=bool)
+        switch_reason = np.full(n, "", dtype=object)
+        switch_events = []
+    guard_state = np.full(n, "disabled", dtype=object)
 
     for i in range(n):
         base_hr = float(baseline[i])
@@ -98,6 +129,18 @@ def fuse_final_hr(
                 reason[i] = "adaptive_not_finite"
             continue
         if label == "recovery":
+            if guard_enabled and np.isfinite(reset_fft[i]):
+                if guard_mask[i] and np.isfinite(adapt_hr):
+                    final[i] = adapt_hr
+                    source[i] = adaptive_source
+                    guard_state[i] = "post_motion_guard"
+                    reason[i] = "post_motion_dynamic_guard_adaptive"
+                else:
+                    final[i] = float(reset_fft[i])
+                    source[i] = "reset_fft"
+                    guard_state[i] = "post_motion_reacquire"
+                    reason[i] = str(switch_reason[i] or "post_motion_reset_fft")
+                continue
             diff = abs(adapt_hr - base_hr) if np.isfinite(adapt_hr) and np.isfinite(base_hr) else float("inf")
             since_end = float(time[i] - motion_end) if np.isfinite(motion_end) else float("inf")
             if np.isfinite(adapt_hr) and since_end <= grace_s and diff <= diff_bpm:
@@ -117,7 +160,43 @@ def fuse_final_hr(
         source[i] = adaptive_source if np.isfinite(adapt_hr) else "baseline_fft"
         reason[i] = f"unknown_segment={label}"
 
-    return FinalFusionResult(final, source, reason)
+    if guard_enabled and bool(getattr(params, "enable_directional_tracking", True)):
+        final = _directional_final_limit(final, params)
+    return FinalFusionResult(
+        final,
+        source,
+        reason,
+        reset_fft,
+        guard_state,
+        switch_reason,
+        tuple(switch_events),
+    )
+
+
+def _directional_final_limit(values: np.ndarray, params: Any) -> np.ndarray:
+    """Apply the final direction-specific slew limit after unsupervised source selection."""
+
+    out = np.asarray(values, dtype=float).copy()
+    previous: float | None = None
+    for idx, value in enumerate(out):
+        if not np.isfinite(value):
+            continue
+        if previous is None:
+            previous = float(value)
+            continue
+        diff = float(value) - previous
+        if diff >= 0:
+            limit = float(getattr(params, "tracking_slew_limit_up_bpm", 10.0))
+            step = float(getattr(params, "tracking_slew_step_up_bpm", 7.0))
+        else:
+            limit = float(getattr(params, "tracking_slew_limit_down_bpm", 10.0))
+            step = float(getattr(params, "tracking_slew_step_down_bpm", 7.0))
+        if diff > limit:
+            out[idx] = previous + step
+        elif diff < -limit:
+            out[idx] = previous - step
+        previous = float(out[idx])
+    return out
 
 
 def _adaptive_source(adaptive_filter: str) -> str:

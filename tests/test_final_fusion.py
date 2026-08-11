@@ -24,7 +24,11 @@ def test_recovery_grace_does_not_immediately_force_baseline() -> None:
         qc_status=np.asarray(["ok", "ok", "ok", "ok", "ok"], dtype=object),
         adaptive_filter="lms",
         motion_end_s=2.0,
-        params=ProtocolTrialParams(Recovery_Grace_S=2.0, Recovery_Diff_Bpm=10.0),
+        params=ProtocolTrialParams(
+            tracker_mode="legacy",
+            Recovery_Grace_S=2.0,
+            Recovery_Diff_Bpm=10.0,
+        ),
     )
 
     assert result.final_hr_bpm.tolist() == [70.0, 91.0, 92.0, 80.0, 80.0]
@@ -67,6 +71,7 @@ def test_deployment_global_uses_baseline_rest_adaptive_motion_and_fused_recovery
         motion_end_s=2.0,
         target_scope="global",
         params=ProtocolTrialParams(
+            tracker_mode="legacy",
             global_objective_strategy="deployment_global",
             Recovery_Grace_S=2.0,
             Recovery_Diff_Bpm=10.0,

@@ -1892,6 +1892,7 @@ def _per_group_row(
         "posthoc_baseline_aae_bpm": run.posthoc_baseline_aae_bpm,
         "posthoc_baseline_acc_pct": run.posthoc_baseline_acc_pct,
         "posthoc_n_valid_windows": run.posthoc_n_valid_windows,
+        "tracking_metadata_json": json.dumps(_jsonify(run.metadata), ensure_ascii=False, sort_keys=True),
     }
 
 
