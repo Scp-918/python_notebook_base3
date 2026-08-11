@@ -163,6 +163,32 @@ def test_notebook_generator_matches_tracked_sources() -> None:
     ]
 
 
+def test_section_two_documents_every_preview_parameter() -> None:
+    notebook = _notebook()
+    heading_index = next(
+        index
+        for index, cell in enumerate(notebook.cells)
+        if cell.cell_type == "markdown" and str(cell.source).startswith("## 2.")
+    )
+    markdown_source = str(notebook.cells[heading_index].source)
+    code_source = str(notebook.cells[heading_index + 1].source)
+
+    for name in (
+        "RUN_PREPROCESS_PREVIEW",
+        "PREVIEW_MOTION_TYPE",
+        "PREVIEW_MOTION_INDEX",
+        "FS_ORIGIN",
+        "TW",
+        "SUBJECT_DIR",
+        "calibration",
+    ):
+        assert f"`{name}`" in markdown_source
+        assert f"# {name}:" in code_source
+    assert "write/gripper/run/rope" in markdown_source
+    assert "100 Hz" in markdown_source
+    assert "Optuna" in markdown_source
+
+
 def test_notebook_safe_defaults_execute_without_creating_outputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -487,15 +487,38 @@ else:
     cells += section(
         2,
         "单样本预处理、分段和对齐预览",
-        "通过 motion/index 选择一个样本，检查 CF2、HF2、HF2comp、UD2、ACC、QC 和运动分段。",
+        """通过 motion/index 选择一个样本，检查 CF2、HF2、HF2comp、UD2、ACC、QC 和运动分段。
+
+本节涉及的参数和可配置项如下：
+
+| 参数 | 含义 | 可配置值与注意事项 |
+| --- | --- | --- |
+| `RUN_PREPROCESS_PREVIEW` | 本节总开关 | `True` 时读取并预处理一个配对；`False` 时只打印跳过信息。它不会创建 Optuna study，也不会写结果文件。 |
+| `PREVIEW_MOTION_TYPE` | 要预览的运动类型 | 只能选择 `write/gripper/run/rope` 之一，并且必须在当前受试者目录中存在。 |
+| `PREVIEW_MOTION_INDEX` | 同一运动类型下的测试序号 | 使用正整数，例如 `1`。motion 与 index 必须唯一匹配一个严格配对。 |
+| `SUBJECT_DIR` | 当前唯一受试者目录 | 在第 0 节或环境变量 `PPG_SUBJECT_DIR` 中设置；本节不会扫描其他受试者。 |
+| `calibration` | 当前受试者的标定系数 | 不是可搜索超参数；固定由第 1 节从 `SUBJECT_DIR.parent / "ck.mat"` 解析并校验。 |
+| `FS_ORIGIN` | 原始传感器采样率 | change6 数据协议固定为 100 Hz；通常保持 `100`，修改后必须与采集序号和真实采样率一致。 |
+| `TW` | 本节运动分段的窗口长度，单位秒 | 预览默认 `8` 秒。这里只影响预览分段；正式训练中的 trial 窗长由 `SEARCH_SPACE.TW` 候选列表采样。 |
+
+本节完成信号预处理和运动分段，并加载参考 HR，为后续对齐诊断准备数据；真正的全局
+Tdelay 搜索和对齐图在第 3 节执行。`PPG_INPUT_TRANSFORM` 则在正式求解窗口内生效，
+不会改变本节展示的原始预处理通道。""",
         r'''
 # 用途：只读预处理选定样本，并显示新协议通道、标定元数据和分段摘要。
 # 输入：PREVIEW_MOTION_TYPE/PREVIEW_MOTION_INDEX，以及第 1 节的 discovery/calibration。
 # 输出：preview_pair、preview_dataset、preview_segment；不保存图表。
 # 是否写文件：否。
 # 耗时风险：中；会完整读取并预处理一个传感器/HR 配对。
+# RUN_PREPROCESS_PREVIEW: True 执行本节；False 安全跳过，不读取完整样本。
+# PREVIEW_MOTION_TYPE: 仅允许 write/gripper/run/rope，必须与当前受试者文件名一致。
 PREVIEW_MOTION_TYPE = "write"
+# PREVIEW_MOTION_INDEX: 同一 motion 下的正整数测试序号；必须唯一匹配一个配对。
 PREVIEW_MOTION_INDEX = 1
+# SUBJECT_DIR: 唯一受试者目录，已在第 0 节解析；本节不会切换或扫描其他受试者。
+# calibration: 第 1 节从 SUBJECT_DIR.parent/ck.mat 得到，不允许在此硬编码标定数值。
+# FS_ORIGIN: 原始采样率，change6/Pydisplay 协议固定按 100 Hz 和序号字段校验。
+# TW: 仅用于本节 detect_activity_segments 的分段窗口；正式训练由 SEARCH_SPACE.TW 采样。
 preview_pair = None
 preview_dataset = None
 preview_segment = None
