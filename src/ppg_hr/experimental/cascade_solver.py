@@ -27,6 +27,7 @@ from .alignment import (
     search_time_bias_after,
 )
 from .envelope_delay import DelayEstimate, estimate_envelope_delays
+from .enhanced_tracking import SpectrumTrackingState, track_spectrum_candidates
 from .fusion import fuse_final_hr
 from .klms import noncausal_klms_filter
 from .motion_frequency import estimate_motion_frequency
@@ -822,6 +823,8 @@ def _run_windows(
     qc_stat_rows: list[dict[str, Any]] = []
     prev_baseline: float | None = None
     prev_adaptive: float | None = None
+    baseline_tracking_state = SpectrumTrackingState()
+    adaptive_tracking_state = SpectrumTrackingState()
     for row_idx, window_idx in enumerate(norm_cache.window_idx):
         start_idx = int(norm_cache.start_idx[row_idx])
         adaptive_source_start_idx = int(norm_cache.adaptive_source_start_idx[row_idx])
@@ -852,6 +855,9 @@ def _run_windows(
             enable_penalty=False,
             penalty_ref=None,
             precomputed_spectrum=baseline_spectrum,
+            tracking_state=baseline_tracking_state,
+            window_kind=label,
+            path="baseline",
         )
         baseline_hr = float(baseline_post["hr_bpm"])
         prev_baseline = baseline_hr if np.isfinite(baseline_hr) else prev_baseline
@@ -884,6 +890,9 @@ def _run_windows(
                 params,
                 enable_penalty=True,
                 penalty_ref=penalty_ref,
+                tracking_state=adaptive_tracking_state,
+                window_kind=label,
+                path="adaptive",
             )
             adaptive_hr = float(adaptive_post["hr_bpm"])
         else:
@@ -937,6 +946,14 @@ def _run_windows(
                     "adaptive_postprocess_reason": str(adaptive_post.get("postprocess_reason", "")),
                     "adaptive_postprocess_candidates_json": json.dumps(
                         _json_ready_postprocess_candidates(adaptive_post),
+                        ensure_ascii=False,
+                    ),
+                    "baseline_spectrum_tracking_json": json.dumps(
+                        _jsonify_postprocess(baseline_post.get("spectrum_tracking", {})),
+                        ensure_ascii=False,
+                    ),
+                    "adaptive_spectrum_tracking_json": json.dumps(
+                        _jsonify_postprocess(adaptive_post.get("spectrum_tracking", {})),
                         ensure_ascii=False,
                     ),
                     "penalty_ref_channel": penalty_ref_channel,
@@ -1634,11 +1651,14 @@ def _extract_hr_result(
     enable_penalty: bool,
     penalty_ref: np.ndarray | None,
     precomputed_spectrum: tuple[np.ndarray, np.ndarray] | None = None,
+    tracking_state: SpectrumTrackingState | None = None,
+    window_kind: str = "rest",
+    path: str = "adaptive",
 ) -> dict[str, Any]:
     """Extract HR and return postprocessing diagnostics."""
 
     method = str(getattr(params, "postprocess_method", "fft") or "fft").lower()
-    fft_hr = _extract_fft_hr(
+    fft_hr, tracking_trace = _extract_fft_hr(
         signal,
         fs,
         previous_hr,
@@ -1646,6 +1666,10 @@ def _extract_hr_result(
         enable_penalty=enable_penalty,
         penalty_ref=penalty_ref,
         precomputed_spectrum=precomputed_spectrum,
+        tracking_state=tracking_state,
+        window_kind=window_kind,
+        path=path,
+        return_trace=True,
     )
     if method == "fft":
         return {
@@ -1656,6 +1680,7 @@ def _extract_hr_result(
             "candidate_bpm": [],
             "candidate_score": [],
             "harmonic_adjusted": False,
+            "spectrum_tracking": tracking_trace,
         }
     if method != "ssr":
         raise ValueError("postprocess_method must be 'fft' or 'ssr'")
@@ -1683,6 +1708,7 @@ def _extract_hr_result(
             "postprocess_method": "ssr",
             "postprocess_fallback": "",
             "postprocess_reason": str(ssr.get("reason", "")),
+            "spectrum_tracking": tracking_trace,
         }
     if bool(getattr(params, "SSR_Fallback_To_FFT", True)):
         return {
@@ -1691,6 +1717,7 @@ def _extract_hr_result(
             "postprocess_method": "ssr",
             "postprocess_fallback": "fft",
             "postprocess_reason": str(ssr.get("reason", "ssr failed")),
+            "spectrum_tracking": tracking_trace,
         }
     return {
         **ssr,
@@ -1698,10 +1725,93 @@ def _extract_hr_result(
         "postprocess_method": "ssr",
         "postprocess_fallback": "",
         "postprocess_reason": str(ssr.get("reason", "ssr failed")),
+        "spectrum_tracking": tracking_trace,
     }
 
 
 def _extract_fft_hr(
+    signal: np.ndarray,
+    fs: int,
+    previous_hr: float | None,
+    params: ProtocolTrialParams,
+    *,
+    enable_penalty: bool,
+    penalty_ref: np.ndarray | None,
+    precomputed_spectrum: tuple[np.ndarray, np.ndarray] | None = None,
+    tracking_state: SpectrumTrackingState | None = None,
+    window_kind: str = "rest",
+    path: str = "adaptive",
+    return_trace: bool = False,
+) -> float | tuple[float, dict[str, Any]]:
+    """Run the legacy tracker or the enhanced candidate/state tracker."""
+
+    feature_names = (
+        "enable_directional_tracking",
+        "enable_dynamic_penalty",
+        "enable_continuity_protection",
+        "enable_low_lock_recovery",
+        "enable_high_lock_recovery",
+        "enable_post_motion_protection",
+    )
+    tracker_mode = str(getattr(params, "tracker_mode", "enhanced")).lower()
+    if tracker_mode not in {"legacy", "enhanced"}:
+        raise ValueError("tracker_mode must be 'legacy' or 'enhanced'")
+    enhanced = tracker_mode == "enhanced" and any(
+        bool(getattr(params, name, False)) for name in feature_names
+    )
+    if not enhanced:
+        value = _extract_fft_hr_legacy(
+            signal,
+            fs,
+            previous_hr,
+            params,
+            enable_penalty=enable_penalty,
+            penalty_ref=penalty_ref,
+            precomputed_spectrum=precomputed_spectrum,
+        )
+        trace = {
+            "tracker_mode": "legacy",
+            "path": path,
+            "window_kind": window_kind,
+            "slew_limited_hr_bpm": float(value),
+            "low_lock_requested": bool(getattr(params, "enable_low_lock_recovery", False)),
+            "low_lock_effective": False,
+        }
+        return (float(value), trace) if return_trace else float(value)
+
+    freq, amp = precomputed_spectrum if precomputed_spectrum is not None else _spectrum(signal, fs)
+    penalty_freqs = penalty_amps = None
+    if enable_penalty and penalty_ref is not None:
+        ref_freq, ref_amp = _spectrum(penalty_ref, fs)
+        ref_band = (ref_freq >= 0.2) & (ref_freq <= 5.0)
+        ref_indices = np.flatnonzero(ref_band)
+        if ref_indices.size:
+            local = ref_indices[1:-1][
+                (ref_amp[ref_indices[1:-1]] > ref_amp[ref_indices[:-2]])
+                & (ref_amp[ref_indices[1:-1]] > ref_amp[ref_indices[2:]])
+            ]
+            if local.size == 0:
+                local = np.asarray([ref_indices[int(np.argmax(ref_amp[ref_indices]))]])
+            penalty_freqs = ref_freq[local]
+            penalty_amps = ref_amp[local]
+    value, trace_obj = track_spectrum_candidates(
+        freq,
+        amp,
+        previous_hr_bpm=previous_hr,
+        params=params,
+        state=tracking_state or SpectrumTrackingState(),
+        window_kind=str(window_kind),
+        path=str(path),
+        enable_penalty=enable_penalty,
+        penalty_peaks_hz=penalty_freqs,
+        penalty_peak_amplitudes=penalty_amps,
+        adaptive_filter=str(getattr(params, "adaptive_filter", "lms")),
+    )
+    trace = {"tracker_mode": "enhanced", **trace_obj.to_dict()}
+    return (float(value), trace) if return_trace else float(value)
+
+
+def _extract_fft_hr_legacy(
     signal: np.ndarray,
     fs: int,
     previous_hr: float | None,

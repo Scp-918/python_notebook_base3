@@ -129,6 +129,38 @@ class ProtocolTrialParams:
     cascade_guard_ratio_max: float = 5.0
     cascade_guard_flat_std_eps: float = 1e-6
     cascade_guard_use_finite_zscore: bool = True
+    # Enhanced spectrum tracker. These fixed fields are serialized and enter cache_key.
+    tracker_mode: str = "enhanced"
+    enable_directional_tracking: bool = True
+    enable_dynamic_penalty: bool = True
+    enable_continuity_protection: bool = True
+    enable_low_lock_recovery: bool = True
+    enable_high_lock_recovery: bool = True
+    enable_post_motion_protection: bool = True
+    tracking_range_up_bpm: float = 25.0
+    tracking_range_down_bpm: float = 25.0
+    tracking_slew_limit_up_bpm: float = 10.0
+    tracking_slew_step_up_bpm: float = 7.0
+    tracking_slew_limit_down_bpm: float = 10.0
+    tracking_slew_step_down_bpm: float = 7.0
+    low_lock_min_bpm: float = 50.0
+    low_lock_max_bpm: float = 80.0
+    low_lock_min_windows: int = 4
+    low_lock_target_min_bpm: float = 90.0
+    low_lock_min_jump_bpm: float = 20.0
+    low_lock_min_amp_ratio: float = 0.45
+    low_lock_candidate_stable_bpm: float = 10.0
+    low_lock_confirm_windows: int = 3
+    low_lock_step_bpm: float = 30.0
+    high_lock_confirm_windows: int = 3
+    high_lock_cooldown_windows: int = 4
+    high_lock_min_gap_bpm: float = 20.0
+    high_lock_min_amp_ratio: float = 0.45
+    high_lock_candidate_min_bpm: float = 85.0
+    high_lock_candidate_stable_bpm: float = 10.0
+    high_lock_penalty_exclusion_bpm: float = 10.0
+    high_lock_down_step_bpm: float = 20.0
+    high_lock_up_step_bpm: float = 3.0
 
     def to_dict(self) -> dict[str, Any]:
         """Return parameter values as plain Python scalars."""
