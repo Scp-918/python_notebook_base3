@@ -33,13 +33,31 @@ class MotionType(str, Enum):
 class CascadeScheme(str, Enum):
     """Adaptive-filter cascade variants used by the experimental protocol."""
 
-    ACC3 = "ACC3"
+    ACC = "ACC"
     HF2 = "HF2"
-    CF2 = "CF2"
+    UD2 = "UD2"
+    ACC_HF2 = "ACC_HF2"
     HF2_CF2 = "HF2_CF2"
-    CF2_HF2 = "CF2_HF2"
-    ACC3_HF2 = "ACC3_HF2"
-    HF2_ACC3 = "HF2_ACC3"
+    ACC_UD2 = "ACC_UD2"
+
+    # Source compatibility for code that referenced the former member names.
+    ACC3 = "ACC"
+    ACC3_HF2 = "ACC_HF2"
+
+    @property
+    def display_name(self) -> str:
+        """Return the ordered user-facing cascade label."""
+
+        return self.value.replace("_", "+")
+
+    @classmethod
+    def _missing_(cls, value: object) -> "CascadeScheme | None":
+        """Read the two renamed legacy identifiers without exposing them for training."""
+
+        return {
+            "ACC3": cls.ACC,
+            "ACC3_HF2": cls.ACC_HF2,
+        }.get(str(value))
 
 
 class TargetScope(str, Enum):

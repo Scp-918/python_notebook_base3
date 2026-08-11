@@ -1553,13 +1553,12 @@ def _scheme_plan(scheme: CascadeScheme) -> list[tuple[str, int]]:
     """Return the ordered sensor groups for a cascade scheme."""
 
     return {
-        CascadeScheme.ACC3: [("ACC", 3)],
+        CascadeScheme.ACC: [("ACC", 3)],
         CascadeScheme.HF2: [("HF", 2)],
-        CascadeScheme.CF2: [("CF", 2)],
+        CascadeScheme.UD2: [("UD", 2)],
+        CascadeScheme.ACC_HF2: [("ACC", 3), ("HF", 2)],
         CascadeScheme.HF2_CF2: [("HF", 2), ("CF", 2)],
-        CascadeScheme.CF2_HF2: [("CF", 2), ("HF", 2)],
-        CascadeScheme.ACC3_HF2: [("ACC", 3), ("HF", 2)],
-        CascadeScheme.HF2_ACC3: [("HF", 2), ("ACC", 3)],
+        CascadeScheme.ACC_UD2: [("ACC", 3), ("UD", 2)],
     }[scheme]
 
 
@@ -1581,14 +1580,14 @@ def _penalty_reference_with_channel(
 ) -> tuple[np.ndarray, str]:
     """Choose the spectral-penalty reference and return its channel name."""
 
-    if scheme in {CascadeScheme.ACC3, CascadeScheme.ACC3_HF2, CascadeScheme.HF2_ACC3}:
+    if scheme in {CascadeScheme.ACC, CascadeScheme.ACC_HF2, CascadeScheme.ACC_UD2}:
         channel = _best_energy_channel(window, ("accx", "accy", "accz"))
         return window[channel], channel
-    if scheme in {CascadeScheme.HF2, CascadeScheme.HF2_CF2, CascadeScheme.CF2_HF2}:
+    if scheme in {CascadeScheme.HF2, CascadeScheme.HF2_CF2}:
         channel = delay_est.primary_by_type.get("HF") or "hf1"
         return window[channel], channel
-    if scheme == CascadeScheme.CF2:
-        channel = delay_est.primary_by_type.get("CF") or "cf1"
+    if scheme == CascadeScheme.UD2:
+        channel = delay_est.primary_by_type.get("UD") or "ud1"
         return window[channel], channel
     return window["ppg_green"], "ppg_green"
 

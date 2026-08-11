@@ -141,7 +141,7 @@ def test_output_run_name_contains_tw_f_label() -> None:
     )
 
     assert name0.endswith("__TW_F0s__hr_fft")
-    assert "global__ACC3__lms__accuracy__split__TW_F2p5s__hr_fft" == name25
+    assert "global__ACC__lms__accuracy__split__TW_F2p5s__hr_fft" == name25
 
 
 def test_output_run_name_is_isolated_by_postprocess_method() -> None:

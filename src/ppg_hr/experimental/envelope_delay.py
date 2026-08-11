@@ -16,13 +16,14 @@ except Exception:  # pragma: no cover - exercised only without numba
 __all__ = ["ChannelDelay", "DelayEstimate", "estimate_envelope_delays"]
 NUMBA_AVAILABLE = njit is not None
 
-# 中文说明：本文件按 HF/CF/ACC 三类补偿信号分别估计相对 PPG 的包络时延。
+# 中文说明：本文件按 HF/CF/UD/ACC 四类补偿信号分别估计相对 PPG 的包络时延。
 # D_opt_samples > 0 表示补偿信号超前 PPG，可用因果 LMS；D_opt_samples < 0
 # 表示补偿信号滞后，需要非因果前向抽头。
 
 _GROUPS = {
     "HF": ("hf1", "hf2"),
     "CF": ("cf1", "cf2"),
+    "UD": ("ud1", "ud2"),
     "ACC": ("accx", "accy", "accz"),
 }
 
@@ -291,4 +292,3 @@ def _zscore(x: np.ndarray) -> np.ndarray:
     if not np.isfinite(sd) or sd <= 1e-12:
         return arr - mu
     return (arr - mu) / sd
-

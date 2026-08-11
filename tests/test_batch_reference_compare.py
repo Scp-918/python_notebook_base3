@@ -122,7 +122,7 @@ def test_run_batch_reference_compare_reads_split_and_writes_utf8_sig_csv(tmp_pat
     out = pd.read_csv(out_path)
     assert calls == [CascadeScheme.HF2, CascadeScheme.ACC3]
     assert out.loc[0, "source_cascade_scheme"] == "HF2"
-    assert out.loc[0, "actual_reference_cascade_scheme"] == "ACC3"
+    assert out.loc[0, "actual_reference_cascade_scheme"] == "ACC"
     assert float(out.loc[0, "source_final_aae_bpm"]) == 4.0
     assert float(out.loc[0, "actual_final_accuracy_pct"]) == 77.0
     assert int(out.loc[0, "actual_num_windows"]) == 3
