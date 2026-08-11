@@ -8,14 +8,15 @@ CF 计算、分类型带通滤波和 ``resample_poly`` 重采样。
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from scipy.signal import butter, filtfilt, resample_poly
 
-from ..preprocess.data_loader import QC_COLUMNS, SENSOR_COLUMNS
+from ..preprocess.calibration import CalibrationCoefficients, load_subject_calibration
+from ..preprocess.data_loader import QC_COLUMNS, load_hrdata_csv, load_pydisplay_sensor_csv
 from ..preprocess.utils import (
     fillmissing_linear,
     fillmissing_nearest,
@@ -41,6 +42,10 @@ PROTOCOL_CHANNELS = (
     "hf2",
     "cf1",
     "cf2",
+    "hfcomp1",
+    "hfcomp2",
+    "ud1",
+    "ud2",
     "accx",
     "accy",
     "accz",
@@ -53,22 +58,19 @@ PROTOCOL_QC_COLUMNS = (
     *QC_COLUMNS,
     "raw_missing_any",
     "raw_missing_count",
+    "ud_denominator_near_zero",
 )
 
 _RAW_COLUMN_BY_FIELD = {
-    "ppg_green": SENSOR_COLUMNS["PPG_Green"],
-    "ppg_red": SENSOR_COLUMNS["PPG_Red"],
-    "ppg_ir": SENSOR_COLUMNS["PPG_IR"],
-    "hf1": SENSOR_COLUMNS["Ut1"],
-    "hf2": SENSOR_COLUMNS["Ut2"],
-    "uc1": SENSOR_COLUMNS["Uc1"],
-    "uc2": SENSOR_COLUMNS["Uc2"],
-    "accx": SENSOR_COLUMNS["AccX"],
-    "accy": SENSOR_COLUMNS["AccY"],
-    "accz": SENSOR_COLUMNS["AccZ"],
-    "gyrox": SENSOR_COLUMNS["GyroX"],
-    "gyroy": SENSOR_COLUMNS["GyroY"],
-    "gyroz": SENSOR_COLUMNS["GyroZ"],
+    "ppg_green": "PPG_G",
+    "ppg_red": "PPG_R",
+    "ppg_ir": "PPG_IR",
+    "accx": "ACC_X",
+    "accy": "ACC_Y",
+    "accz": "ACC_Z",
+    "gyrox": "GYRO_X",
+    "gyroy": "GYRO_Y",
+    "gyroz": "GYRO_Z",
 }
 
 
@@ -98,11 +100,22 @@ class ProtocolDataset:
     raw_ppg_green: np.ndarray | None = None
     raw_ppg_red: np.ndarray | None = None
     raw_ppg_ir: np.ndarray | None = None
+    hfcomp1: np.ndarray | None = None
+    hfcomp2: np.ndarray | None = None
+    ud1: np.ndarray | None = None
+    ud2: np.ndarray | None = None
+    source_metadata: dict[str, object] = field(default_factory=dict)
 
     def channels(self) -> dict[str, np.ndarray]:
         """Return a copy of the channel mapping used by downstream modules."""
 
-        return {name: np.asarray(getattr(self, name), dtype=float) for name in PROTOCOL_CHANNELS}
+        out: dict[str, np.ndarray] = {}
+        for name in PROTOCOL_CHANNELS:
+            value = getattr(self, name, None)
+            if value is None:
+                value = np.zeros(len(self.time_s), dtype=float)
+            out[name] = np.asarray(value, dtype=float)
+        return out
 
     def qc_frame(self) -> pd.DataFrame:
         """Return sample-level QC metadata aligned to ``time_s``.
@@ -149,16 +162,19 @@ def load_and_preprocess_protocol(
     sensor_csv: str | Path,
     ref_csv: str | Path,
     fs_origin: int = 100,
+    *,
+    calibration: CalibrationCoefficients | None = None,
 ) -> ProtocolDataset:
     """Load one sensor/reference pair for the batch adaptive protocol.
 
-    中文说明：传感器时间轴始终按 ``np.arange(n) / fs_origin`` 从 0 重建；缺失值
-    先线性插值再近邻补边；PPG 使用既有毛刺修复工具；CF 按
-    ``Uc / (Ut - Uc)`` 计算并防止零分母；最后按信号类型做零相位带通滤波。
+    中文说明：严格读取 Pydisplay 表头并修复序号；缺失值先线性插值再近邻补边；
+    PPG 使用既有毛刺修复工具；CF/HF/HFcomp/UD 按新协议公式由原始伏特列和
+    ``ck.mat`` 标定值计算；最后按信号类型做零相位带通滤波。
     """
 
     sensor_path = Path(sensor_csv)
-    clean_frame = _build_clean_frame(sensor_path, int(fs_origin))
+    calibration = calibration or load_subject_calibration(sensor_path.parent)
+    clean_frame, sequence_metadata = _build_clean_frame(sensor_path, int(fs_origin), calibration)
     fs = int(fs_origin)
 
     raw_ppg_green = clean_frame["ppg_green"].to_numpy(dtype=float)
@@ -171,6 +187,10 @@ def load_and_preprocess_protocol(
     hf2 = _safe_bandpass(clean_frame["hf2"].to_numpy(dtype=float), fs, 0.1, 5.0)
     cf1 = _safe_bandpass(clean_frame["cf1"].to_numpy(dtype=float), fs, 0.1, 5.0)
     cf2 = _safe_bandpass(clean_frame["cf2"].to_numpy(dtype=float), fs, 0.1, 5.0)
+    hfcomp1 = _safe_bandpass(clean_frame["hfcomp1"].to_numpy(dtype=float), fs, 0.1, 5.0)
+    hfcomp2 = _safe_bandpass(clean_frame["hfcomp2"].to_numpy(dtype=float), fs, 0.1, 5.0)
+    ud1 = _safe_bandpass(clean_frame["ud1"].to_numpy(dtype=float), fs, 0.1, 5.0)
+    ud2 = _safe_bandpass(clean_frame["ud2"].to_numpy(dtype=float), fs, 0.1, 5.0)
     accx = _safe_bandpass(clean_frame["accx"].to_numpy(dtype=float), fs, 0.5, 10.0)
     accy = _safe_bandpass(clean_frame["accy"].to_numpy(dtype=float), fs, 0.5, 10.0)
     accz = _safe_bandpass(clean_frame["accz"].to_numpy(dtype=float), fs, 0.5, 10.0)
@@ -178,7 +198,8 @@ def load_and_preprocess_protocol(
     gyroy = _safe_bandpass(clean_frame["gyroy"].to_numpy(dtype=float), fs, 0.5, 10.0)
     gyroz = _safe_bandpass(clean_frame["gyroz"].to_numpy(dtype=float), fs, 0.5, 10.0)
 
-    ref_time_s, ref_hr_bpm = _parse_reference_csv_protocol(Path(ref_csv))
+    ref_data = load_hrdata_csv(Path(ref_csv))
+    ref_time_s, ref_hr_bpm = ref_data[:, 0], ref_data[:, 1]
     qc = clean_frame.loc[:, list(PROTOCOL_QC_COLUMNS)].copy()
     return ProtocolDataset(
         sample_stem=sensor_path.stem,
@@ -203,6 +224,11 @@ def load_and_preprocess_protocol(
         raw_ppg_green=raw_ppg_green,
         raw_ppg_red=raw_ppg_red,
         raw_ppg_ir=raw_ppg_ir,
+        hfcomp1=hfcomp1,
+        hfcomp2=hfcomp2,
+        ud1=ud1,
+        ud2=ud2,
+        source_metadata={**calibration.to_metadata(), **sequence_metadata},
     )
 
 
@@ -243,29 +269,16 @@ def apply_ppg_input_transform(dataset: ProtocolDataset, params: object) -> Proto
 def load_protocol_raw_clean_frames(
     sensor_csv: str | Path,
     fs_origin: int = 100,
+    *,
+    calibration: CalibrationCoefficients | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return raw and cleaned 13-channel protocol frames for plotting.
-
-    中文说明：raw 表直接来自原始 CSV 并按协议字段重命名；clean 表完成缺失值、PPG
-    毛刺和 CF 安全计算，但尚未做带通滤波，便于对比原始/清洗后信号。
-    """
+    """Return derived raw and cleaned frames before band-pass filtering."""
 
     path = Path(sensor_csv)
-    raw = pd.read_csv(path)
-    _validate_sensor_columns(raw)
-    fs = int(fs_origin)
-    time_s = _time_seconds_from_raw(raw, fs)
-    raw_frame = pd.DataFrame({"time_s": time_s})
-    for field in PROTOCOL_CHANNELS:
-        if field == "cf1":
-            raw_frame[field] = _raw_ratio(raw, "uc1", "hf1")
-        elif field == "cf2":
-            raw_frame[field] = _raw_ratio(raw, "uc2", "hf2")
-        elif field in {"hf1", "hf2"}:
-            raw_frame[field] = pd.to_numeric(raw[_RAW_COLUMN_BY_FIELD[field]], errors="coerce")
-        else:
-            raw_frame[field] = pd.to_numeric(raw[_RAW_COLUMN_BY_FIELD[field]], errors="coerce")
-    clean_frame = _build_clean_frame(path, fs)
+    calibration = calibration or load_subject_calibration(path.parent)
+    loaded = load_pydisplay_sensor_csv(path, fs=int(fs_origin))
+    raw_frame, _ = _derive_protocol_frame(loaded.frame, calibration, clean=False)
+    clean_frame, _ = _build_clean_frame(path, int(fs_origin), calibration, loaded=loaded)
     return raw_frame, clean_frame
 
 
@@ -289,42 +302,99 @@ def resample_protocol_dataset(dataset: ProtocolDataset, fs_target: int) -> Proto
     return dataset.replace_channels(channels, fs_target)
 
 
-def _build_clean_frame(sensor_path: Path, fs: int) -> pd.DataFrame:
-    """Load raw CSV and build the cleaned, unfiltered 13-channel frame."""
+def _build_clean_frame(
+    sensor_path: Path,
+    fs: int,
+    calibration: CalibrationCoefficients,
+    *,
+    loaded: object | None = None,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Load and derive the cleaned, unfiltered new-protocol frame."""
 
-    raw = pd.read_csv(sensor_path)
-    if raw.empty:
-        raise ValueError(f"Sensor CSV is empty: {sensor_path}")
-    _validate_sensor_columns(raw)
+    sensor_data = loaded or load_pydisplay_sensor_csv(sensor_path, fs=fs)
+    frame, _ = _derive_protocol_frame(sensor_data.frame, calibration, clean=True, fs=fs)
+    report = sensor_data.report
+    metadata = {
+        "sensor_csv": str(Path(sensor_path).resolve()),
+        "sequence_input_rows": report.input_rows,
+        "sequence_output_rows": report.output_rows,
+        "sequence_removed_empty_rows": report.removed_empty_rows,
+        "sequence_removed_parser_invalid_rows": report.removed_parser_invalid_rows,
+        "sequence_removed_duplicate_or_reordered_rows": report.removed_duplicate_or_reordered_rows,
+        "sequence_inserted_missing_rows": report.inserted_missing_rows,
+        "sequence_frame_seq_mismatches": report.frame_seq_mismatches,
+        "sequence_sample_seq_mismatches": report.sample_seq_mismatches,
+        "sequence_segment_transitions": report.segment_transitions,
+    }
+    return frame, metadata
 
-    time_s = _time_seconds_from_raw(raw, fs)
-    qc_frame = _build_qc_frame(raw)
-    hf1_raw = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["hf1"]])
-    hf2_raw = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["hf2"]])
-    uc1_raw = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["uc1"]])
-    uc2_raw = _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["uc2"]])
 
-    frame = pd.DataFrame(
-        {
-            "time_s": time_s,
-            "ppg_green": _clean_ppg(raw[_RAW_COLUMN_BY_FIELD["ppg_green"]], fs),
-            "ppg_red": _clean_ppg(raw[_RAW_COLUMN_BY_FIELD["ppg_red"]], fs),
-            "ppg_ir": _clean_ppg(raw[_RAW_COLUMN_BY_FIELD["ppg_ir"]], fs),
-            "hf1": hf1_raw,
-            "hf2": hf2_raw,
-            "cf1": _safe_ratio(uc1_raw, hf1_raw - uc1_raw),
-            "cf2": _safe_ratio(uc2_raw, hf2_raw - uc2_raw),
-            "accx": _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["accx"]]),
-            "accy": _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["accy"]]),
-            "accz": _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["accz"]]),
-            "gyrox": _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["gyrox"]]),
-            "gyroy": _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["gyroy"]]),
-            "gyroz": _clean_numeric(raw[_RAW_COLUMN_BY_FIELD["gyroz"]]),
-        }
+def _derive_protocol_frame(
+    source: pd.DataFrame,
+    calibration: CalibrationCoefficients,
+    *,
+    clean: bool,
+    fs: int = 100,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """Apply the documented CF2/HF2/HF2comp/UD2 formulas."""
+
+    numeric_names = (
+        "PPG_G", "PPG_R", "PPG_IR", "ACC_X", "ACC_Y", "ACC_Z",
+        "GYRO_X", "GYRO_Y", "GYRO_Z", "Uh1", "Uh2", "Uh3", "Uh4", "Uc2", "Uc3",
     )
+    values = {
+        name: pd.to_numeric(source[name], errors="coerce").to_numpy(dtype=float)
+        for name in numeric_names
+    }
+    den2 = float(calibration.c2) - values["Uc2"]
+    den3 = float(calibration.c3) - values["Uc3"]
+    near2 = np.isfinite(den2) & (np.abs(den2) <= 1e-9)
+    near3 = np.isfinite(den3) & (np.abs(den3) <= 1e-9)
+    safe_den2 = den2.copy()
+    safe_den3 = den3.copy()
+    safe_den2[near2] = np.nan
+    safe_den3[near3] = np.nan
+    derived: dict[str, np.ndarray] = {
+        "ppg_green": values["PPG_G"],
+        "ppg_red": values["PPG_R"],
+        "ppg_ir": values["PPG_IR"],
+        "cf1": values["Uh1"] * 1000.0,
+        "cf2": values["Uh4"] * 1000.0,
+        "hf1": (values["Uh2"] - float(calibration.k2) * values["Uh1"]) * 1000.0,
+        "hf2": (values["Uh3"] - float(calibration.k3) * values["Uh4"]) * 1000.0,
+        "hfcomp1": values["Uh2"] * 1000.0,
+        "hfcomp2": values["Uh3"] * 1000.0,
+        "ud1": (values["Uh2"] - values["Uc2"]) / safe_den2,
+        "ud2": (values["Uh3"] - values["Uc3"]) / safe_den3,
+        "accx": values["ACC_X"],
+        "accy": values["ACC_Y"],
+        "accz": values["ACC_Z"],
+        "gyrox": values["GYRO_X"],
+        "gyroy": values["GYRO_Y"],
+        "gyroz": values["GYRO_Z"],
+    }
+    frame = pd.DataFrame({"time_s": pd.to_numeric(source["Time_s"], errors="coerce")})
+    for name, array in derived.items():
+        if not clean:
+            frame[name] = array
+        elif name.startswith("ppg_"):
+            frame[name] = _clean_ppg(array, fs)
+        else:
+            frame[name] = _clean_numeric_required(array, name)
+    if not clean:
+        for name in ("Uh1", "Uh2", "Uh3", "Uh4", "Uc2", "Uc3"):
+            frame[name] = values[name]
+        return frame, near2 | near3
+
+    qc_frame = _build_qc_frame(source)
+    raw_matrix = np.column_stack([np.asarray(item, dtype=float) for item in derived.values()])
+    raw_missing_count = np.sum(~np.isfinite(raw_matrix), axis=1).astype(int)
+    qc_frame["raw_missing_any"] = (raw_missing_count > 0).astype(int)
+    qc_frame["raw_missing_count"] = raw_missing_count
+    qc_frame["ud_denominator_near_zero"] = (near2 | near3).astype(int)
     for column in PROTOCOL_QC_COLUMNS:
         frame[column] = qc_frame[column].to_numpy()
-    return frame
+    return frame, near2 | near3
 
 
 def _time_seconds_from_raw(raw: pd.DataFrame, fs: int) -> np.ndarray:
@@ -380,6 +450,7 @@ def _normalise_qc_frame(qc: pd.DataFrame | None, n: int) -> pd.DataFrame:
         "MissingBefore": np.zeros(n, dtype=int),
         "raw_missing_any": np.zeros(n, dtype=int),
         "raw_missing_count": np.zeros(n, dtype=int),
+        "ud_denominator_near_zero": np.zeros(n, dtype=int),
     }
     out = pd.DataFrame(index=np.arange(n))
     source = qc if qc is not None else pd.DataFrame()
@@ -438,6 +509,18 @@ def _clean_numeric(values: pd.Series | np.ndarray) -> np.ndarray:
     arr = fillmissing_linear(arr)
     arr = fillmissing_nearest(arr)
     return arr
+
+
+def _clean_numeric_required(values: pd.Series | np.ndarray, name: str) -> np.ndarray:
+    """Interpolate one required channel and reject unrecoverable all-NaN data."""
+
+    arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
+    if not np.isfinite(arr).any():
+        raise ValueError(f"Required derived channel {name!r} has no finite values")
+    cleaned = _clean_numeric(arr)
+    if not np.isfinite(cleaned).all():
+        raise ValueError(f"Required derived channel {name!r} contains unrecoverable values")
+    return cleaned
 
 
 def _clean_ppg(values: pd.Series | np.ndarray, fs: int) -> np.ndarray:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .calibration import CalibrationCoefficients, load_subject_calibration
 from .data_loader import SENSOR_COLUMNS, ProcessedDataset, load_dataset
 from .utils import (
     fillmissing_linear,
@@ -13,8 +14,10 @@ from .utils import (
 
 __all__ = [
     "ProcessedDataset",
+    "CalibrationCoefficients",
     "SENSOR_COLUMNS",
     "load_dataset",
+    "load_subject_calibration",
     "fillmissing_linear",
     "fillmissing_nearest",
     "filloutliers_mean_previous",

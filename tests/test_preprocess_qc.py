@@ -4,8 +4,14 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.io import savemat
 
-from ppg_hr.preprocess.data_loader import QC_COLUMNS, SENSOR_COLUMNS, load_dataset
+from ppg_hr.preprocess.data_loader import (
+    PYDISPLAY_SENSOR_COLUMNS,
+    QC_COLUMNS,
+    SENSOR_COLUMNS,
+    load_dataset,
+)
 from ppg_hr.experimental.alignment import AlignedDataset, AlignmentInfo
 from ppg_hr.experimental.cascade_solver import _TrialBase, _run_windows
 from ppg_hr.experimental.preprocess_protocol import (
@@ -89,18 +95,52 @@ def test_load_dataset_fills_default_qc_for_old_layout(tmp_path: Path) -> None:
 
 
 def test_protocol_loader_carries_qc_metadata_into_frame(tmp_path: Path) -> None:
-    sensor_csv = tmp_path / "multi_tiaosheng1.csv"
-    ref_csv = _protocol_ref_csv(tmp_path / "multi_tiaosheng1_ref.csv")
-    _sensor_frame(include_time_qc=True).to_csv(sensor_csv, index=False)
+    subject_dir = tmp_path / "subject_name"
+    subject_dir.mkdir()
+    sensor_csv = subject_dir / "subject_name_write_1_sensor.csv"
+    ref_csv = subject_dir / "subject_name_write_1_HRdata.csv"
+    n = 180
+    t = np.arange(n, dtype=float) / 100.0
+    sensor = pd.DataFrame({name: np.ones(n) for name in PYDISPLAY_SENSOR_COLUMNS})
+    sensor["frame_seq"] = np.r_[np.arange(20), np.arange(21, n + 1)] % 65536
+    sensor["absolute_seq_u64"] = np.r_[np.arange(20), np.arange(21, n + 1)]
+    sensor["segment_id"] = 0
+    sensor["sample_seq"] = np.arange(n) + 1
+    sensor["parser_valid"] = True
+    sensor["PPG_G"] = 6000.0 + 100.0 * np.sin(2 * np.pi * 1.2 * t)
+    sensor["PPG_R"] = 6500.0 + 80.0 * np.sin(2 * np.pi * 1.1 * t)
+    sensor["PPG_IR"] = 7000.0 + 60.0 * np.sin(2 * np.pi * t)
+    sensor["Uh1"] = 1.0
+    sensor["Uh2"] = 4.0
+    sensor["Uh3"] = 6.0
+    sensor["Uh4"] = 2.0
+    sensor["Uc2"] = 0.5
+    sensor["Uc3"] = 1.0
+    sensor.to_csv(sensor_csv, index=False)
+    pd.DataFrame(
+        {"elapsed_seconds": [0.0, 1.0, 2.0], "hr_bpm": [72.0, 73.0, 74.0]}
+    ).to_csv(ref_csv, index=False)
+    c_result = np.empty((3, 1), dtype=object)
+    c_result[:, 0] = [
+        {"channel": 1, "c": 1.0},
+        {"channel": 2, "c": 2.0},
+        {"channel": 3, "c": 3.0},
+    ]
+    k_result = np.empty((2, 1), dtype=object)
+    k_result[:, 0] = [
+        {"mainChannel": 2, "k": 0.1},
+        {"mainChannel": 3, "k": 0.2},
+    ]
+    savemat(tmp_path / "ck.mat", {"cResult": c_result, "kResult": k_result})
 
     dataset = load_and_preprocess_protocol(sensor_csv, ref_csv, fs_origin=100)
     frame = dataset.to_frame()
 
     for column in QC_COLUMNS:
         assert column in frame.columns
-    assert np.isclose(frame["time_s"].iloc[0], 12.5)
-    assert frame["ValidFlag"].iloc[0] == 0
-    assert frame["InterpFlag"].sum() > 0
+    assert np.isclose(frame["time_s"].iloc[0], 0.0)
+    assert frame["ValidFlag"].iloc[20] == 0
+    assert frame["InterpFlag"].iloc[20] == 1
 
 
 def test_log_absorbance_transform_outputs_finite_ppg_with_original_length() -> None:
