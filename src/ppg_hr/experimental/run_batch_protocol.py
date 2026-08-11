@@ -67,6 +67,7 @@ __all__ = [
     "protocol_params_from_record",
     "replay_best_record_hr_curves",
     "redraw_best_param_hr_curves",
+    "redraw_subject_target_hr_curves",
     "run_batch_reference_compare",
     "run_batch_adaptive_protocol",
     "safe_prepare_output_dir",
@@ -3360,6 +3361,260 @@ def redraw_best_param_hr_curves(
     )
     _write_manual_global_hr_csv(global_frame, global_csv_path)
     return {"training_scope": train_path, "global": global_path, "global_csv": global_csv_path}
+
+
+def redraw_subject_target_hr_curves(
+    *,
+    subject_dir: str | Path,
+    results_root: str | Path,
+    target_scope: str = "motion_post10",
+    cascade_scheme: str = "ACC",
+    adaptive_filter: str = "lms",
+    data_split_mode: str = "all_train",
+    TW_F: float | None = None,
+    output_dir: str | Path | None = None,
+    fs_origin: int = 100,
+    postprocess_method_override: str | None = None,
+) -> pd.DataFrame:
+    """Redraw target-scope reference/final HR curves for every subject sample.
+
+    This is a replay-only entry point: it restores one selected Stage-6 mode per
+    motion type and never creates an Optuna study.  Post-hoc reference alignment
+    is applied only after the prediction frame has been produced.
+    """
+
+    subject_path = Path(subject_dir).resolve()
+    results_path = Path(results_root).resolve()
+    discovery = discover_sample_pairs_with_unpaired(subject_path)
+    if discovery.unpaired:
+        detail = "; ".join(
+            f"{item.file_name} [{item.category}]: {item.reason}" for item in discovery.unpaired
+        )
+        raise ValueError(f"Subject file discovery contains rejected files: {detail}")
+    if not discovery.pairs:
+        raise ValueError(f"No complete sensor/HR pairs found under {subject_path}")
+
+    scope = TargetScope(target_scope)
+    scheme = CascadeScheme(cascade_scheme)
+    filter_name = str(adaptive_filter)
+    motion_rank = {item.value: idx for idx, item in enumerate(MotionType)}
+    pairs = sorted(
+        discovery.pairs,
+        key=lambda item: (motion_rank.get(item.motion_type, len(motion_rank)), int(item.motion_index)),
+    )
+    tw_label = "auto" if TW_F is None else _tw_f_run_label(float(TW_F))
+    mode_signature = (
+        f"{scope.value}__{scheme.value}__{filter_name}__{data_split_mode}__{tw_label}"
+    )
+    out_root = (
+        Path(output_dir).resolve()
+        if output_dir is not None
+        else results_path / "batch_target_hr_curves" / mode_signature
+    )
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    mode_cache: dict[str, tuple[pd.Series, ProtocolTrialParams]] = {}
+    rows: list[dict[str, Any]] = []
+    for pair in pairs:
+        base_row = {
+            "subject": subject_path.name,
+            "sample_id": pair.sample_id,
+            "motion_type": pair.motion_type,
+            "motion_index": int(pair.motion_index),
+            "target_scope": scope.value,
+            "cascade_scheme": scheme.value,
+            "adaptive_filter": filter_name,
+            "data_split_mode": data_split_mode,
+            "TW_F": TW_F,
+            "status": "failed",
+            "reason": "",
+            "time_bias_after_s": float("nan"),
+            "time_bias_after_mode": "",
+            "posthoc_target_aae_bpm": float("nan"),
+            "posthoc_target_accuracy_pct": float("nan"),
+            "n_target_windows": 0,
+            "n_valid_windows": 0,
+            "best_record_path": "",
+            "plot_path": "",
+            "csv_path": "",
+        }
+        try:
+            if pair.motion_type not in mode_cache:
+                motion_dir = _stage6_motion_record_dir(results_path, pair.motion_type)
+                records = _read_stage6_record_tables(motion_dir)
+                best_row = _select_subject_batch_best_record(
+                    records["best_params"],
+                    motion_type=pair.motion_type,
+                    data_split_mode=data_split_mode,
+                    target_scope=scope.value,
+                    cascade_scheme=scheme.value,
+                    adaptive_filter=filter_name,
+                    TW_F=TW_F,
+                )
+                params = _params_from_stage6_record(
+                    best_row,
+                    adaptive_filter=filter_name,
+                    TW_F=TW_F,
+                )
+                if postprocess_method_override:
+                    params = replace(params, postprocess_method=str(postprocess_method_override))
+                mode_cache[pair.motion_type] = (best_row, params)
+            best_row, params = mode_cache[pair.motion_type]
+            motion_dir = _stage6_motion_record_dir(results_path, pair.motion_type)
+            base_row["best_record_path"] = str(motion_dir / "best_params_and_alignment.csv")
+
+            dataset = load_and_preprocess_protocol(pair.sensor_csv, pair.ref_csv, fs_origin=fs_origin)
+            run = run_protocol_trial(
+                dataset,
+                scheme,
+                scope,
+                params,
+                collect_frame=True,
+                collect_stages=False,
+            )
+            if not run.success or run.frame.empty:
+                raise RuntimeError(run.reason or "trial produced no window frame")
+            detail, metrics = _build_subject_target_replay_frame(dataset, run.frame, run, best_row)
+            motion_out = out_root / pair.motion_type
+            motion_out.mkdir(parents=True, exist_ok=True)
+            csv_path = motion_out / f"{pair.sample_id}__target_hr.csv"
+            plot_path = motion_out / f"{pair.sample_id}__target_hr.png"
+            detail.to_csv(csv_path, index=False, encoding="utf-8-sig")
+            _plot_subject_target_hr_curve(
+                plot_path,
+                detail,
+                title=(
+                    f"{pair.sample_id} | {scope.value} / {scheme.display_name} / {filter_name} | "
+                    f"post-hoc AAE={metrics['aae']:.2f} bpm, accuracy={metrics['accuracy']:.1f}%"
+                ),
+            )
+            base_row.update(
+                {
+                    "status": "ok",
+                    "time_bias_after_s": metrics["bias"],
+                    "time_bias_after_mode": metrics["bias_mode"],
+                    "posthoc_target_aae_bpm": metrics["aae"],
+                    "posthoc_target_accuracy_pct": metrics["accuracy"],
+                    "n_target_windows": int(len(detail)),
+                    "n_valid_windows": metrics["n_valid"],
+                    "plot_path": str(plot_path),
+                    "csv_path": str(csv_path),
+                }
+            )
+        except Exception as exc:
+            base_row["reason"] = str(exc)
+        rows.append(base_row)
+
+    manifest = pd.DataFrame(rows)
+    manifest_path = out_root / "batch_target_hr_manifest.csv"
+    manifest.to_csv(manifest_path, index=False, encoding="utf-8-sig")
+    manifest.attrs["manifest_path"] = str(manifest_path)
+    manifest.attrs["output_dir"] = str(out_root)
+    return manifest
+
+
+def _select_subject_batch_best_record(
+    best_df: pd.DataFrame,
+    *,
+    motion_type: str,
+    data_split_mode: str,
+    target_scope: str,
+    cascade_scheme: str,
+    adaptive_filter: str,
+    TW_F: float | None,
+) -> pd.Series:
+    """Select exactly one Stage-6 row; batch replay never falls back silently."""
+
+    candidates = best_df.copy()
+    selectors = {
+        "motion_type": motion_type,
+        "mode": data_split_mode,
+        "target_scope": target_scope,
+        "cascade_scheme": cascade_scheme,
+        "adaptive_filter": adaptive_filter,
+    }
+    for column, expected in selectors.items():
+        if column not in candidates.columns:
+            raise ValueError(f"Stage-6 best params missing selector column: {column}")
+        candidates = candidates[candidates[column].astype(str) == str(expected)]
+    if TW_F is not None:
+        if "TW_F" not in candidates.columns:
+            raise ValueError("Stage-6 best params missing selector column: TW_F")
+        values = pd.to_numeric(candidates["TW_F"], errors="coerce")
+        candidates = candidates[np.isclose(values, float(TW_F), equal_nan=False)]
+    if len(candidates) != 1:
+        raise ValueError(
+            "Expected exactly one Stage-6 best-param row for "
+            f"{motion_type}/{target_scope}/{cascade_scheme}/{adaptive_filter}/{data_split_mode}, "
+            f"found {len(candidates)}"
+        )
+    return candidates.iloc[0]
+
+
+def _build_subject_target_replay_frame(
+    dataset: ProtocolDataset,
+    frame: pd.DataFrame,
+    run: ProtocolRunResult,
+    best_row: pd.Series,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    time_s = frame["time_s"].to_numpy(dtype=float)
+    bias_result = getattr(run, "time_bias_after", None)
+    if bias_result is not None and np.isfinite(float(bias_result.time_bias_after_s)):
+        bias = float(bias_result.time_bias_after_s)
+        bias_mode = str(getattr(bias_result, "mode", "posthoc_oracle_alignment"))
+    else:
+        saved_bias = pd.to_numeric(pd.Series([best_row.get("time_bias_after_s", 0.0)]), errors="coerce").iloc[0]
+        bias = float(saved_bias) if np.isfinite(saved_bias) else 0.0
+        bias_mode = str(best_row.get("time_bias_after_mode", "saved_or_zero"))
+    reference = np.interp(
+        time_s + bias,
+        np.asarray(dataset.ref_time_s, dtype=float),
+        np.asarray(dataset.ref_hr_bpm, dtype=float),
+        left=np.nan,
+        right=np.nan,
+    )
+    target = frame["is_filtered_segment"].astype(bool).to_numpy()
+    final = frame["final_hr_bpm"].to_numpy(dtype=float)
+    valid = target & np.isfinite(reference) & np.isfinite(final)
+    baseline = frame.get("baseline_hr_bpm", frame.get("baseline_ppg_hr_bpm", np.nan))
+    detail = pd.DataFrame(
+        {
+            "time_s": time_s,
+            "reference_hr_after_bpm": reference,
+            "baseline_hr_bpm": baseline,
+            "adaptive_hr_bpm": frame.get("adaptive_hr_bpm", np.nan),
+            "final_hr_bpm": final,
+            "final_source": frame.get("final_source", ""),
+            "segment_label": frame.get("segment_label", ""),
+            "is_valid": valid,
+            "abs_err_after_bpm": np.where(valid, np.abs(final - reference), np.nan),
+        }
+    ).loc[target].reset_index(drop=True)
+    errors = detail.loc[detail["is_valid"], "abs_err_after_bpm"].to_numpy(dtype=float)
+    return detail, {
+        "bias": bias,
+        "bias_mode": bias_mode,
+        "aae": _nanmean(errors),
+        "accuracy": _accuracy_from_abs_err(errors),
+        "n_valid": int(np.isfinite(errors).sum()),
+    }
+
+
+def _plot_subject_target_hr_curve(out_path: Path, frame: pd.DataFrame, *, title: str) -> None:
+    """Plot only post-hoc reference and final HR for one target segment."""
+
+    plt = _prepare_matplotlib(out_path.parent)
+    fig, ax = plt.subplots(figsize=(10.0, 4.5))
+    ax.plot(frame["time_s"], frame["reference_hr_after_bpm"], label="Reference HR (post-hoc)", linewidth=2)
+    ax.plot(frame["time_s"], frame["final_hr_bpm"], label="Final predicted HR", linewidth=1.8)
+    ax.set_title(title)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("HR (bpm)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 def run_batch_reference_compare(
