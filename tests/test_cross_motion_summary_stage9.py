@@ -18,9 +18,9 @@ def _write_motion_records(root: Path, motion_type: str, final_aae: float) -> Non
                 "mode": "all_train",
                 "target_scope": "motion_only",
                 "objective_mode": "aae",
-                "cascade_scheme": "ACC3",
+                "cascade_scheme": "ACC",
                 "adaptive_filter": "lms",
-                "adaptive_data_type": "ACC3",
+                "adaptive_data_type": "ACC",
                 "TW": 8.0,
                 "TW_F": 0.0,
                 "best_tdelay_s": 1.0,
@@ -36,7 +36,7 @@ def _write_motion_records(root: Path, motion_type: str, final_aae: float) -> Non
                 "mode": "all_train",
                 "target_scope": "motion_only",
                 "filter_type": "lms",
-                "adaptive_data_type": "ACC3",
+                "adaptive_data_type": "ACC",
                 "TW": 8.0,
                 "TW_F": 0.0,
                 "baseline_aae_bpm": 3.0,
@@ -58,9 +58,9 @@ def _write_motion_records(root: Path, motion_type: str, final_aae: float) -> Non
                 "mode": "all_train",
                 "motion_frequency_hz": 1.5,
                 "penalty_ref_channel": "accx",
-                "cascade_scheme": "ACC3",
+                "cascade_scheme": "ACC",
                 "adaptive_filter": "lms",
-                "adaptive_data_type": "ACC3",
+                "adaptive_data_type": "ACC",
                 "TW": 8.0,
                 "TW_F": 0.0,
             }
@@ -74,23 +74,23 @@ def _write_motion_records(root: Path, motion_type: str, final_aae: float) -> Non
 
 def test_cross_motion_summary_reads_stage6_records_without_training(tmp_path: Path) -> None:
     results_root = tmp_path / "results"
-    _write_motion_records(results_root, "tiaosheng", 1.5)
-    _write_motion_records(results_root, "paobu", 2.5)
+    _write_motion_records(results_root, "write", 1.5)
+    _write_motion_records(results_root, "run", 2.5)
 
     out_path = rbp.build_cross_motion_summary_table(
         table_output_dir=tmp_path / "tables",
         results_root=results_root,
         adaptive_filter="lms",
-        adaptive_data_type="ACC3",
-        cascade_scheme="ACC3",
+        adaptive_data_type="ACC",
+        cascade_scheme="ACC",
         target_scope="motion_only",
         TW_F=0.0,
     )
 
     assert out_path.exists()
-    assert out_path.name == "summary_lms_ACC3_TW_F0s.csv"
+    assert out_path.name == "summary_lms_ACC_TW_F0s.csv"
     summary = pd.read_csv(out_path)
-    assert summary["motion_type"].tolist() == ["paobu", "tiaosheng"]
+    assert summary["motion_type"].tolist() == ["write", "run"]
     assert {
         "baseline_aae",
         "adaptive_aae",
@@ -100,4 +100,4 @@ def test_cross_motion_summary_reads_stage6_records_without_training(tmp_path: Pa
         "motion_frequency_hz",
         "penalty_ref_channel",
     }.issubset(summary.columns)
-    assert summary.loc[summary["motion_type"] == "tiaosheng", "final_source_distribution"].iloc[0]
+    assert summary.loc[summary["motion_type"] == "write", "final_source_distribution"].iloc[0]

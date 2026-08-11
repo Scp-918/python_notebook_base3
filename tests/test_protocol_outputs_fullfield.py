@@ -26,7 +26,7 @@ def _dataset_for_plot(fs: int = 20, duration_s: float = 80.0) -> ProtocolDataset
     accx[motion] = 0.5 * np.sin(2.0 * np.pi * 1.0 * t[motion])
     zeros = np.zeros_like(t)
     return ProtocolDataset(
-        sample_stem="multi_kaihe1",
+        sample_stem="subject_name_write_1",
         fs=fs,
         time_s=t,
         ppg_green=ppg,
@@ -49,48 +49,48 @@ def _dataset_for_plot(fs: int = 20, duration_s: float = 80.0) -> ProtocolDataset
 
 def test_plot_unaligned_fullfield_ppg_hr_by_motion_type_writes_png(tmp_path: Path) -> None:
     pair = SamplePair(
-        motion_id="kaihe1",
-        motion_type="kaihe",
+        motion_id="subject_name_write_1",
+        motion_type="write",
         motion_index=1,
-        stem="multi_kaihe1",
-        sensor_csv=tmp_path / "multi_kaihe1.csv",
-        ref_csv=tmp_path / "multi_kaihe1_ref.csv",
+        stem="subject_name_write_1",
+        sensor_csv=tmp_path / "subject_name_write_1_sensor.csv",
+        ref_csv=tmp_path / "subject_name_write_1_HRdata.csv",
     )
 
     paths = plot_unaligned_fullfield_ppg_hr_by_motion_type(
         pairs=[pair],
-        datasets={"kaihe1": _dataset_for_plot()},
+        datasets={"subject_name_write_1": _dataset_for_plot()},
         output_dir=tmp_path / "allfield",
         fs_target=20,
         TW=8,
     )
 
-    assert set(paths) == {"kaihe"}
-    assert paths["kaihe"].name == "kaihe_all_alignment_TW8.png"
-    assert paths["kaihe"].exists()
-    assert paths["kaihe"].stat().st_size > 0
+    assert set(paths) == {"write"}
+    assert paths["write"].name == "write_all_alignment_TW8.png"
+    assert paths["write"].exists()
+    assert paths["write"].stat().st_size > 0
 
 
 def test_plot_raw_ppg_and_unaligned_hr_by_motion_type_writes_rest_dual_axis_png(tmp_path: Path) -> None:
     pair = SamplePair(
-        motion_id="kaihe1",
-        motion_type="kaihe",
+        motion_id="subject_name_write_1",
+        motion_type="write",
         motion_index=1,
-        stem="multi_kaihe1",
+        stem="subject_name_write_1",
         sensor_csv=tmp_path / "missing_sensor.csv",
         ref_csv=tmp_path / "missing_ref.csv",
     )
 
     paths = plot_raw_ppg_and_unaligned_hr_by_motion_type(
         pairs=[pair],
-        datasets={"kaihe1": _dataset_for_plot()},
+        datasets={"subject_name_write_1": _dataset_for_plot()},
         output_dir=tmp_path / "allfield",
         fs_target=20,
         fs_origin=20,
         TW=8,
     )
 
-    assert set(paths) == {"kaihe"}
-    assert paths["kaihe"].name == "kaihe_rest_raw_ppg_hr_dual_axis_TW8.png"
-    assert paths["kaihe"].exists()
-    assert paths["kaihe"].stat().st_size > 0
+    assert set(paths) == {"write"}
+    assert paths["write"].name == "write_rest_raw_ppg_hr_dual_axis_TW8.png"
+    assert paths["write"].exists()
+    assert paths["write"].stat().st_size > 0

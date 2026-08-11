@@ -409,6 +409,7 @@ def run_batch_adaptive_protocol(
                 group_id=pair.motion_id,
                 motion_type=pair.motion_type,
                 fs_origin=fs_origin,
+                calibration=calibration,
             )
         except Exception as exc:
             load_failures.append(
@@ -2096,6 +2097,7 @@ def _mode_manifest_payload(result: _ModeOptimisation) -> dict[str, Any]:
         "motion_type": result.motion_type,
         "target_scope": result.target_scope.value,
         "cascade_scheme": result.cascade_scheme.value,
+        "cascade_scheme_display": result.cascade_scheme.display_name,
         "adaptive_filter": result.adaptive_filter,
         "objective_mode": result.objective_mode,
         "data_split_mode": result.data_split_mode,
@@ -2655,6 +2657,7 @@ def _best_params_alignment_record(result: _ModeOptimisation) -> dict[str, Any]:
         "cascade_scheme": result.cascade_scheme.value,
         "adaptive_filter": result.adaptive_filter,
         "adaptive_data_type": result.cascade_scheme.value,
+        "adaptive_data_type_display": result.cascade_scheme.display_name,
         "TW": float(params.TW),
         "TW_F": float(getattr(params, "TW_F", 0.0)),
         "Fs_Target": int(params.Fs_Target),
@@ -3880,7 +3883,13 @@ def build_cross_motion_summary_table(
             )
     summary = pd.DataFrame(rows)
     if not summary.empty:
-        summary = summary.sort_values(["motion_type", "target_scope", "split", "mode"]).reset_index(drop=True)
+        motion_rank = {motion.value: index for index, motion in enumerate(MotionType)}
+        summary["_motion_rank"] = summary["motion_type"].map(motion_rank).fillna(len(motion_rank))
+        summary = (
+            summary.sort_values(["_motion_rank", "target_scope", "split", "mode"])
+            .drop(columns="_motion_rank")
+            .reset_index(drop=True)
+        )
     out_path = output_dir / f"summary_{adaptive_filter}_{data_type}_{_tw_f_run_label(float(TW_F or 0.0))}.csv"
     summary.to_csv(out_path, index=False, encoding="utf-8-sig")
     return out_path
@@ -3892,10 +3901,12 @@ def _scan_stage6_motion_dirs(results_root: Path) -> list[Path]:
     base = results_root / "motion_types" if (results_root / "motion_types").exists() else results_root
     if not base.exists():
         return []
-    return sorted(
-        [path for path in base.iterdir() if path.is_dir() and (path / "best_metrics.csv").exists()],
-        key=lambda item: item.name,
-    )
+    present = {
+        path.name: path
+        for path in base.iterdir()
+        if path.is_dir() and (path / "best_metrics.csv").exists()
+    }
+    return [present[motion.value] for motion in MotionType if motion.value in present]
 
 
 def _filter_cross_motion_records(

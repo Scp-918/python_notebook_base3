@@ -1,6 +1,6 @@
 """CSV, JSON, and signal-figure outputs for the batch adaptive protocol.
 
-中文说明：主训练流程只写 QC 表、训练曲线数据、汇总表和 13 路信号图；HR 对比图
+中文说明：主训练流程只写 QC 表、训练曲线数据、汇总表和协议信号图；HR 对比图
 只由 Notebook 末尾的“手动重画最佳参数”函数输出。
 """
 
@@ -17,7 +17,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ..params import CascadeScheme, TargetScope
+from ..params import CascadeScheme, MotionType, TargetScope
+from ..preprocess.calibration import CalibrationCoefficients
 from .alignment import (
     align_ppg_to_ref_hr,
     compute_rest_alignment_diagnostic_curve,
@@ -142,7 +143,7 @@ def plot_rest_alignment_diagnostics_by_motion_type(
             grouped.setdefault(pair.motion_type, []).append(pair)
 
     paths: dict[str, Path] = {}
-    for motion_type, members in sorted(grouped.items()):
+    for motion_type, members in _ordered_motion_groups(grouped):
         members = sorted(members, key=lambda p: (p.motion_index, p.motion_id))
         n = max(1, len(members))
         cols = 2 if n > 1 else 1
@@ -259,7 +260,7 @@ def plot_unaligned_fullfield_ppg_hr_by_motion_type(
     paths: dict[str, Path] = {}
     tw_value = float(TW)
     hr_band_bpm = (float(hr_band_hz[0]) * 60.0, float(hr_band_hz[1]) * 60.0)
-    for motion_type, members in sorted(grouped.items()):
+    for motion_type, members in _ordered_motion_groups(grouped):
         members = sorted(members, key=lambda p: (p.motion_index, p.motion_id))
         n = max(1, len(members))
         cols = 2 if n > 1 else 1
@@ -395,7 +396,7 @@ def plot_raw_ppg_and_unaligned_hr_by_motion_type(
     paths: dict[str, Path] = {}
     tw_value = float(TW)
     hr_band_bpm = (float(hr_band_hz[0]) * 60.0, float(hr_band_hz[1]) * 60.0)
-    for motion_type, members in sorted(grouped.items()):
+    for motion_type, members in _ordered_motion_groups(grouped):
         members = sorted(members, key=lambda p: (p.motion_index, p.motion_id))
         n = max(1, len(members))
         cols = 2 if n > 1 else 1
@@ -555,19 +556,24 @@ def plot_signal_figures(
     group_id: str,
     motion_type: str,
     fs_origin: int = 100,
+    calibration: CalibrationCoefficients | None = None,
 ) -> dict[str, Path]:
     """Plot full raw/cleaned signals and motion-segment bandpassed signals.
 
-    中文说明：两张图都使用 5 个子图：HF、CF、PPG、ACC、Gyro。每个子图都有
+    中文说明：两张图使用 HF2、HF2comp、CF2、UD2、PPG、ACC、Gyro 子图。每个子图都有
     title、xlabel、ylabel、legend 和 grid，文件名包含 group_id 与 motion_type。
     """
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     plt = _prepare_matplotlib(out)
-    raw_frame, clean_frame = load_protocol_raw_clean_frames(sensor_csv, fs_origin=fs_origin)
-    full_path = out / f"raw_clean_13ch_{group_id}_{motion_type}.png"
-    motion_path = out / f"motion_bandpass_13ch_{group_id}_{motion_type}.png"
+    raw_frame, clean_frame = load_protocol_raw_clean_frames(
+        sensor_csv,
+        fs_origin=fs_origin,
+        calibration=calibration,
+    )
+    full_path = out / f"raw_clean_signals_{group_id}_{motion_type}.png"
+    motion_path = out / f"motion_bandpass_signals_{group_id}_{motion_type}.png"
 
     _plot_full_raw_clean(plt, raw_frame, clean_frame, full_path, group_id, motion_type)
     _plot_motion_bandpass(plt, dataset, segment_info, motion_path, group_id, motion_type)
@@ -682,7 +688,7 @@ def _plot_full_raw_clean(
     motion_type: str,
 ) -> None:
     groups = _plot_groups()
-    fig, axes = plt.subplots(5, 1, figsize=(14, 15), sharex=True)
+    fig, axes = plt.subplots(len(groups), 1, figsize=(14, 19), sharex=True)
     x = clean_frame["time_s"].to_numpy(dtype=float)
     for ax, (title, ylabel, names) in zip(axes, groups, strict=True):
         for name in names:
@@ -693,7 +699,7 @@ def _plot_full_raw_clean(
         ax.set_ylabel(ylabel)
         ax.legend(loc="upper right", ncol=min(3, len(names)), fontsize=7)
         ax.grid(True, alpha=0.25)
-    fig.suptitle(f"{group_id} / {motion_type} full raw and cleaned 13-channel signals", fontsize=14)
+    fig.suptitle(f"{group_id} / {motion_type} full raw and cleaned protocol signals", fontsize=14)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -722,7 +728,7 @@ def _plot_motion_bandpass(
         x = x - x[0]
 
     groups = _plot_groups()
-    fig, axes = plt.subplots(5, 1, figsize=(14, 15), sharex=True)
+    fig, axes = plt.subplots(len(groups), 1, figsize=(14, 19), sharex=True)
     for ax, (title, ylabel, names) in zip(axes, groups, strict=True):
         for name in names:
             ax.plot(x, frame.loc[mask, name].to_numpy(dtype=float), linewidth=1.0, label=name)
@@ -731,7 +737,7 @@ def _plot_motion_bandpass(
         ax.set_ylabel(ylabel)
         ax.legend(loc="upper right", ncol=min(3, len(names)), fontsize=8)
         ax.grid(True, alpha=0.25)
-    fig.suptitle(f"{group_id} / {motion_type} motion-segment bandpassed 13-channel signals", fontsize=14)
+    fig.suptitle(f"{group_id} / {motion_type} motion-segment bandpassed protocol signals", fontsize=14)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -739,12 +745,20 @@ def _plot_motion_bandpass(
 
 def _plot_groups() -> list[tuple[str, str, list[str]]]:
     return [
-        ("HF channels", "Amplitude (mV)", ["hf1", "hf2"]),
-        ("CF channels", "Ratio", ["cf1", "cf2"]),
+        ("HF2", "Amplitude (mV)", ["hf1", "hf2"]),
+        ("HF2comp", "Amplitude (mV)", ["hfcomp1", "hfcomp2"]),
+        ("CF2", "Amplitude (mV)", ["cf1", "cf2"]),
+        ("UD2", "Normalized amplitude", ["ud1", "ud2"]),
         ("PPG channels", "Amplitude (a.u.)", ["ppg_green", "ppg_red", "ppg_ir"]),
         ("ACC channels", "Amplitude (g)", ["accx", "accy", "accz"]),
         ("Gyro channels", "Amplitude (dps)", ["gyrox", "gyroy", "gyroz"]),
     ]
+
+
+def _ordered_motion_groups(grouped: dict[str, list[Any]]) -> list[tuple[str, list[Any]]]:
+    """Return present motion groups in the shared canonical order."""
+
+    return [(motion.value, grouped[motion.value]) for motion in MotionType if motion.value in grouped]
 
 
 def _mode_payload(result: ProtocolModeResult) -> dict[str, Any]:
