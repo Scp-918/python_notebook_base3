@@ -1,15 +1,12 @@
-"""Discovery of ``multi_<motion_type><index>.csv`` / ``*_ref.csv`` sample pairs.
-
-中文说明：本模块只做文件名层面的样本发现。传感器文件必须形如
-``multi_kaihe1.csv``，参考心率文件必须是同 stem 加 ``_ref``。没有配对的 CSV
-会写入 unpaired，不进入后续 QC、预处理或训练。
-"""
+"""Strict discovery of paired files inside one subject directory."""
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from ..params import MotionType
 
 __all__ = [
     "LEGAL_MOTION_TYPES",
@@ -21,8 +18,15 @@ __all__ = [
     "parse_motion_id",
 ]
 
-LEGAL_MOTION_TYPES = ("tiaosheng", "wanju", "fuwo", "kaihe", "bobi")
-_SENSOR_RE = re.compile(r"^multi_(?P<motion_id>[A-Za-z]+(?P<motion_index>\d+))$")
+LEGAL_MOTION_TYPES = tuple(item.value for item in MotionType)
+_FILE_RE = re.compile(
+    r"^(?P<subject>.+)_(?P<motion>write|gripper|run|rope)_"
+    r"(?P<index>\d+)_(?P<kind>sensor|HRdata)\.csv$"
+)
+_MOTION_RE = re.compile(
+    r"^(?:(?P<subject>.+)_)?(?P<motion>write|gripper|run|rope)_"
+    r"(?P<index>\d+)(?:_(?:sensor|HRdata)\.csv)?$"
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +43,13 @@ class SamplePair:
     stem: str
     sensor_csv: Path
     ref_csv: Path
+    subject: str = ""
+
+    @property
+    def sample_id(self) -> str:
+        """Return the canonical ``subject_motion_index`` identifier."""
+
+        return self.stem
 
 
 @dataclass(frozen=True)
@@ -48,6 +59,7 @@ class UnpairedSample:
     file_name: str
     file_path: Path
     reason: str
+    category: str = "unpaired"
 
 
 @dataclass(frozen=True)
@@ -59,110 +71,104 @@ class PairDiscovery:
 
 
 def parse_motion_id(stem_or_motion_id: str) -> tuple[str, int, str] | None:
-    """Parse motion type/index from ``kaihe1`` or ``multi_kaihe1``.
+    """Parse the canonical motion/index suffix from the right-hand side."""
 
-    中文说明：只接受当前实验定义的 5 类运动；非法类型返回 ``None``，调用方把
-    文件记入 unpaired 表，避免错误文件混入训练。
-    """
-
-    text = str(stem_or_motion_id).removeprefix("multi_").removesuffix("_ref")
-    for motion_type in LEGAL_MOTION_TYPES:
-        prefix = motion_type
-        suffix = text[len(prefix) :]
-        if text.startswith(prefix) and suffix.isdigit():
-            return motion_type, int(suffix), f"{motion_type}{int(suffix)}"
-    return None
+    match = _MOTION_RE.fullmatch(Path(str(stem_or_motion_id)).name)
+    if match is None:
+        return None
+    motion = match.group("motion")
+    index = int(match.group("index"))
+    subject = match.group("subject")
+    sample_id = f"{subject}_{motion}_{index}" if subject else f"{motion}_{index}"
+    return motion, index, sample_id
 
 
 def discover_sample_pairs(input_dir: Path) -> list[SamplePair]:
-    """Return paired ``multi_<motion_id>.csv`` samples from ``input_dir``."""
+    """Return valid pairs from one flat subject directory."""
 
     return discover_sample_pairs_with_unpaired(input_dir).pairs
 
 
 def discover_sample_pairs_with_unpaired(input_dir: Path) -> PairDiscovery:
-    """Discover valid sample pairs and all lone sensor/reference CSVs.
-
-    中文说明：先正向扫描传感器 CSV，再反向扫描孤立参考 CSV；所有 rejected 文件
-    都有明确 reason，Notebook 和 ``unpaired_samples.csv`` 可直接展示。
-    """
+    """Discover strict sensor/HR pairs and return every rejected CSV."""
 
     root = Path(input_dir)
-    csv_files = sorted(p for p in root.glob("*.csv") if p.is_file())
-    by_stem = {p.stem: p for p in csv_files}
+    if not root.is_dir():
+        raise NotADirectoryError(f"Subject directory not found: {root}")
+    subject = root.name
+    csv_files = sorted(
+        (path for path in root.iterdir() if path.is_file() and path.suffix.lower() == ".csv"),
+        key=lambda path: path.name,
+    )
+    accepted: dict[tuple[str, int, str], list[tuple[Path, re.Match[str]]]] = {}
+    unpaired: list[UnpairedSample] = []
+
+    for path in csv_files:
+        match = _FILE_RE.fullmatch(path.name)
+        if match is None:
+            unpaired.append(_issue(path, "invalid_name", "filename does not match the subject data contract"))
+            continue
+        if match.group("subject") != subject:
+            unpaired.append(
+                _issue(path, "subject_mismatch", f"filename subject must equal directory name {subject!r}")
+            )
+            continue
+        if not _has_data_row(path):
+            unpaired.append(_issue(path, "empty_data", "CSV contains no data rows"))
+            continue
+        key = (match.group("motion"), int(match.group("index")), match.group("kind"))
+        accepted.setdefault(key, []).append((path, match))
+
+    duplicate_keys = {key for key, items in accepted.items() if len(items) > 1}
+    for key in sorted(duplicate_keys):
+        for path, _ in accepted[key]:
+            unpaired.append(_issue(path, "duplicate", "duplicate file for normalized motion/index/kind"))
 
     pairs: list[SamplePair] = []
-    unpaired: list[UnpairedSample] = []
-    paired_ref_stems: set[str] = set()
-
-    for sensor in csv_files:
-        if sensor.stem.endswith("_ref"):
-            continue
-        match = _SENSOR_RE.match(sensor.stem)
-        parsed = parse_motion_id(sensor.stem)
-        if match is None or parsed is None:
-            unpaired.append(
-                UnpairedSample(
-                    file_name=sensor.name,
-                    file_path=sensor,
-                    reason=(
-                        "sensor name must match multi_<motion_type><index>.csv "
-                        f"with motion_type in {', '.join(LEGAL_MOTION_TYPES)}"
-                    ),
-                )
-            )
-            continue
-        motion_type, motion_index, motion_id = parsed
-        ref = None
-        ref_stem = ""
-        for suffix in ("_ref", "_HR_ref"):
-            candidate = f"{sensor.stem}{suffix}"
-            found = by_stem.get(candidate)
-            if found is not None:
-                ref = found
-                ref_stem = candidate
-                break
-        if ref is None:
-            unpaired.append(
-                UnpairedSample(
-                    file_name=sensor.name,
-                    file_path=sensor,
-                    reason=f"missing reference file (tried {sensor.stem}_ref.csv, {sensor.stem}_HR_ref.csv)",
-                )
-            )
-            continue
-        paired_ref_stems.add(ref_stem)
-        pairs.append(
-            SamplePair(
-                motion_id=motion_id,
-                motion_type=motion_type,
-                motion_index=motion_index,
-                stem=sensor.stem,
-                sensor_csv=sensor,
-                ref_csv=ref,
-            )
-        )
-
-    sensor_stems = {p.sensor_csv.stem for p in pairs}
-    for ref in csv_files:
-        if not (ref.stem.endswith("_ref") or ref.stem.endswith("_HR_ref")):
-            continue
-        sensor_stem = ref.stem
-        for suffix in ("_HR_ref", "_ref"):
-            if sensor_stem.endswith(suffix):
-                sensor_stem = sensor_stem.removesuffix(suffix)
-                break
-        if ref.stem in paired_ref_stems or sensor_stem in sensor_stems:
-            continue
-        unpaired.append(
-            UnpairedSample(
-                file_name=ref.name,
-                file_path=ref,
-                reason=f"missing sensor file {sensor_stem}.csv",
-            )
-        )
-
-    return PairDiscovery(
-        pairs=sorted(pairs, key=lambda x: (x.motion_type, x.motion_index, x.stem)),
-        unpaired=sorted(unpaired, key=lambda x: x.file_name),
+    motion_order = {motion: idx for idx, motion in enumerate(LEGAL_MOTION_TYPES)}
+    sample_keys = sorted(
+        {(motion, index) for motion, index, _ in accepted},
+        key=lambda item: (motion_order[item[0]], item[1]),
     )
+    for motion, index in sample_keys:
+        sensor_key = (motion, index, "sensor")
+        ref_key = (motion, index, "HRdata")
+        sensor_items = [] if sensor_key in duplicate_keys else accepted.get(sensor_key, [])
+        ref_items = [] if ref_key in duplicate_keys else accepted.get(ref_key, [])
+        if len(sensor_items) == 1 and len(ref_items) == 1:
+            sensor = sensor_items[0][0]
+            ref = ref_items[0][0]
+            sample_id = f"{subject}_{motion}_{index}"
+            pairs.append(
+                SamplePair(
+                    motion_id=sample_id,
+                    motion_type=motion,
+                    motion_index=index,
+                    stem=sample_id,
+                    sensor_csv=sensor,
+                    ref_csv=ref,
+                    subject=subject,
+                )
+            )
+            continue
+        if len(sensor_items) == 1:
+            unpaired.append(_issue(sensor_items[0][0], "missing_pair", "missing matching HRdata CSV"))
+        if len(ref_items) == 1:
+            unpaired.append(_issue(ref_items[0][0], "missing_pair", "missing matching sensor CSV"))
+
+    return PairDiscovery(pairs=pairs, unpaired=sorted(unpaired, key=lambda item: item.file_name))
+
+
+def _has_data_row(path: Path) -> bool:
+    """Return whether a CSV has at least one non-blank row after its header."""
+
+    try:
+        with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
+            next(handle, None)
+            return any(line.strip() for line in handle)
+    except OSError:
+        return False
+
+
+def _issue(path: Path, category: str, reason: str) -> UnpairedSample:
+    return UnpairedSample(path.name, path, reason, category)

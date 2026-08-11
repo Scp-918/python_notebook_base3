@@ -13,11 +13,21 @@ from typing import Any
 
 __all__ = [
     "CascadeScheme",
+    "MotionType",
     "ProtocolParams",
     "ProtocolSearchParams",
     "SolverParams",
     "TargetScope",
 ]
+
+
+class MotionType(str, Enum):
+    """Canonical motion types accepted by the subject-directory protocol."""
+
+    WRITE = "write"
+    GRIPPER = "gripper"
+    RUN = "run"
+    ROPE = "rope"
 
 
 class CascadeScheme(str, Enum):
