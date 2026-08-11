@@ -328,8 +328,8 @@ MAX_ITERATIONS = 200
 NUM_REPEATS = 1
 RANDOM_STATE = 42
 TW_F = 0.0
-UD_CALCULATION_MODE = "smoothed"
-UD_SMOOTHING_WINDOW_S = 0.1
+UD_CALCULATION_MODE = "smoothed"  # raw=原始 Uh/Uc 直接计算；smoothed=四路电压分别平滑后计算，默认为模式2。
+UD_SMOOTHING_WINDOW_S = 0.1  # 模式2中心移动中位数窗口(秒)；100 Hz 下 0.1 秒约为 10 点，可调。
 TRAIN_HR_POSTPROCESS_METHOD = "fft"  # 可选 fft/ssr，并进入运行目录名
 
 # 总开关：legacy 完全使用旧追踪；enhanced 再由下面六个布尔开关逐项控制。
