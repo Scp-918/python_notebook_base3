@@ -186,11 +186,23 @@ def _directional_final_limit(values: np.ndarray, params: Any) -> np.ndarray:
             continue
         diff = float(value) - previous
         if diff >= 0:
-            limit = float(getattr(params, "tracking_slew_limit_up_bpm", 10.0))
-            step = float(getattr(params, "tracking_slew_step_up_bpm", 7.0))
+            shared_limit = getattr(params, "tracking_slew_limit_up_bpm", None)
+            shared_step = getattr(params, "tracking_slew_step_up_bpm", None)
+            limit = float(
+                getattr(params, "slew_limit_bpm", 10.0) if shared_limit is None else shared_limit
+            )
+            step = float(
+                getattr(params, "slew_step_bpm", 7.0) if shared_step is None else shared_step
+            )
         else:
-            limit = float(getattr(params, "tracking_slew_limit_down_bpm", 10.0))
-            step = float(getattr(params, "tracking_slew_step_down_bpm", 7.0))
+            shared_limit = getattr(params, "tracking_slew_limit_down_bpm", None)
+            shared_step = getattr(params, "tracking_slew_step_down_bpm", None)
+            limit = float(
+                getattr(params, "slew_limit_bpm", 10.0) if shared_limit is None else shared_limit
+            )
+            step = float(
+                getattr(params, "slew_step_bpm", 7.0) if shared_step is None else shared_step
+            )
         if diff > limit:
             out[idx] = previous + step
         elif diff < -limit:

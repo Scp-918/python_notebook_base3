@@ -15,6 +15,16 @@ _MIN_EFFECTIVE_PENALTY_CONFIDENCE = 0.9
 _CHALLENGER_MIN_AMP_RATIO = 0.45
 
 
+@dataclass(frozen=True)
+class _DirectionalTrackingParams:
+    range_up_bpm: float
+    range_down_bpm: float
+    limit_up_bpm: float
+    step_up_bpm: float
+    limit_down_bpm: float
+    step_down_bpm: float
+
+
 @dataclass
 class SpectrumTrackingState:
     """Per-path state; callers create separate baseline/adaptive instances."""
@@ -98,6 +108,7 @@ def track_spectrum_candidates(
     raw_order = peak_idx[np.argsort(-amps[peak_idx], kind="stable")]
 
     previous = _finite_positive(previous_hr_bpm)
+    directional = _directional_tracking_params(params, path=path, window_kind=window_kind)
     penalty_enabled = bool(enable_penalty and getattr(params, "enable_dynamic_penalty", True))
     penalty_centers: tuple[float, ...] = ()
     confidence = 1.0
@@ -130,12 +141,9 @@ def track_spectrum_candidates(
         effective_weight,
         previous if bool(getattr(params, "enable_continuity_protection", True)) and window_kind == "motion" else None,
         min(
-            float(getattr(params, "tracking_range_up_bpm", 25.0)),
-            float(getattr(params, "tracking_range_down_bpm", 25.0)),
-            max(
-                float(getattr(params, "tracking_slew_step_up_bpm", 7.0)),
-                float(getattr(params, "tracking_slew_step_down_bpm", 7.0)),
-            ),
+            directional.range_up_bpm,
+            directional.range_down_bpm,
+            max(directional.step_up_bpm, directional.step_down_bpm),
         ),
     )
     scores = amps * weights
@@ -153,8 +161,8 @@ def track_spectrum_candidates(
     if previous is None:
         chosen = int(scored_order[0]) if scored_order.size else (int(all_order[0]) if all_order.size else None)
     else:
-        down = float(getattr(params, "tracking_range_down_bpm", getattr(params, "hr_range_hz", 25 / 60) * 60))
-        up = float(getattr(params, "tracking_range_up_bpm", getattr(params, "hr_range_hz", 25 / 60) * 60))
+        down = directional.range_down_bpm
+        up = directional.range_up_bpm
         search_min, search_max = previous - down, previous + up
         chosen = _first_in_range(freq_bpm, scored_order, search_min, search_max)
         if chosen is None and not penalty_enabled:
@@ -181,7 +189,7 @@ def track_spectrum_candidates(
     if chosen is not None:
         ranks = np.flatnonzero(all_order == chosen)
         selected_rank = int(ranks[0]) + 1 if ranks.size else 0
-    limited = _directional_slew(previous, tracked, params)
+    limited = _directional_slew(previous, tracked, params, directional)
 
     low_requested = bool(getattr(params, "enable_low_lock_recovery", True))
     low_effective = low_requested and path == "adaptive" and str(adaptive_filter).lower() == "lms"
@@ -255,6 +263,64 @@ def _finite_positive(value: float | None) -> float | None:
     return float(value) if value is not None and np.isfinite(value) and value > 0 else None
 
 
+def _directional_tracking_params(params: object, *, path: str, window_kind: str) -> _DirectionalTrackingParams:
+    kind = str(window_kind).strip().lower()
+    path_name = str(path).strip().lower()
+    if path_name == "baseline":
+        kind = "rest"
+    if kind not in {"rest", "motion", "recovery"}:
+        raise ValueError(f"unsupported enhanced-tracking window_kind: {window_kind!r}")
+
+    if path_name == "fft_post_motion_reset":
+        up_step = float(getattr(params, "post_motion_guard_recovery_step_up_bpm", 1.5))
+        down_step = float(getattr(params, "post_motion_guard_recovery_step_down_bpm", 3.0))
+        values = _DirectionalTrackingParams(
+            range_up_bpm=float(getattr(params, "recovery_tracking_range_up_bpm", 20.0)),
+            range_down_bpm=float(getattr(params, "recovery_tracking_range_down_bpm", 25.0)),
+            limit_up_bpm=up_step,
+            step_up_bpm=up_step,
+            limit_down_bpm=down_step,
+            step_down_bpm=down_step,
+        )
+    elif kind == "rest":
+        values = _DirectionalTrackingParams(
+            range_up_bpm=float(getattr(params, "Rest_HR_Track_Band_BPM", 30.0)),
+            range_down_bpm=float(getattr(params, "Rest_HR_Track_Band_BPM", 30.0)),
+            limit_up_bpm=float(getattr(params, "Rest_HR_Slew_Limit_BPM", 6.0)),
+            step_up_bpm=float(getattr(params, "Rest_HR_Slew_Step_BPM", 4.0)),
+            limit_down_bpm=float(getattr(params, "Rest_HR_Slew_Limit_BPM", 6.0)),
+            step_down_bpm=float(getattr(params, "Rest_HR_Slew_Step_BPM", 4.0)),
+        )
+    else:
+        prefix = "motion" if kind == "motion" else "recovery"
+        defaults = (35.0, 15.0, 5.5, 3.5, 2.0, 1.5) if kind == "motion" else (
+            20.0, 25.0, 1.5, 1.5, 3.5, 3.0
+        )
+        values = _DirectionalTrackingParams(
+            range_up_bpm=float(getattr(params, f"{prefix}_tracking_range_up_bpm", defaults[0])),
+            range_down_bpm=float(getattr(params, f"{prefix}_tracking_range_down_bpm", defaults[1])),
+            limit_up_bpm=float(getattr(params, f"{prefix}_tracking_slew_limit_up_bpm", defaults[2])),
+            step_up_bpm=float(getattr(params, f"{prefix}_tracking_slew_step_up_bpm", defaults[3])),
+            limit_down_bpm=float(getattr(params, f"{prefix}_tracking_slew_limit_down_bpm", defaults[4])),
+            step_down_bpm=float(getattr(params, f"{prefix}_tracking_slew_step_down_bpm", defaults[5])),
+        )
+
+    shared_names = (
+        "tracking_range_up_bpm",
+        "tracking_range_down_bpm",
+        "tracking_slew_limit_up_bpm",
+        "tracking_slew_step_up_bpm",
+        "tracking_slew_limit_down_bpm",
+        "tracking_slew_step_down_bpm",
+    )
+    resolved = list(values.__dict__.values())
+    for idx, name in enumerate(shared_names):
+        override = getattr(params, name, None)
+        if override is not None:
+            resolved[idx] = float(override)
+    return _DirectionalTrackingParams(*resolved)
+
+
 def _penalty_confidence(values: np.ndarray) -> float:
     amps = np.asarray(values, dtype=float)
     amps = np.sort(amps[np.isfinite(amps) & (amps > 0)])[::-1]
@@ -315,16 +381,16 @@ def _challenger(freq_bpm, amps, order, low, high, centers, width, current):
     return None
 
 
-def _directional_slew(previous, tracked, params):
+def _directional_slew(previous, tracked, params, directional):
     if previous is None or not bool(getattr(params, "enable_directional_tracking", True)):
         return float(tracked)
     diff = float(tracked) - previous
     if diff >= 0:
-        limit = float(getattr(params, "tracking_slew_limit_up_bpm", 10.0))
-        step = float(getattr(params, "tracking_slew_step_up_bpm", 7.0))
+        limit = directional.limit_up_bpm
+        step = directional.step_up_bpm
     else:
-        limit = float(getattr(params, "tracking_slew_limit_down_bpm", 10.0))
-        step = float(getattr(params, "tracking_slew_step_down_bpm", 7.0))
+        limit = directional.limit_down_bpm
+        step = directional.step_down_bpm
     if diff > limit:
         return previous + step
     if diff < -limit:

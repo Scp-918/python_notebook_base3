@@ -60,6 +60,104 @@ def test_directional_tracking_uses_asymmetric_range_and_slew() -> None:
     assert hr2 == pytest.approx(93.0)
 
 
+def test_reference_directional_defaults_are_selected_by_path_and_stage() -> None:
+    freq, amp = _spectrum({88: 0.8, 132: 1.0})
+    params = ProtocolTrialParams()
+
+    baseline_hr, baseline_trace = track_spectrum_candidates(
+        freq,
+        amp,
+        previous_hr_bpm=100.0,
+        params=params,
+        state=SpectrumTrackingState(),
+        window_kind="motion",
+        path="baseline",
+    )
+    motion_hr, motion_trace = track_spectrum_candidates(
+        freq,
+        amp,
+        previous_hr_bpm=100.0,
+        params=params,
+        state=SpectrumTrackingState(),
+        window_kind="motion",
+        path="adaptive",
+    )
+    recovery_hr, recovery_trace = track_spectrum_candidates(
+        freq,
+        amp,
+        previous_hr_bpm=100.0,
+        params=params,
+        state=SpectrumTrackingState(),
+        window_kind="recovery",
+        path="adaptive",
+    )
+
+    assert (baseline_trace.search_min_bpm, baseline_trace.search_max_bpm) == pytest.approx(
+        (70.0, 130.0)
+    )
+    assert baseline_hr == pytest.approx(96.0)
+    assert (motion_trace.search_min_bpm, motion_trace.search_max_bpm) == pytest.approx(
+        (85.0, 135.0)
+    )
+    assert motion_hr == pytest.approx(103.5)
+    assert (recovery_trace.search_min_bpm, recovery_trace.search_max_bpm) == pytest.approx(
+        (75.0, 120.0)
+    )
+    assert recovery_hr == pytest.approx(97.0)
+
+
+def test_post_motion_reset_uses_reference_specific_recovery_slew() -> None:
+    freq = np.arange(0.5, 4.001, 0.1 / 60.0)
+    amp = np.full(freq.size, 0.001)
+    peak_idx = int(np.argmin(np.abs(freq * 60.0 - 96.7)))
+    amp[peak_idx - 1 : peak_idx + 2] = [0.01, 1.0, 0.01]
+    params = ProtocolTrialParams()
+
+    adaptive_hr, _ = track_spectrum_candidates(
+        freq,
+        amp,
+        previous_hr_bpm=100.0,
+        params=params,
+        state=SpectrumTrackingState(),
+        window_kind="recovery",
+        path="adaptive",
+    )
+    reset_hr, _ = track_spectrum_candidates(
+        freq,
+        amp,
+        previous_hr_bpm=100.0,
+        params=params,
+        state=SpectrumTrackingState(),
+        window_kind="recovery",
+        path="fft_post_motion_reset",
+    )
+
+    assert adaptive_hr == pytest.approx(96.7)
+    assert reset_hr == pytest.approx(97.0)
+
+
+def test_deprecated_shared_directional_fields_explicitly_override_all_stages() -> None:
+    freq, amp = _spectrum({120: 1.0})
+    params = ProtocolTrialParams(
+        tracking_range_up_bpm=40.0,
+        tracking_slew_limit_up_bpm=6.0,
+        tracking_slew_step_up_bpm=3.0,
+    )
+
+    for window_kind, path in (("rest", "baseline"), ("motion", "adaptive"), ("recovery", "adaptive")):
+        hr, trace = track_spectrum_candidates(
+            freq,
+            amp,
+            previous_hr_bpm=90.0,
+            params=params,
+            state=SpectrumTrackingState(),
+            window_kind=window_kind,
+            path=path,
+        )
+        assert trace.search_max_bpm == pytest.approx(130.0)
+        assert hr == pytest.approx(93.0)
+
+
 def test_dynamic_penalty_uses_confidence_and_only_existing_harmonic() -> None:
     freq, amp = _spectrum({60: 1.0, 120: 0.8, 150: 0.7})
     _, trace = track_spectrum_candidates(

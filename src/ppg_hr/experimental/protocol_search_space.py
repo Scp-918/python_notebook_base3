@@ -137,12 +137,26 @@ class ProtocolTrialParams:
     enable_low_lock_recovery: bool = True
     enable_high_lock_recovery: bool = True
     enable_post_motion_protection: bool = True
-    tracking_range_up_bpm: float = 25.0
-    tracking_range_down_bpm: float = 25.0
-    tracking_slew_limit_up_bpm: float = 10.0
-    tracking_slew_step_up_bpm: float = 7.0
-    tracking_slew_limit_down_bpm: float = 10.0
-    tracking_slew_step_down_bpm: float = 7.0
+    # Reference-v2 phase-specific directional tracking. Deprecated shared fields remain
+    # optional so an explicit old caller override still applies to every phase.
+    tracking_range_up_bpm: float | None = None
+    tracking_range_down_bpm: float | None = None
+    tracking_slew_limit_up_bpm: float | None = None
+    tracking_slew_step_up_bpm: float | None = None
+    tracking_slew_limit_down_bpm: float | None = None
+    tracking_slew_step_down_bpm: float | None = None
+    motion_tracking_range_up_bpm: float = 35.0
+    motion_tracking_range_down_bpm: float = 15.0
+    motion_tracking_slew_limit_up_bpm: float = 5.5
+    motion_tracking_slew_step_up_bpm: float = 3.5
+    motion_tracking_slew_limit_down_bpm: float = 2.0
+    motion_tracking_slew_step_down_bpm: float = 1.5
+    recovery_tracking_range_up_bpm: float = 20.0
+    recovery_tracking_range_down_bpm: float = 25.0
+    recovery_tracking_slew_limit_up_bpm: float = 1.5
+    recovery_tracking_slew_step_up_bpm: float = 1.5
+    recovery_tracking_slew_limit_down_bpm: float = 3.5
+    recovery_tracking_slew_step_down_bpm: float = 3.0
     low_lock_min_bpm: float = 50.0
     low_lock_max_bpm: float = 80.0
     low_lock_min_windows: int = 4

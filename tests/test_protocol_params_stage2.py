@@ -52,6 +52,9 @@ def test_stage1_search_space_uses_stabilized_candidate_lists() -> None:
     assert space.options("klms_step_size") == [0.005, 0.01, 0.02, 0.05]
     assert space.options("klms_sigma") == [0.5, 1.0, 2.0, 5.0]
     assert space.options("klms_epsilon") == [0.005, 0.01, 0.02, 0.05, 0.1]
+    assert space.options("Rest_HR_Track_Band_BPM") == [20.0, 30.0, 60.0, 80.0]
+    assert space.options("Rest_HR_Slew_Limit_BPM") == [1.0, 3.0, 6.0, 8.0]
+    assert space.options("Rest_HR_Slew_Step_BPM") == [0.5, 2.0, 4.0]
 
 
 def test_stage1_fixed_rest_params_remain_overrideable() -> None:

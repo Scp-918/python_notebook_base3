@@ -119,13 +119,13 @@ class ProtocolSearchParams:
     slew_limit_bpm: list[int] = field(default_factory=lambda: [8, 10, 12, 14])
     slew_step_bpm: list[int] = field(default_factory=lambda: [5, 7, 9])
     Rest_HR_Track_Band_BPM: list[float] = field(
-        default_factory=lambda: [20.0, 30.0, 50.0, 60.0, 80.0]
+        default_factory=lambda: [20.0, 30.0, 60.0, 80.0]
     )
     Rest_HR_Slew_Limit_BPM: list[float] = field(
-        default_factory=lambda: [1.0, 3.0, 5.0, 6.0, 8.0, 25.0]
+        default_factory=lambda: [1.0, 3.0, 6.0, 8.0]
     )
     Rest_HR_Slew_Step_BPM: list[float] = field(
-        default_factory=lambda: [0.5, 2.0, 4.0, 5.0, 8.0, 12.0]
+        default_factory=lambda: [0.5, 2.0, 4.0]
     )
     LMS_Mu_Base: list[float] = field(default_factory=lambda: [0.004, 0.006, 0.008])
     RFF_LMS_Mu_Base: list[float] = field(default_factory=lambda: [0.001, 0.002, 0.004, 0.006])
