@@ -45,6 +45,8 @@ def test_notebook_has_layered_protocol_configuration() -> None:
     assert "build_subject_output_dir(" in first
     assert "OUTPUT_ROOT = SUBJECT_DIR.parent / \"outputs\"" in first
     assert "RUN_OUTPUT_DIR = build_subject_output_dir(" in first
+    assert 'UD_CALCULATION_MODE = "smoothed"' in first
+    assert "UD_SMOOTHING_WINDOW_S = 0.1" in first
     for name in (
         "FS_ORIGIN",
         "TW_F",
@@ -128,6 +130,8 @@ def test_notebook_adds_subject_batch_target_redraw_section_and_mode_progress() -
     assert any(line.startswith("## 16.") for line in headings)
     assert "redraw_subject_target_hr_curves(" in joined
     assert "progress_callback=notebook_progress" in joined
+    assert "ud_calculation_mode=UD_CALCULATION_MODE" in joined
+    assert "ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S" in joined
     assert 'info.get("stage") != "optimization_mode_completed"' in joined
     assert "posthoc_final_aae_bpm" in joined
     assert "acc_compare_posthoc_aae_bpm" in joined

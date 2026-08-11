@@ -18,6 +18,8 @@ CONFIG_LINE_RE = re.compile(
 CONFIG_COMMENTS = {
     # Sampling, preprocessing, alignment, post-hoc alignment and recovery.
     "FS_ORIGIN": "原始采样率(Hz)；change6/Pydisplay 数据固定按 100 Hz 与序号校验。",
+    "UD_CALCULATION_MODE": "UD 公式输入模式；raw 直接使用原始 Uh/Uc，smoothed 先分别平滑四路电压再计算。",
+    "UD_SMOOTHING_WINDOW_S": "模式 smoothed 的中心移动中位数窗口(秒)；100 Hz 下 0.1 秒约为 10 点。",
     "FS_TARGET": "预览绘图目标采样率(Hz)；训练候选由 SEARCH_SPACE.Fs_Target 单独控制。",
     "TW": "预览分段窗口长度(秒)；训练窗口候选由 SEARCH_SPACE.TW 控制。",
     "TW_F": "自适应滤波前置收敛上下文(秒)；0 表示不额外增加前置上下文。",
@@ -326,6 +328,8 @@ MAX_ITERATIONS = 200
 NUM_REPEATS = 1
 RANDOM_STATE = 42
 TW_F = 0.0
+UD_CALCULATION_MODE = "smoothed"
+UD_SMOOTHING_WINDOW_S = 0.1
 TRAIN_HR_POSTPROCESS_METHOD = "fft"  # 可选 fft/ssr，并进入运行目录名
 
 # 总开关：legacy 完全使用旧追踪；enhanced 再由下面六个布尔开关逐项控制。
@@ -776,6 +780,8 @@ if RUN_PREPROCESS_PREVIEW and discovery is not None:
             preview_pair.ref_csv,
             fs_origin=FS_ORIGIN,
             calibration=calibration,
+            ud_calculation_mode=UD_CALCULATION_MODE,
+            ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S,
         )
         datasets[preview_pair.motion_id] = preview_dataset
         preview_segment = detect_activity_segments(
@@ -808,7 +814,12 @@ if RUN_ALIGNMENT_DIAGNOSTICS and discovery is not None:
     for pair in discovery.pairs:
         if pair.motion_id not in datasets:
             datasets[pair.motion_id] = load_and_preprocess_protocol(
-                pair.sensor_csv, pair.ref_csv, fs_origin=FS_ORIGIN, calibration=calibration
+                pair.sensor_csv,
+                pair.ref_csv,
+                fs_origin=FS_ORIGIN,
+                calibration=calibration,
+                ud_calculation_mode=UD_CALCULATION_MODE,
+                ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S,
             )
     alignment_paths = plot_rest_alignment_diagnostics_by_motion_type(
         discovery.pairs,
@@ -841,7 +852,12 @@ if RUN_FULLFIELD_PLOT and discovery is not None:
     for pair in discovery.pairs:
         if pair.motion_id not in datasets:
             datasets[pair.motion_id] = load_and_preprocess_protocol(
-                pair.sensor_csv, pair.ref_csv, fs_origin=FS_ORIGIN, calibration=calibration
+                pair.sensor_csv,
+                pair.ref_csv,
+                fs_origin=FS_ORIGIN,
+                calibration=calibration,
+                ud_calculation_mode=UD_CALCULATION_MODE,
+                ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S,
             )
     fullfield_paths = plot_unaligned_fullfield_ppg_hr_by_motion_type(
         discovery.pairs,
@@ -899,6 +915,8 @@ def run_training_cell(*, max_iterations, target_scopes, cascade_schemes, adaptiv
         random_state=RANDOM_STATE,
         num_seed_points=NUM_SEED_POINTS,
         fs_origin=FS_ORIGIN,
+        ud_calculation_mode=UD_CALCULATION_MODE,
+        ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S,
         parallel_repeats=PARALLEL_REPEATS,
         n_jobs=N_JOBS,
         trial_cache_max_entries=TRIAL_CACHE_MAX_ENTRIES,
@@ -936,7 +954,12 @@ if RUN_RAW_PPG_PLOT and discovery is not None:
     for pair in discovery.pairs:
         if pair.motion_id not in datasets:
             datasets[pair.motion_id] = load_and_preprocess_protocol(
-                pair.sensor_csv, pair.ref_csv, fs_origin=FS_ORIGIN, calibration=calibration
+                pair.sensor_csv,
+                pair.ref_csv,
+                fs_origin=FS_ORIGIN,
+                calibration=calibration,
+                ud_calculation_mode=UD_CALCULATION_MODE,
+                ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S,
             )
     raw_ppg_paths = plot_raw_ppg_and_unaligned_hr_by_motion_type(
         discovery.pairs,
@@ -1092,6 +1115,8 @@ if RUN_STAGE7_REPLAY:
         cascade_scheme=REPLAY_CASCADE_SCHEME,
         TW_F=REPLAY_TW_F,
         fs_origin=FS_ORIGIN,
+        ud_calculation_mode=UD_CALCULATION_MODE,
+        ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S,
         guard_ratio_min_override=REPLAY_GUARD_RATIO_MIN_OVERRIDE,
         guard_ratio_max_override=REPLAY_GUARD_RATIO_MAX_OVERRIDE,
         guard_flat_std_eps_override=REPLAY_GUARD_FLAT_STD_EPS_OVERRIDE,
@@ -1134,6 +1159,8 @@ if RUN_WINDOW_DIAGNOSTICS:
         cascade_scheme=REPLAY_CASCADE_SCHEME,
         TW_F=REPLAY_TW_F,
         fs_origin=FS_ORIGIN,
+        ud_calculation_mode=UD_CALCULATION_MODE,
+        ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S,
         guard_ratio_min_override=REPLAY_GUARD_RATIO_MIN_OVERRIDE,
         guard_ratio_max_override=REPLAY_GUARD_RATIO_MAX_OVERRIDE,
         guard_flat_std_eps_override=REPLAY_GUARD_FLAT_STD_EPS_OVERRIDE,
@@ -1211,6 +1238,8 @@ if RUN_CROSS_STAGE7_REPLAY:
         override_cascade_scheme=CROSS_APPLIED_SCHEME,
         TW_F=CROSS_TW_F,
         fs_origin=FS_ORIGIN,
+        ud_calculation_mode=UD_CALCULATION_MODE,
+        ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S,
         postprocess_method_override=REDRAW_HR_POSTPROCESS_METHOD,
     )
     print(cross_replay_paths)
@@ -1246,6 +1275,8 @@ if RUN_CROSS_WINDOW_DIAGNOSTICS:
         override_cascade_scheme=CROSS_APPLIED_SCHEME,
         TW_F=CROSS_TW_F,
         fs_origin=FS_ORIGIN,
+        ud_calculation_mode=UD_CALCULATION_MODE,
+        ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S,
         postprocess_method_override=REDRAW_HR_POSTPROCESS_METHOD,
     )
     print(cross_window_diagnostics)
@@ -1286,6 +1317,8 @@ if RUN_BATCH_REFERENCE_COMPARE:
         best_param_csv_path=REFERENCE_COMPARE_BEST_PARAMS_CSV,
         output_dir=REFERENCE_COMPARE_OUTPUT_DIR,
         fs_origin=FS_ORIGIN,
+        ud_calculation_mode=UD_CALCULATION_MODE,
+        ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S,
     )
     print(reference_compare_paths)
     display(pd.read_csv(reference_compare_paths["csv"]))
@@ -1321,6 +1354,8 @@ if RUN_BATCH_TARGET_HR_REDRAW:
         TW_F=BATCH_TARGET_TW_F,
         output_dir=BATCH_TARGET_OUTPUT_DIR,
         fs_origin=FS_ORIGIN,
+        ud_calculation_mode=UD_CALCULATION_MODE,
+        ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S,
         postprocess_method_override=REDRAW_HR_POSTPROCESS_METHOD,
     )
     success_count = int((batch_target_manifest["status"] == "ok").sum())
