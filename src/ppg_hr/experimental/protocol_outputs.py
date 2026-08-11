@@ -557,6 +557,8 @@ def plot_signal_figures(
     motion_type: str,
     fs_origin: int = 100,
     calibration: CalibrationCoefficients | None = None,
+    ud_calculation_mode: str = "smoothed",
+    ud_smoothing_window_s: float = 0.1,
 ) -> dict[str, Path]:
     """Plot full raw/cleaned signals and motion-segment bandpassed signals.
 
@@ -571,6 +573,8 @@ def plot_signal_figures(
         sensor_csv,
         fs_origin=fs_origin,
         calibration=calibration,
+        ud_calculation_mode=ud_calculation_mode,
+        ud_smoothing_window_s=ud_smoothing_window_s,
     )
     full_path = out / f"raw_clean_signals_{group_id}_{motion_type}.png"
     motion_path = out / f"motion_bandpass_signals_{group_id}_{motion_type}.png"

@@ -44,6 +44,8 @@ def test_default_batch_contract_is_single_subject_all_train_post10_lms_200_trial
     assert signature.parameters["num_repeats"].default == 1
     assert signature.parameters["objective_mode"].default == "posthoc_aae"
     assert signature.parameters["data_split_mode"].default == "all_train"
+    assert signature.parameters["ud_calculation_mode"].default == "smoothed"
+    assert signature.parameters["ud_smoothing_window_s"].default == 0.1
     assert ProtocolParams().max_iterations == 200
     assert ProtocolParams().num_repeats == 1
     assert ProtocolTrialParams().ppg_input_transform == "log_absorbance"
@@ -160,12 +162,19 @@ def test_mode_checkpoint_fingerprint_covers_inputs_calibration_space_and_budget(
 
 
 def test_ud_preprocessing_marker_only_invalidates_ud_modes() -> None:
-    marker = {"ud_preprocessing": "calibrated_formula_qc_interpolated_no_bandpass_v1"}
+    marker = {
+        "ud_preprocessing": "calibrated_formula_optional_voltage_smoothing_no_bandpass_v2",
+        "ud_calculation_mode": "smoothed",
+        "ud_smoothing_method": "centered_moving_median",
+        "ud_smoothing_window_s": 0.1,
+        "ud_smoothing_window_samples": 10,
+    }
 
-    assert rbp._ud_preprocessing_fingerprint_fields(CascadeScheme.UD2) == marker
-    assert rbp._ud_preprocessing_fingerprint_fields(CascadeScheme.ACC_UD2) == marker
-    assert rbp._ud_preprocessing_fingerprint_fields(CascadeScheme.ACC) == {}
-    assert rbp._ud_preprocessing_fingerprint_fields(CascadeScheme.HF2) == {}
+    kwargs = {"mode": "smoothed", "window_s": 0.1, "window_samples": 10}
+    assert rbp._ud_preprocessing_fingerprint_fields(CascadeScheme.UD2, **kwargs) == marker
+    assert rbp._ud_preprocessing_fingerprint_fields(CascadeScheme.ACC_UD2, **kwargs) == marker
+    assert rbp._ud_preprocessing_fingerprint_fields(CascadeScheme.ACC, **kwargs) == {}
+    assert rbp._ud_preprocessing_fingerprint_fields(CascadeScheme.HF2, **kwargs) == {}
 
 
 def test_one_all_train_objective_receives_all_indices_of_one_motion(monkeypatch) -> None:

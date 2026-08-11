@@ -13,6 +13,7 @@ from ppg_hr.experimental.preprocess_protocol import (
 )
 from ppg_hr.preprocess.calibration import CalibrationCoefficients, load_subject_calibration
 from ppg_hr.preprocess.data_loader import PYDISPLAY_SENSOR_COLUMNS
+from ppg_hr.preprocess.utils import smoothdata_movmedian
 
 
 def _write_calibration(
@@ -183,3 +184,60 @@ def test_new_voltage_formulas_and_near_zero_denominator_qc(tmp_path: Path) -> No
     np.testing.assert_allclose(dataset.ud2, clean["ud2"].to_numpy(dtype=float))
     assert dataset.source_metadata["ud_preprocessing"] == "calibrated_formula_qc_interpolated_no_bandpass"
     assert len(dataset.time_s) == 240
+
+
+def test_ud_calculation_supports_raw_and_smoothed_voltage_modes(tmp_path: Path) -> None:
+    subject = tmp_path / "pjy"
+    subject.mkdir()
+    _write_calibration(tmp_path)
+    sensor = subject / "pjy_write_1_sensor.csv"
+    _write_sensor(sensor)
+    calibration = load_subject_calibration(subject)
+
+    raw, clean_raw = load_protocol_raw_clean_frames(
+        sensor,
+        calibration=calibration,
+        ud_calculation_mode="raw",
+        ud_smoothing_window_s=0.05,
+    )
+    _, clean_smoothed = load_protocol_raw_clean_frames(
+        sensor,
+        calibration=calibration,
+        ud_calculation_mode="smoothed",
+        ud_smoothing_window_s=0.05,
+    )
+    window = 5
+    uh2 = smoothdata_movmedian(raw["Uh2"].to_numpy(dtype=float), window)
+    uh3 = smoothdata_movmedian(raw["Uh3"].to_numpy(dtype=float), window)
+    uc2 = smoothdata_movmedian(raw["Uc2"].to_numpy(dtype=float), window)
+    uc3 = smoothdata_movmedian(raw["Uc3"].to_numpy(dtype=float), window)
+
+    np.testing.assert_allclose(clean_raw["ud1"], raw["ud1"])
+    np.testing.assert_allclose(clean_raw["ud2"], raw["ud2"])
+    np.testing.assert_allclose(clean_smoothed["ud1"], (uh2 - uc2) / (calibration.c2 - uc2))
+    np.testing.assert_allclose(clean_smoothed["ud2"], (uh3 - uc3) / (calibration.c3 - uc3))
+    assert not np.allclose(clean_smoothed["ud1"], clean_raw["ud1"])
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"ud_calculation_mode": "invalid"}, "ud_calculation_mode"),
+        ({"ud_smoothing_window_s": 0.0}, "ud_smoothing_window_s"),
+    ],
+)
+def test_ud_calculation_rejects_invalid_configuration(
+    tmp_path: Path,
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    subject = tmp_path / "pjy"
+    subject.mkdir()
+    _write_calibration(tmp_path)
+    sensor = subject / "pjy_write_1_sensor.csv"
+    ref = subject / "pjy_write_1_HRdata.csv"
+    _write_sensor(sensor)
+    _write_hr(ref)
+
+    with pytest.raises(ValueError, match=message):
+        load_and_preprocess_protocol(sensor, ref, **kwargs)

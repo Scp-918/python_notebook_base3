@@ -22,6 +22,7 @@ from ..preprocess.utils import (
     fillmissing_nearest,
     filloutliers_mean_previous,
     filloutliers_movmedian_linear,
+    smoothdata_movmedian,
 )
 
 __all__ = [
@@ -164,6 +165,8 @@ def load_and_preprocess_protocol(
     fs_origin: int = 100,
     *,
     calibration: CalibrationCoefficients | None = None,
+    ud_calculation_mode: str = "smoothed",
+    ud_smoothing_window_s: float = 0.1,
 ) -> ProtocolDataset:
     """Load one sensor/reference pair for the batch adaptive protocol.
 
@@ -175,7 +178,18 @@ def load_and_preprocess_protocol(
 
     sensor_path = Path(sensor_csv)
     calibration = calibration or load_subject_calibration(sensor_path.parent)
-    clean_frame, sequence_metadata = _build_clean_frame(sensor_path, int(fs_origin), calibration)
+    ud_mode, ud_window_samples = _validate_ud_calculation_config(
+        ud_calculation_mode,
+        ud_smoothing_window_s,
+        int(fs_origin),
+    )
+    clean_frame, sequence_metadata = _build_clean_frame(
+        sensor_path,
+        int(fs_origin),
+        calibration,
+        ud_calculation_mode=ud_mode,
+        ud_smoothing_window_samples=ud_window_samples,
+    )
     fs = int(fs_origin)
 
     raw_ppg_green = clean_frame["ppg_green"].to_numpy(dtype=float)
@@ -233,6 +247,10 @@ def load_and_preprocess_protocol(
             **calibration.to_metadata(),
             **sequence_metadata,
             "ud_preprocessing": "calibrated_formula_qc_interpolated_no_bandpass",
+            "ud_calculation_mode": ud_mode,
+            "ud_smoothing_method": "centered_moving_median",
+            "ud_smoothing_window_s": float(ud_smoothing_window_s),
+            "ud_smoothing_window_samples": int(ud_window_samples),
         },
     )
 
@@ -276,14 +294,35 @@ def load_protocol_raw_clean_frames(
     fs_origin: int = 100,
     *,
     calibration: CalibrationCoefficients | None = None,
+    ud_calculation_mode: str = "smoothed",
+    ud_smoothing_window_s: float = 0.1,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return derived raw and cleaned frames before band-pass filtering."""
 
     path = Path(sensor_csv)
     calibration = calibration or load_subject_calibration(path.parent)
+    ud_mode, ud_window_samples = _validate_ud_calculation_config(
+        ud_calculation_mode,
+        ud_smoothing_window_s,
+        int(fs_origin),
+    )
     loaded = load_pydisplay_sensor_csv(path, fs=int(fs_origin))
-    raw_frame, _ = _derive_protocol_frame(loaded.frame, calibration, clean=False)
-    clean_frame, _ = _build_clean_frame(path, int(fs_origin), calibration, loaded=loaded)
+    raw_frame, _ = _derive_protocol_frame(
+        loaded.frame,
+        calibration,
+        clean=False,
+        fs=int(fs_origin),
+        ud_calculation_mode="raw",
+        ud_smoothing_window_samples=1,
+    )
+    clean_frame, _ = _build_clean_frame(
+        path,
+        int(fs_origin),
+        calibration,
+        loaded=loaded,
+        ud_calculation_mode=ud_mode,
+        ud_smoothing_window_samples=ud_window_samples,
+    )
     return raw_frame, clean_frame
 
 
@@ -313,11 +352,20 @@ def _build_clean_frame(
     calibration: CalibrationCoefficients,
     *,
     loaded: object | None = None,
+    ud_calculation_mode: str = "smoothed",
+    ud_smoothing_window_samples: int = 10,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     """Load and derive the cleaned, unfiltered new-protocol frame."""
 
     sensor_data = loaded or load_pydisplay_sensor_csv(sensor_path, fs=fs)
-    frame, _ = _derive_protocol_frame(sensor_data.frame, calibration, clean=True, fs=fs)
+    frame, _ = _derive_protocol_frame(
+        sensor_data.frame,
+        calibration,
+        clean=True,
+        fs=fs,
+        ud_calculation_mode=ud_calculation_mode,
+        ud_smoothing_window_samples=ud_smoothing_window_samples,
+    )
     report = sensor_data.report
     metadata = {
         "sensor_csv": str(Path(sensor_path).resolve()),
@@ -340,6 +388,8 @@ def _derive_protocol_frame(
     *,
     clean: bool,
     fs: int = 100,
+    ud_calculation_mode: str = "raw",
+    ud_smoothing_window_samples: int = 1,
 ) -> tuple[pd.DataFrame, np.ndarray]:
     """Apply the documented CF2/HF2/HF2comp/UD2 formulas."""
 
@@ -351,10 +401,23 @@ def _derive_protocol_frame(
         name: pd.to_numeric(source[name], errors="coerce").to_numpy(dtype=float)
         for name in numeric_names
     }
-    den2 = float(calibration.c2) - values["Uc2"]
-    den3 = float(calibration.c3) - values["Uc3"]
+    raw_den2 = float(calibration.c2) - values["Uc2"]
+    raw_den3 = float(calibration.c3) - values["Uc3"]
+    raw_near2 = np.isfinite(raw_den2) & (np.abs(raw_den2) <= 1e-9)
+    raw_near3 = np.isfinite(raw_den3) & (np.abs(raw_den3) <= 1e-9)
+    ud_inputs = {name: values[name] for name in ("Uh2", "Uh3", "Uc2", "Uc3")}
+    if ud_calculation_mode == "smoothed":
+        ud_inputs = {
+            name: smoothdata_movmedian(array, int(ud_smoothing_window_samples))
+            for name, array in ud_inputs.items()
+        }
+    elif ud_calculation_mode != "raw":
+        raise ValueError("ud_calculation_mode must be 'raw' or 'smoothed'")
+    den2 = float(calibration.c2) - ud_inputs["Uc2"]
+    den3 = float(calibration.c3) - ud_inputs["Uc3"]
     near2 = np.isfinite(den2) & (np.abs(den2) <= 1e-9)
     near3 = np.isfinite(den3) & (np.abs(den3) <= 1e-9)
+    qc_near = raw_near2 | raw_near3 | near2 | near3
     safe_den2 = den2.copy()
     safe_den3 = den3.copy()
     safe_den2[near2] = np.nan
@@ -369,8 +432,8 @@ def _derive_protocol_frame(
         "hf2": (values["Uh3"] - float(calibration.k3) * values["Uh4"]) * 1000.0,
         "hfcomp1": values["Uh2"] * 1000.0,
         "hfcomp2": values["Uh3"] * 1000.0,
-        "ud1": (values["Uh2"] - values["Uc2"]) / safe_den2,
-        "ud2": (values["Uh3"] - values["Uc3"]) / safe_den3,
+        "ud1": (ud_inputs["Uh2"] - ud_inputs["Uc2"]) / safe_den2,
+        "ud2": (ud_inputs["Uh3"] - ud_inputs["Uc3"]) / safe_den3,
         "accx": values["ACC_X"],
         "accy": values["ACC_Y"],
         "accz": values["ACC_Z"],
@@ -389,17 +452,29 @@ def _derive_protocol_frame(
     if not clean:
         for name in ("Uh1", "Uh2", "Uh3", "Uh4", "Uc2", "Uc3"):
             frame[name] = values[name]
-        return frame, near2 | near3
+        return frame, qc_near
 
     qc_frame = _build_qc_frame(source)
     raw_matrix = np.column_stack([np.asarray(item, dtype=float) for item in derived.values()])
     raw_missing_count = np.sum(~np.isfinite(raw_matrix), axis=1).astype(int)
     qc_frame["raw_missing_any"] = (raw_missing_count > 0).astype(int)
     qc_frame["raw_missing_count"] = raw_missing_count
-    qc_frame["ud_denominator_near_zero"] = (near2 | near3).astype(int)
+    qc_frame["ud_denominator_near_zero"] = qc_near.astype(int)
     for column in PROTOCOL_QC_COLUMNS:
         frame[column] = qc_frame[column].to_numpy()
-    return frame, near2 | near3
+    return frame, qc_near
+
+
+def _validate_ud_calculation_config(mode: str, window_s: float, fs: int) -> tuple[str, int]:
+    """Validate fixed UD formula preprocessing and return its sample window."""
+
+    normalized_mode = str(mode).strip().lower()
+    if normalized_mode not in {"raw", "smoothed"}:
+        raise ValueError("ud_calculation_mode must be 'raw' or 'smoothed'")
+    window_seconds = float(window_s)
+    if not np.isfinite(window_seconds) or window_seconds <= 0.0:
+        raise ValueError("ud_smoothing_window_s must be finite and > 0")
+    return normalized_mode, max(1, int(round(window_seconds * int(fs))))
 
 
 def _time_seconds_from_raw(raw: pd.DataFrame, fs: int) -> np.ndarray:

@@ -45,7 +45,12 @@ from .cascade_solver import (
     clear_trial_heavy_caches,
     run_protocol_trial,
 )
-from .preprocess_protocol import ProtocolDataset, load_and_preprocess_protocol, resample_protocol_dataset
+from .preprocess_protocol import (
+    ProtocolDataset,
+    _validate_ud_calculation_config,
+    load_and_preprocess_protocol,
+    resample_protocol_dataset,
+)
 from .protocol_outputs import SampleOutputPaths, plot_signal_figures, write_qc_tables
 from .protocol_search_space import (
     ProtocolSearchSpace,
@@ -127,6 +132,9 @@ class _ModeOptimisation:
     success: bool
     reason: str
     training_elapsed_s: float = 0.0
+    ud_calculation_mode: str = "smoothed"
+    ud_smoothing_window_s: float = 0.1
+    ud_smoothing_window_samples: int = 10
     fold_id: int | None = None
     heldout_group_id: str = ""
     train_group_ids: list[str] = field(default_factory=list)
@@ -265,6 +273,8 @@ def run_batch_adaptive_protocol(
     random_state: int = 42,
     num_seed_points: int = 10,
     fs_origin: int = 100,
+    ud_calculation_mode: str = "smoothed",
+    ud_smoothing_window_s: float = 0.1,
     penalty_value: float = 999.0,
     parallel_repeats: int = 1,
     n_jobs: int | None = 1,
@@ -304,6 +314,11 @@ def run_batch_adaptive_protocol(
         raise ValueError(f"data_split_mode must be one of {_VALID_SPLIT_MODES}")
     if delay_estimation_mode not in {"envelope", "direct"}:
         raise ValueError("delay_estimation_mode must be 'envelope' or 'direct'")
+    ud_calculation_mode, ud_smoothing_window_samples = _validate_ud_calculation_config(
+        ud_calculation_mode,
+        ud_smoothing_window_s,
+        int(fs_origin),
+    )
 
     scopes = [TargetScope(x) for x in (target_scopes or [TargetScope.MOTION_POST10])]
     schemes = [CascadeScheme(x) for x in (cascade_schemes or list(CascadeScheme))]
@@ -372,6 +387,11 @@ def run_batch_adaptive_protocol(
             progress_callback(dict(info))
 
     calibration = load_subject_calibration(input_path, on_log=_log)
+    _log(
+        "UD 计算配置: "
+        f"mode={ud_calculation_mode}, smoothing=centered_moving_median, "
+        f"window={float(ud_smoothing_window_s):g}s/{ud_smoothing_window_samples} samples"
+    )
     discovery = discover_sample_pairs_with_unpaired(input_path)
     _log(f"配对总数: {len(discovery.pairs)}")
     _log(f"未配对文件数量: {len(discovery.unpaired)}")
@@ -427,6 +447,8 @@ def run_batch_adaptive_protocol(
                 pair.ref_csv,
                 fs_origin=fs_origin,
                 calibration=calibration,
+                ud_calculation_mode=ud_calculation_mode,
+                ud_smoothing_window_s=ud_smoothing_window_s,
             )
             datasets[pair.motion_id] = dataset
             pair_by_group[pair.motion_id] = pair
@@ -440,6 +462,8 @@ def run_batch_adaptive_protocol(
                 motion_type=pair.motion_type,
                 fs_origin=fs_origin,
                 calibration=calibration,
+                ud_calculation_mode=ud_calculation_mode,
+                ud_smoothing_window_s=ud_smoothing_window_s,
             )
         except Exception as exc:
             load_failures.append(
@@ -542,7 +566,12 @@ def run_batch_adaptive_protocol(
                             "penalty_value": float(penalty_value),
                             "delay_estimation_mode": delay_estimation_mode,
                             "trial_param_overrides": trial_overrides,
-                            **_ud_preprocessing_fingerprint_fields(scheme),
+                            **_ud_preprocessing_fingerprint_fields(
+                                scheme,
+                                mode=ud_calculation_mode,
+                                window_s=ud_smoothing_window_s,
+                                window_samples=ud_smoothing_window_samples,
+                            ),
                         },
                     )
                     resumed = restored_by_key.get(mode_key)
@@ -664,6 +693,9 @@ def run_batch_adaptive_protocol(
                             test_group_id=test_ids[0] if len(test_ids) == 1 else "",
                         )
                     result.training_elapsed_s = max(0.0, time.perf_counter() - mode_started_at)
+                    result.ud_calculation_mode = ud_calculation_mode
+                    result.ud_smoothing_window_s = float(ud_smoothing_window_s)
+                    result.ud_smoothing_window_samples = int(ud_smoothing_window_samples)
                     result.run_fingerprint = expected_fingerprint
                     mode_results.append(result)
                     _finalize_completed_mode(
@@ -2163,11 +2195,23 @@ def _build_mode_fingerprint(
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _ud_preprocessing_fingerprint_fields(scheme: CascadeScheme) -> dict[str, str]:
+def _ud_preprocessing_fingerprint_fields(
+    scheme: CascadeScheme,
+    *,
+    mode: str,
+    window_s: float,
+    window_samples: int,
+) -> dict[str, Any]:
     """Invalidate only modes whose numerical inputs changed with raw-formula UD."""
 
     if scheme in {CascadeScheme.UD2, CascadeScheme.ACC_UD2}:
-        return {"ud_preprocessing": "calibrated_formula_qc_interpolated_no_bandpass_v1"}
+        return {
+            "ud_preprocessing": "calibrated_formula_optional_voltage_smoothing_no_bandpass_v2",
+            "ud_calculation_mode": str(mode),
+            "ud_smoothing_method": "centered_moving_median",
+            "ud_smoothing_window_s": float(window_s),
+            "ud_smoothing_window_samples": int(window_samples),
+        }
     return {}
 
 
@@ -2209,6 +2253,9 @@ def _mode_manifest_payload(result: _ModeOptimisation) -> dict[str, Any]:
         "success": result.success,
         "reason": result.reason,
         "training_elapsed_s": result.training_elapsed_s,
+        "ud_calculation_mode": result.ud_calculation_mode,
+        "ud_smoothing_window_s": result.ud_smoothing_window_s,
+        "ud_smoothing_window_samples": result.ud_smoothing_window_samples,
         "fold_id": result.fold_id,
         "heldout_group_id": result.heldout_group_id,
         "train_group_ids": result.train_group_ids,
@@ -2248,6 +2295,9 @@ def _mode_result_from_manifest_payload(payload: dict[str, Any]) -> _ModeOptimisa
         success=bool(payload.get("success", False)),
         reason=str(payload.get("reason", "")),
         training_elapsed_s=float(payload.get("training_elapsed_s", 0.0) or 0.0),
+        ud_calculation_mode=str(payload.get("ud_calculation_mode", "smoothed")),
+        ud_smoothing_window_s=float(payload.get("ud_smoothing_window_s", 0.1) or 0.1),
+        ud_smoothing_window_samples=int(payload.get("ud_smoothing_window_samples", 10) or 10),
         fold_id=(None if payload.get("fold_id", None) in ("", None) else int(payload.get("fold_id"))),
         heldout_group_id=str(payload.get("heldout_group_id", "")),
         train_group_ids=[str(item) for item in payload.get("train_group_ids", [])],
@@ -2771,6 +2821,9 @@ def _best_params_alignment_record(result: _ModeOptimisation) -> dict[str, Any]:
         "posthoc_final_aae_bpm": metrics.get("posthoc_final_aae_bpm"),
         "posthoc_final_acc_pct": metrics.get("posthoc_final_acc_pct"),
         "training_elapsed_s": float(result.training_elapsed_s),
+        "ud_calculation_mode": result.ud_calculation_mode,
+        "ud_smoothing_window_s": float(result.ud_smoothing_window_s),
+        "ud_smoothing_window_samples": int(result.ud_smoothing_window_samples),
         "baseline_aae_bpm": metrics.get("baseline_aae_bpm"),
         "baseline_acc_pct": metrics.get("baseline_acc_pct"),
         "adaptive_aae_bpm": metrics.get("adaptive_aae_bpm"),
@@ -2847,6 +2900,7 @@ def _best_params_alignment_columns() -> list[str]:
         "no_posthoc_final_aae_bpm", "no_posthoc_final_acc_pct",
         "posthoc_final_aae_bpm", "posthoc_final_acc_pct",
         "training_elapsed_s",
+        "ud_calculation_mode", "ud_smoothing_window_s", "ud_smoothing_window_samples",
         "baseline_aae_bpm", "baseline_acc_pct", "adaptive_aae_bpm", "adaptive_acc_pct",
         "acc3_compare_aae_bpm", "acc3_compare_accuracy_pct", "acc3_compare_num_windows",
         "acc_compare_posthoc_aae_bpm", "acc_compare_posthoc_accuracy_pct",
@@ -2922,6 +2976,9 @@ def _summary_row(result: _ModeOptimisation) -> dict[str, Any]:
         "success": result.success,
         "reason": result.reason,
         "training_elapsed_s": float(result.training_elapsed_s),
+        "ud_calculation_mode": result.ud_calculation_mode,
+        "ud_smoothing_window_s": float(result.ud_smoothing_window_s),
+        "ud_smoothing_window_samples": int(result.ud_smoothing_window_samples),
     }
     for prefix, metrics in (
         ("train", result.train_metrics),
@@ -3017,6 +3074,9 @@ def _summary_columns() -> list[str]:
         "success",
         "reason",
         "training_elapsed_s",
+        "ud_calculation_mode",
+        "ud_smoothing_window_s",
+        "ud_smoothing_window_samples",
         "train_aae_bpm",
         "train_accuracy_pct",
         "train_baseline_aae_bpm",
@@ -3261,6 +3321,8 @@ def redraw_best_param_hr_curves(
     best_param_csv_path: str | Path,
     output_dir: str | Path,
     fs_origin: int = 100,
+    ud_calculation_mode: str = "smoothed",
+    ud_smoothing_window_s: float = 0.1,
     fold_id: int | None = None,
     heldout_group_id: str | None = None,
     enable_time_bias_after: bool | None = None,
@@ -3297,7 +3359,13 @@ def redraw_best_param_hr_curves(
     )
     if postprocess_method_override:
         params = replace(params, postprocess_method=str(postprocess_method_override))
-    dataset = load_and_preprocess_protocol(sensor_csv_path, ref_csv_path, fs_origin=fs_origin)
+    dataset = load_and_preprocess_protocol(
+        sensor_csv_path,
+        ref_csv_path,
+        fs_origin=fs_origin,
+        ud_calculation_mode=ud_calculation_mode,
+        ud_smoothing_window_s=ud_smoothing_window_s,
+    )
     run = run_protocol_trial(dataset, scheme, scope, params)
     if not run.success or run.frame.empty:
         raise RuntimeError(f"手动重画失败: {run.reason}")
@@ -3383,6 +3451,8 @@ def redraw_subject_target_hr_curves(
     TW_F: float | None = None,
     output_dir: str | Path | None = None,
     fs_origin: int = 100,
+    ud_calculation_mode: str = "smoothed",
+    ud_smoothing_window_s: float = 0.1,
     postprocess_method_override: str | None = None,
 ) -> pd.DataFrame:
     """Redraw target-scope reference/final HR curves for every subject sample.
@@ -3412,9 +3482,11 @@ def redraw_subject_target_hr_curves(
         key=lambda item: (motion_rank.get(item.motion_type, len(motion_rank)), int(item.motion_index)),
     )
     tw_label = "auto" if TW_F is None else _tw_f_run_label(float(TW_F))
-    mode_signature = (
-        f"{scope.value}__{scheme.value}__{filter_name}__{data_split_mode}__{tw_label}"
+    ud_mode, ud_window_samples = _validate_ud_calculation_config(
+        ud_calculation_mode, ud_smoothing_window_s, int(fs_origin)
     )
+    ud_label = f"UD_{ud_mode}_{_compact_float_label(float(ud_smoothing_window_s))}s"
+    mode_signature = f"{scope.value}__{scheme.value}__{filter_name}__{data_split_mode}__{tw_label}__{ud_label}"
     output_base = (
         Path(output_dir).resolve()
         if output_dir is not None
@@ -3436,6 +3508,9 @@ def redraw_subject_target_hr_curves(
             "adaptive_filter": filter_name,
             "data_split_mode": data_split_mode,
             "TW_F": TW_F,
+            "ud_calculation_mode": ud_mode,
+            "ud_smoothing_window_s": float(ud_smoothing_window_s),
+            "ud_smoothing_window_samples": int(ud_window_samples),
             "status": "failed",
             "reason": "",
             "time_bias_after_s": float("nan"),
@@ -3473,7 +3548,13 @@ def redraw_subject_target_hr_curves(
             motion_dir = _stage6_motion_record_dir(results_path, pair.motion_type)
             base_row["best_record_path"] = str(motion_dir / "best_params_and_alignment.csv")
 
-            dataset = load_and_preprocess_protocol(pair.sensor_csv, pair.ref_csv, fs_origin=fs_origin)
+            dataset = load_and_preprocess_protocol(
+                pair.sensor_csv,
+                pair.ref_csv,
+                fs_origin=fs_origin,
+                ud_calculation_mode=ud_mode,
+                ud_smoothing_window_s=ud_smoothing_window_s,
+            )
             run = run_protocol_trial(
                 dataset,
                 scheme,
@@ -3638,6 +3719,8 @@ def run_batch_reference_compare(
     output_dir: str | Path,
     group_ids: list[str] | None = None,
     fs_origin: int = 100,
+    ud_calculation_mode: str = "smoothed",
+    ud_smoothing_window_s: float = 0.1,
 ) -> dict[str, Path]:
     """Re-evaluate one motion type with source and actual reference schemes.
 
@@ -3686,7 +3769,13 @@ def run_batch_reference_compare(
         sensor_csv = Path(str(row.get("data_file", "")))
         ref_csv = Path(str(row.get("ref_file", "")))
         try:
-            dataset = load_and_preprocess_protocol(sensor_csv, ref_csv, fs_origin=fs_origin)
+            dataset = load_and_preprocess_protocol(
+                sensor_csv,
+                ref_csv,
+                fs_origin=fs_origin,
+                ud_calculation_mode=ud_calculation_mode,
+                ud_smoothing_window_s=ud_smoothing_window_s,
+            )
             source_run = run_protocol_trial(dataset, source_scheme, scope, params, collect_frame=False)
             actual_run = run_protocol_trial(dataset, actual_scheme, scope, params, collect_frame=False)
             rows.append(
@@ -4417,6 +4506,8 @@ def plot_window_diagnostics_from_records(
     mode: str = "",
     target_scope: str = "motion_only",
     fs_origin: int = 100,
+    ud_calculation_mode: str = "smoothed",
+    ud_smoothing_window_s: float = 0.1,
     guard_ratio_min_override: float | None = None,
     guard_ratio_max_override: float | None = None,
     guard_flat_std_eps_override: float | None = None,
@@ -4452,7 +4543,13 @@ def plot_window_diagnostics_from_records(
     scheme_to_run = override_cascade_scheme if override_cascade_scheme else scheme_text
     scheme = CascadeScheme(scheme_to_run)
     scope = TargetScope(target_scope)
-    dataset = load_and_preprocess_protocol(signal_csv, ref_csv, fs_origin=fs_origin)
+    dataset = load_and_preprocess_protocol(
+        signal_csv,
+        ref_csv,
+        fs_origin=fs_origin,
+        ud_calculation_mode=ud_calculation_mode,
+        ud_smoothing_window_s=ud_smoothing_window_s,
+    )
     dataset = resample_protocol_dataset(dataset, fs_target=int(params.Fs_Target))
     label_data_type = adaptive_data_type or scheme_text
     if override_cascade_scheme:
@@ -5080,6 +5177,8 @@ def replay_best_record_hr_curves(
     TW_F: float | None = None,
     results_root: str | Path,
     fs_origin: int = 100,
+    ud_calculation_mode: str = "smoothed",
+    ud_smoothing_window_s: float = 0.1,
     guard_ratio_min_override: float | None = None,
     guard_ratio_max_override: float | None = None,
     guard_flat_std_eps_override: float | None = None,
@@ -5120,7 +5219,13 @@ def replay_best_record_hr_curves(
     scheme = CascadeScheme(scheme_to_run)
     scope = TargetScope(target_scope)
 
-    dataset = load_and_preprocess_protocol(signal_csv, ref_csv, fs_origin=fs_origin)
+    dataset = load_and_preprocess_protocol(
+        signal_csv,
+        ref_csv,
+        fs_origin=fs_origin,
+        ud_calculation_mode=ud_calculation_mode,
+        ud_smoothing_window_s=ud_smoothing_window_s,
+    )
     label_data_type = adaptive_data_type or scheme_text
 
     if override_cascade_scheme:
