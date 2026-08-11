@@ -169,7 +169,8 @@ def load_and_preprocess_protocol(
 
     中文说明：严格读取 Pydisplay 表头并修复序号；缺失值先线性插值再近邻补边；
     PPG 使用既有毛刺修复工具；CF/HF/HFcomp/UD 按新协议公式由原始伏特列和
-    ``ck.mat`` 标定值计算；最后按信号类型做零相位带通滤波。
+    ``ck.mat`` 标定值计算。CF/HF/HFcomp 继续做零相位带通；UD1/UD2 保留完成
+    QC/插值后的公式值，供 UD2/ACC_UD2 在自适应窗口内直接归一化。
     """
 
     sensor_path = Path(sensor_csv)
@@ -189,8 +190,8 @@ def load_and_preprocess_protocol(
     cf2 = _safe_bandpass(clean_frame["cf2"].to_numpy(dtype=float), fs, 0.1, 5.0)
     hfcomp1 = _safe_bandpass(clean_frame["hfcomp1"].to_numpy(dtype=float), fs, 0.1, 5.0)
     hfcomp2 = _safe_bandpass(clean_frame["hfcomp2"].to_numpy(dtype=float), fs, 0.1, 5.0)
-    ud1 = _safe_bandpass(clean_frame["ud1"].to_numpy(dtype=float), fs, 0.1, 5.0)
-    ud2 = _safe_bandpass(clean_frame["ud2"].to_numpy(dtype=float), fs, 0.1, 5.0)
+    ud1 = clean_frame["ud1"].to_numpy(dtype=float).copy()
+    ud2 = clean_frame["ud2"].to_numpy(dtype=float).copy()
     accx = _safe_bandpass(clean_frame["accx"].to_numpy(dtype=float), fs, 0.5, 10.0)
     accy = _safe_bandpass(clean_frame["accy"].to_numpy(dtype=float), fs, 0.5, 10.0)
     accz = _safe_bandpass(clean_frame["accz"].to_numpy(dtype=float), fs, 0.5, 10.0)
@@ -228,7 +229,11 @@ def load_and_preprocess_protocol(
         hfcomp2=hfcomp2,
         ud1=ud1,
         ud2=ud2,
-        source_metadata={**calibration.to_metadata(), **sequence_metadata},
+        source_metadata={
+            **calibration.to_metadata(),
+            **sequence_metadata,
+            "ud_preprocessing": "calibrated_formula_qc_interpolated_no_bandpass",
+        },
     )
 
 

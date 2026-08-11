@@ -22,6 +22,10 @@ motion = write | gripper | run | rope
 - scheme：`ACC`、`HF2`、`UD2`、`ACC+HF2`、`HF2+CF2`、`ACC+UD2`。
 - motion 顺序：`write`、`gripper`、`run`、`rope`。
 
+UD1/UD2 使用标定公式及近零分母 QC/插值后的值，不经过 0.1–5 Hz 带通；仅在
+`UD2`、`ACC+UD2` 自适应级联使用时，按当前 `normalization_mode` 对每个
+`TW_F+TW` 窗口直接归一化。HF2、CF2 等通道的既有带通处理保持不变。
+
 Notebook 首个代码单元提供 `legacy/enhanced` 总开关和六项独立开关：方向性追踪、
 动态惩罚、连续性保护、低锁定恢复、高锁定恢复、运动后动态保护。默认使用
 `enhanced` 且全部开启。这些字段会进入参数 JSON/CSV、cache key、模式 checkpoint

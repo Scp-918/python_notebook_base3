@@ -179,4 +179,7 @@ def test_new_voltage_formulas_and_near_zero_denominator_qc(tmp_path: Path) -> No
     assert dataset.source_metadata["calibration_path"] == str(calibration.source_path)
     assert dataset.hfcomp1 is not None
     assert dataset.ud1 is not None
+    np.testing.assert_allclose(dataset.ud1, clean["ud1"].to_numpy(dtype=float))
+    np.testing.assert_allclose(dataset.ud2, clean["ud2"].to_numpy(dtype=float))
+    assert dataset.source_metadata["ud_preprocessing"] == "calibrated_formula_qc_interpolated_no_bandpass"
     assert len(dataset.time_s) == 240

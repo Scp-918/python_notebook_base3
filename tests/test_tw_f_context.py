@@ -127,3 +127,19 @@ def test_normalised_window_cache_is_isolated_by_tw_f() -> None:
     assert cache0.adaptive_win_len == 40
     assert cache1.adaptive_win_len == 60
     assert cache0 is not cache1
+
+
+def test_ud_formula_channels_are_directly_minmax_normalised_in_adaptive_context() -> None:
+    base = _twf_base()
+    raw_ud1 = np.linspace(10.0, 30.0, len(base.dataset.time_s))
+    raw_ud2 = np.linspace(-4.0, 8.0, len(base.dataset.time_s)) ** 2
+    base.dataset.ud1 = raw_ud1
+    base.dataset.ud2 = raw_ud2
+    params = ProtocolTrialParams(Fs_Target=20, TW=2, TW_F=1.0, normalization_mode="minmax")
+
+    cache = _get_normalised_window_cache(base, params)
+
+    for name in ("ud1", "ud2"):
+        values = cache.adaptive_norm_by_channel[name][1]
+        assert float(values.min()) == 0.0
+        assert float(values.max()) == 1.0
