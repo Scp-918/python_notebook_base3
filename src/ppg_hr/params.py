@@ -87,8 +87,8 @@ class ProtocolParams:
     """
 
     fs_origin: int = 100
-    max_iterations: int = 250
-    num_repeats: int = 3
+    max_iterations: int = 200
+    num_repeats: int = 1
     random_state: int = 42
     num_seed_points: int = 10
     penalty_value: float = 999.0

@@ -383,16 +383,16 @@ def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    input_dir = tmp_path / "input"
-    input_dir.mkdir()
+    subject_dir = tmp_path / "subject_name"
+    subject_dir.mkdir()
     output_root = tmp_path / "outputs" / "resume_case"
     pair = SimpleNamespace(
-        sensor_csv=input_dir / "multi_tiaosheng1.csv",
-        ref_csv=input_dir / "multi_tiaosheng1_ref.csv",
-        motion_type="tiaosheng",
+        sensor_csv=subject_dir / "subject_name_write_1_sensor.csv",
+        ref_csv=subject_dir / "subject_name_write_1_HRdata.csv",
+        motion_type="write",
         motion_index=1,
-        motion_id="tiaosheng1",
-        stem="multi_tiaosheng1",
+        motion_id="subject_name_write_1",
+        stem="subject_name_write_1",
     )
     dataset = SimpleNamespace(_trial_base_cache={}, _global_tdelay_cache={})
     calls: list[str] = []
@@ -401,6 +401,11 @@ def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
         rbp,
         "discover_sample_pairs_with_unpaired",
         lambda _input_dir: SimpleNamespace(pairs=[pair], unpaired=[]),
+    )
+    monkeypatch.setattr(
+        rbp,
+        "load_subject_calibration",
+        lambda *args, **kwargs: SimpleNamespace(source_sha256="calibration-test"),
     )
     monkeypatch.setattr(rbp, "quality_filter_sample", lambda *args, **kwargs: SimpleNamespace(is_good=True))
     monkeypatch.setattr(rbp, "write_qc_tables", lambda *args, **kwargs: {})
@@ -411,13 +416,13 @@ def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
         rbp,
         "_build_split_plan",
         lambda *args, **kwargs: {
-            "tiaosheng": [
+            "write": [
                 {
                     "status": "ok",
                     "fold_id": 0,
-                    "train": ["tiaosheng1"],
+                    "train": ["subject_name_write_1"],
                     "val": [],
-                    "test": ["tiaosheng1"],
+                    "test": ["subject_name_write_1"],
                     "heldout_group_id": "",
                 }
             ]
@@ -426,7 +431,9 @@ def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
 
     def _fake_optimise_group_mode(**kwargs: object) -> rbp._ModeOptimisation:
         calls.append("called")
-        return _single_split_result()
+        result = _single_split_result()
+        result.motion_type = "write"
+        return result
 
     monkeypatch.setattr(rbp, "_optimise_group_mode", _fake_optimise_group_mode)
     monkeypatch.setattr(rbp, "_write_final_summary", lambda *args, **kwargs: {})
@@ -435,7 +442,7 @@ def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
     monkeypatch.setattr(rbp, "clear_trial_heavy_caches", lambda _dataset: None)
 
     first = rbp.run_batch_adaptive_protocol(
-        input_dir=input_dir,
+        subject_dir=subject_dir,
         output_root=output_root,
         target_scopes=[TargetScope.MOTION_ONLY],
         cascade_schemes=[CascadeScheme.ACC3],
@@ -444,7 +451,7 @@ def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
         verbose=False,
     )
     second = rbp.run_batch_adaptive_protocol(
-        input_dir=input_dir,
+        subject_dir=subject_dir,
         output_root=output_root,
         target_scopes=[TargetScope.MOTION_ONLY],
         cascade_schemes=[CascadeScheme.ACC3],
@@ -452,8 +459,18 @@ def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
         data_split_mode="split",
         verbose=False,
     )
+    rbp.run_batch_adaptive_protocol(
+        subject_dir=subject_dir,
+        output_root=output_root,
+        target_scopes=[TargetScope.MOTION_ONLY],
+        cascade_schemes=[CascadeScheme.ACC3],
+        adaptive_filters=["lms"],
+        data_split_mode="split",
+        max_iterations=201,
+        verbose=False,
+    )
 
-    assert len(calls) == 1
-    assert "tiaosheng" in first.mode_results
-    assert "tiaosheng" in second.mode_results
-    assert second.mode_results["tiaosheng"][0].history == []
+    assert len(calls) == 2
+    assert "write" in first.mode_results
+    assert "write" in second.mode_results
+    assert second.mode_results["write"][0].history == []

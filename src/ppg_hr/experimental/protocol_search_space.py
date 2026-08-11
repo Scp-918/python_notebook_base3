@@ -57,7 +57,7 @@ class ProtocolTrialParams:
     LMS_Mu_Base: float = 0.01
     LMS_Mu_Min: float = 1e-6
     adaptive_filter: str = "lms"
-    objective_mode: str = "aae"
+    objective_mode: str = "posthoc_aae"
     # 中文说明：窗口级 QC 的默认策略是部署保守的 baseline 回退；该参数是固定实验
     # 配置，不进入 Optuna/Bayes 搜索空间。
     qc_policy: str = "fallback_baseline"
@@ -118,7 +118,7 @@ class ProtocolTrialParams:
     klms_nlms_eps: float = 1e-6
     # 中文说明：PPG 输入策略和全局 objective/级联 guard 会改变实际 HR 结果，
     # 因此作为固定 trial 参数保存，并通过 cache_key 自动参与缓存隔离。
-    ppg_input_transform: str = "raw_bandpass"
+    ppg_input_transform: str = "log_absorbance"
     log_absorbance_baseline_mode: str = "rolling_median"
     log_absorbance_baseline_window_s: float = 5.0
     log_absorbance_eps: float = 1e-6

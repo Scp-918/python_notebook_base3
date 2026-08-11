@@ -70,11 +70,11 @@ def test_stage1_fixed_rest_params_remain_overrideable() -> None:
 
 def test_stage2_strategy_fields_roundtrip_and_affect_cache_key() -> None:
     base = ProtocolTrialParams()
-    transformed = ProtocolTrialParams(ppg_input_transform="log_absorbance")
+    transformed = ProtocolTrialParams(ppg_input_transform="raw_bandpass")
     deployment = ProtocolTrialParams(global_objective_strategy="deployment_global")
     guarded = ProtocolTrialParams(cascade_guard_policy="rms_guard")
 
-    assert transformed.to_dict()["ppg_input_transform"] == "log_absorbance"
+    assert transformed.to_dict()["ppg_input_transform"] == "raw_bandpass"
     assert deployment.to_dict()["global_objective_strategy"] == "deployment_global"
     assert guarded.to_dict()["cascade_guard_policy"] == "rms_guard"
     assert base.cache_key() != transformed.cache_key()

@@ -16,7 +16,7 @@ import os
 import shutil
 import subprocess
 from collections import OrderedDict
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
@@ -31,7 +31,8 @@ except ModuleNotFoundError:  # pragma: no cover - only used in lean environments
     optuna = None
     TPESampler = None
 
-from ..params import CascadeScheme, ProtocolParams, TargetScope
+from ..params import CascadeScheme, MotionType, ProtocolParams, TargetScope
+from ..preprocess.calibration import load_subject_calibration
 from .batch_pairing import SamplePair, discover_sample_pairs_with_unpaired
 from .alignment import _window_fft_hr, search_time_bias_after
 from .cascade_solver import (
@@ -138,10 +139,16 @@ class _ModeOptimisation:
     params_semantics: str = ""
     representative_fold_id: int | None = None
     representative_heldout_group_id: str = ""
+    run_fingerprint: str = ""
 
     @property
     def mode_key(self) -> str:
-        return f"{self.target_scope.value}__{self.cascade_scheme.value}__{self.adaptive_filter}"
+        return _mode_key_for(
+            self.motion_type,
+            self.target_scope,
+            self.cascade_scheme,
+            self.adaptive_filter,
+        )
 
 
 def build_output_run_name(
@@ -218,13 +225,13 @@ def safe_prepare_output_dir(
 
 def run_batch_adaptive_protocol(
     *,
-    input_dir: str | Path,
+    subject_dir: str | Path,
     output_root: str | Path | None = None,
     csv_out_dir: str | Path | None = None,
     report_out_dir: str | Path | None = None,
     fig_out_dir: str | Path | None = None,
-    max_iterations: int = 350,
-    num_repeats: int = 3,
+    max_iterations: int = 200,
+    num_repeats: int = 1,
     random_state: int = 42,
     num_seed_points: int = 10,
     fs_origin: int = 100,
@@ -239,8 +246,8 @@ def run_batch_adaptive_protocol(
     target_scopes: list[TargetScope | str] | None = None,
     cascade_schemes: list[CascadeScheme | str] | None = None,
     adaptive_filters: list[str] | None = None,
-    objective_mode: str = "aae",
-    data_split_mode: str = "split",
+    objective_mode: str = "posthoc_aae",
+    data_split_mode: str = "all_train",
     delay_estimation_mode: str = "envelope",
     val_groups_per_type: int = 1,
     test_groups_per_type: int = 1,
@@ -268,7 +275,7 @@ def run_batch_adaptive_protocol(
     if delay_estimation_mode not in {"envelope", "direct"}:
         raise ValueError("delay_estimation_mode must be 'envelope' or 'direct'")
 
-    scopes = [TargetScope(x) for x in (target_scopes or [TargetScope.MOTION_ONLY, TargetScope.MOTION_AND_RECOVERY])]
+    scopes = [TargetScope(x) for x in (target_scopes or [TargetScope.MOTION_POST10])]
     schemes = [CascadeScheme(x) for x in (cascade_schemes or list(CascadeScheme))]
     filters = [str(x) for x in (adaptive_filters or ["lms"])]
     unsupported = [x for x in filters if x not in _VALID_FILTERS]
@@ -276,7 +283,7 @@ def run_batch_adaptive_protocol(
         raise ValueError(f"Unsupported adaptive_filters: {unsupported}")
 
     trial_overrides = _normalise_trial_param_overrides(trial_param_overrides)
-    input_path = Path(input_dir).resolve()
+    input_path = Path(subject_dir).resolve()
     if output_root is None:
         if csv_out_dir is not None:
             root_out = Path(csv_out_dir).resolve().parent
@@ -334,13 +341,14 @@ def run_batch_adaptive_protocol(
         if progress_callback is not None:
             progress_callback(dict(info))
 
+    calibration = load_subject_calibration(input_path, on_log=_log)
     discovery = discover_sample_pairs_with_unpaired(input_path)
     _log(f"配对总数: {len(discovery.pairs)}")
     _log(f"未配对文件数量: {len(discovery.unpaired)}")
 
     good_qc: list[QcResult] = []
     bad_qc: list[QcResult] = []
-    good_pairs: list[SamplePair] = []
+    accepted_pairs: list[SamplePair] = []
     qc_by_stem: dict[str, QcResult] = {}
     for idx, pair in enumerate(discovery.pairs, start=1):
         _progress({"stage": "qc", "current": idx, "total": len(discovery.pairs), "sample": pair.stem})
@@ -352,9 +360,11 @@ def run_batch_adaptive_protocol(
             ref_csv=pair.ref_csv,
         )
         qc_by_stem[pair.stem] = qc
+        # QC is metadata, not a structural admission filter. Strict parsing above
+        # decides whether a pair is loadable; bad samples continue into calculation.
+        accepted_pairs.append(pair)
         if qc.is_good:
             good_qc.append(qc)
-            good_pairs.append(pair)
         else:
             bad_qc.append(qc)
     _log(f"好样本数量: {len(good_qc)}")
@@ -379,10 +389,15 @@ def run_batch_adaptive_protocol(
     pair_by_group: dict[str, SamplePair] = {}
     load_failures: list[dict[str, Any]] = []
     signal_figures: dict[str, dict[str, Path]] = {}
-    for idx, pair in enumerate(good_pairs, start=1):
-        _progress({"stage": "preprocess", "current": idx, "total": len(good_pairs), "sample": pair.stem})
+    for idx, pair in enumerate(accepted_pairs, start=1):
+        _progress({"stage": "preprocess", "current": idx, "total": len(accepted_pairs), "sample": pair.stem})
         try:
-            dataset = load_and_preprocess_protocol(pair.sensor_csv, pair.ref_csv, fs_origin=fs_origin)
+            dataset = load_and_preprocess_protocol(
+                pair.sensor_csv,
+                pair.ref_csv,
+                fs_origin=fs_origin,
+                calibration=calibration,
+            )
             datasets[pair.motion_id] = dataset
             pair_by_group[pair.motion_id] = pair
             seg_for_plot = detect_activity_segments(dataset.accx, dataset.accy, dataset.accz, dataset.fs, TW=8)
@@ -406,10 +421,10 @@ def run_batch_adaptive_protocol(
             )
 
     grouped_pairs: dict[str, list[SamplePair]] = {}
-    for pair in good_pairs:
+    for pair in accepted_pairs:
         if pair.motion_id in datasets:
             grouped_pairs.setdefault(pair.motion_type, []).append(pair)
-    motion_types = sorted(grouped_pairs)
+    motion_types = _motion_types_in_canonical_order(grouped_pairs)
     _log(f"当前识别到的运动类型列表: {motion_types}")
     for motion_type in motion_types:
         members = grouped_pairs[motion_type]
@@ -448,6 +463,14 @@ def run_batch_adaptive_protocol(
 
         restored_results = _load_completed_mode_results(motion_dir)
         restored_by_key = {result.mode_key: result for result in restored_results}
+        input_signatures = {
+            pair.motion_id: f"{_file_content_signature(pair.sensor_csv)}:{_file_content_signature(pair.ref_csv)}"
+            for pair in members
+        }
+        calibration_signature = str(getattr(calibration, "source_sha256", ""))
+        search_space_signature = hashlib.sha256(
+            json.dumps(_jsonify(asdict(space)), ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
         mode_results: list[_ModeOptimisation] = []
         shared_trial_cache: OrderedDict[tuple[Any, ...], ProtocolRunResult] = OrderedDict()
         for scope in scopes:
@@ -468,9 +491,30 @@ def run_batch_adaptive_protocol(
                             "adaptive_filter": adaptive_filter,
                         }
                     )
-                    mode_key = _mode_key_for(scope, scheme, adaptive_filter)
+                    mode_key = _mode_key_for(motion_type, scope, scheme, adaptive_filter)
+                    expected_fingerprint = _build_mode_fingerprint(
+                        motion_type=motion_type,
+                        scope=scope,
+                        scheme=scheme,
+                        adaptive_filter=adaptive_filter,
+                        objective_mode=objective_mode,
+                        data_split_mode=data_split_mode,
+                        input_signatures=input_signatures,
+                        calibration_signature=calibration_signature,
+                        search_space_signature=search_space_signature,
+                        n_trials=budget["n_trials"],
+                        n_repeats=budget["n_repeats"],
+                        fixed_config={
+                            "fs_origin": int(fs_origin),
+                            "random_state": int(random_state),
+                            "num_seed_points": int(num_seed_points),
+                            "penalty_value": float(penalty_value),
+                            "delay_estimation_mode": delay_estimation_mode,
+                            "trial_param_overrides": trial_overrides,
+                        },
+                    )
                     resumed = restored_by_key.get(mode_key)
-                    if resumed is not None:
+                    if resumed is not None and resumed.run_fingerprint == expected_fingerprint:
                         mode_results.append(resumed)
                         gc.collect()
                         continue
@@ -578,6 +622,7 @@ def run_batch_adaptive_protocol(
                             train_group_ids=train_ids,
                             test_group_id=test_ids[0] if len(test_ids) == 1 else "",
                         )
+                    result.run_fingerprint = expected_fingerprint
                     mode_results.append(result)
                     _finalize_completed_mode(
                         motion_dir,
@@ -714,6 +759,12 @@ def _build_split_plan(
     return plans
 
 
+def _motion_types_in_canonical_order(grouped: dict[str, Any]) -> list[str]:
+    """Return present motion types in the one shared protocol order."""
+
+    return [motion.value for motion in MotionType if motion.value in grouped]
+
+
 def _split_rows(folds: list[dict[str, Any]], pair_by_group: dict[str, SamplePair]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for fold in folds:
@@ -835,8 +886,16 @@ def _run_one_optuna_repeat(
 
     try:
         if optuna is not None and TPESampler is not None:
+            mode_seed = _derive_mode_seed(
+                random_state=random_state,
+                motion_type=motion_type,
+                scope=scope,
+                scheme=scheme,
+                adaptive_filter=adaptive_filter,
+                repeat_idx=repeat_idx,
+            )
             sampler = TPESampler(
-                seed=int(random_state) + int(repeat_idx),
+                seed=mode_seed,
                 n_startup_trials=min(int(num_seed_points), int(n_trials)),
             )
             study = optuna.create_study(direction="minimize", sampler=sampler)
@@ -854,7 +913,7 @@ def _run_one_optuna_repeat(
                     adaptive_filter=adaptive_filter,
                     objective_mode=objective_mode,
                     delay_estimation_mode=delay_estimation_mode,
-                    mode_key=f"{scope.value}__{scheme.value}__{adaptive_filter}",
+                    mode_key=_mode_key_for(motion_type, scope, scheme, adaptive_filter),
                     repeat_idx=repeat_idx,
                     random_state=random_state,
                     trial_param_overrides=trial_param_overrides,
@@ -885,7 +944,16 @@ def _run_one_optuna_repeat(
 
             study.optimize(_objective, n_trials=int(n_trials), show_progress_bar=False)
         else:
-            rng = np.random.default_rng(int(random_state) + int(repeat_idx))
+            rng = np.random.default_rng(
+                _derive_mode_seed(
+                    random_state=random_state,
+                    motion_type=motion_type,
+                    scope=scope,
+                    scheme=scheme,
+                    adaptive_filter=adaptive_filter,
+                    repeat_idx=repeat_idx,
+                )
+            )
             for trial_idx in range(int(n_trials)):
                 idx_map = {
                     name: int(rng.integers(0, len(space.options(name))))
@@ -897,7 +965,7 @@ def _run_one_optuna_repeat(
                     adaptive_filter=adaptive_filter,
                     objective_mode=objective_mode,
                     delay_estimation_mode=delay_estimation_mode,
-                    mode_key=f"{scope.value}__{scheme.value}__{adaptive_filter}",
+                    mode_key=_mode_key_for(motion_type, scope, scheme, adaptive_filter),
                     repeat_idx=repeat_idx,
                     random_state=random_state,
                     trial_param_overrides=trial_param_overrides,
@@ -1141,8 +1209,16 @@ def _optimise_group_mode(
 
     for repeat_idx in ([] if actual_n_jobs > 1 and int(n_repeats) > 1 else range(int(n_repeats))):
         if optuna is not None and TPESampler is not None:
+            mode_seed = _derive_mode_seed(
+                random_state=random_state,
+                motion_type=motion_type,
+                scope=scope,
+                scheme=scheme,
+                adaptive_filter=adaptive_filter,
+                repeat_idx=repeat_idx,
+            )
             sampler = TPESampler(
-                seed=int(random_state) + repeat_idx,
+                seed=mode_seed,
                 n_startup_trials=min(int(cfg.num_seed_points), int(n_trials)),
             )
             study = optuna.create_study(direction="minimize", sampler=sampler)
@@ -1160,7 +1236,7 @@ def _optimise_group_mode(
                     adaptive_filter=adaptive_filter,
                     objective_mode=objective_mode,
                     delay_estimation_mode=delay_estimation_mode,
-                    mode_key=f"{scope.value}__{scheme.value}__{adaptive_filter}",
+                    mode_key=_mode_key_for(motion_type, scope, scheme, adaptive_filter),
                     repeat_idx=repeat_idx,
                     random_state=random_state,
                     trial_param_overrides=trial_param_overrides,
@@ -1210,7 +1286,16 @@ def _optimise_group_mode(
 
             study.optimize(_objective, n_trials=int(n_trials), show_progress_bar=False)
         else:
-            rng = np.random.default_rng(int(random_state) + repeat_idx)
+            rng = np.random.default_rng(
+                _derive_mode_seed(
+                    random_state=random_state,
+                    motion_type=motion_type,
+                    scope=scope,
+                    scheme=scheme,
+                    adaptive_filter=adaptive_filter,
+                    repeat_idx=repeat_idx,
+                )
+            )
             for trial_idx in range(int(n_trials)):
                 idx_map = {
                     name: int(rng.integers(0, len(space.options(name))))
@@ -1222,7 +1307,7 @@ def _optimise_group_mode(
                     adaptive_filter=adaptive_filter,
                     objective_mode=objective_mode,
                     delay_estimation_mode=delay_estimation_mode,
-                    mode_key=f"{scope.value}__{scheme.value}__{adaptive_filter}",
+                    mode_key=_mode_key_for(motion_type, scope, scheme, adaptive_filter),
                     repeat_idx=repeat_idx,
                     random_state=random_state,
                     trial_param_overrides=trial_param_overrides,
@@ -1918,8 +2003,73 @@ def _mode_artifact_dir(motion_dir: Path, result: _ModeOptimisation) -> Path:
     return motion_dir / "_modes" / result.mode_key
 
 
-def _mode_key_for(scope: TargetScope, scheme: CascadeScheme, adaptive_filter: str) -> str:
-    return f"{scope.value}__{scheme.value}__{adaptive_filter}"
+def _mode_key_for(
+    motion_type: str,
+    scope: TargetScope,
+    scheme: CascadeScheme,
+    adaptive_filter: str,
+) -> str:
+    """Return a globally unique optimisation/checkpoint identity."""
+
+    return f"{motion_type}__{scope.value}__{scheme.value}__{adaptive_filter}"
+
+
+def _derive_mode_seed(
+    *,
+    random_state: int,
+    motion_type: str,
+    scope: TargetScope,
+    scheme: CascadeScheme,
+    adaptive_filter: str,
+    repeat_idx: int,
+) -> int:
+    """Derive a reproducible sampler/RFF namespace including motion type."""
+
+    return _stable_int_hash(
+        {
+            "random_state": int(random_state),
+            "motion_type": str(motion_type),
+            "target_scope": scope.value,
+            "cascade_scheme": scheme.value,
+            "adaptive_filter": str(adaptive_filter),
+            "repeat_idx": int(repeat_idx),
+        }
+    )
+
+
+def _build_mode_fingerprint(
+    *,
+    motion_type: str,
+    scope: TargetScope,
+    scheme: CascadeScheme,
+    adaptive_filter: str,
+    objective_mode: str,
+    data_split_mode: str,
+    input_signatures: dict[str, str],
+    calibration_signature: str,
+    search_space_signature: str,
+    n_trials: int,
+    n_repeats: int,
+    fixed_config: dict[str, Any],
+) -> str:
+    """Hash every input that determines whether a mode checkpoint is reusable."""
+
+    payload = {
+        "motion_type": str(motion_type),
+        "target_scope": scope.value,
+        "cascade_scheme": scheme.value,
+        "adaptive_filter": str(adaptive_filter),
+        "objective_mode": str(objective_mode),
+        "data_split_mode": str(data_split_mode),
+        "input_signatures": dict(sorted(input_signatures.items())),
+        "calibration_signature": str(calibration_signature),
+        "search_space_signature": str(search_space_signature),
+        "n_trials": int(n_trials),
+        "n_repeats": int(n_repeats),
+        "fixed_config": fixed_config,
+    }
+    text = json.dumps(_jsonify(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _mode_history_path(motion_dir: Path, result: _ModeOptimisation) -> Path:
@@ -1971,6 +2121,7 @@ def _mode_manifest_payload(result: _ModeOptimisation) -> dict[str, Any]:
         "params_semantics": result.params_semantics,
         "representative_fold_id": result.representative_fold_id,
         "representative_heldout_group_id": result.representative_heldout_group_id,
+        "run_fingerprint": result.run_fingerprint,
         "fold_results": [_mode_manifest_payload(fold) for fold in result.fold_results],
     }
 
@@ -2017,6 +2168,7 @@ def _mode_result_from_manifest_payload(payload: dict[str, Any]) -> _ModeOptimisa
             else int(payload.get("representative_fold_id"))
         ),
         representative_heldout_group_id=str(payload.get("representative_heldout_group_id", "")),
+        run_fingerprint=str(payload.get("run_fingerprint", "")),
     )
 
 
@@ -2068,6 +2220,7 @@ def _update_mode_checkpoint_entry(
     checkpoint = _read_motion_checkpoint(motion_dir)
     checkpoint["modes"][result.mode_key] = {
         "status": str(checkpoint_status),
+        "run_fingerprint": result.run_fingerprint,
         "mode_manifest_path": str(manifest_path or result.mode_manifest_path or ""),
         "history_path": str(history_path or result.history_path or ""),
     }
@@ -3636,6 +3789,19 @@ def _stable_int_hash(payload: Any) -> int:
     text = json.dumps(_jsonify(payload), ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return int(digest[:16], 16) % (2**32)
+
+
+def _file_content_signature(path: str | Path) -> str:
+    """Return a reproducible SHA-256 signature, including a clear missing marker."""
+
+    source = Path(path)
+    if not source.is_file():
+        return f"missing:{source.resolve()}"
+    digest = hashlib.sha256()
+    with source.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def build_cross_motion_summary_table(
