@@ -99,6 +99,26 @@ def test_compat_wrapper_keeps_alignment_tw_independent_from_tw() -> None:
     assert aligned_10.alignment_info.train_tw_s == 10.0
 
 
+def test_alignment_accepts_notebook_hr_band_hz_kwargs() -> None:
+    ds, segment = _synthetic_dataset()
+
+    aligned = align_ppg_to_ref_hr(
+        ds,
+        segment,
+        TW=8.0,
+        fs_target=ds.fs,
+        alignment_TW=8.0,
+        delay_range_s=(-0.5, 0.5),
+        delay_step_s=0.5,
+        rest_hr_kwargs={
+            "hr_band_hz": (40.0 / 60.0, 180.0 / 60.0),
+            "track_band_bpm": 30.0,
+        },
+    )
+
+    assert np.isfinite(aligned.alignment_info.best_tdelay_s)
+
+
 def test_global_tdelay_cache_key_excludes_train_tw() -> None:
     ds, _ = _synthetic_dataset()
     p6 = ProtocolTrialParams(Fs_Target=50, TW=6.0, Alignment_TW=8.0)

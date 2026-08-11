@@ -1042,7 +1042,7 @@ def _rest_ppg_hr_tracked_for_delay(
     if penalty_signal is not None:
         shifted_penalty = _shift_channel_for_delay(penalty_signal, delay_s, fs)
         penalty_segment = shifted_penalty[min_start:max_end]
-    kwargs = dict(rest_hr_kwargs)
+    kwargs = _normalise_rest_hr_extractor_kwargs(rest_hr_kwargs)
     kwargs["tw_s"] = tw_s
     kwargs["step_s"] = step_s
     # 中文说明：参考实现的纯 FFT 路径使用 ACC 作为谱惩罚参考；这里传入同一
@@ -1058,6 +1058,24 @@ def _rest_ppg_hr_tracked_for_delay(
         hr_bpm_smooth=result.hr_bpm_smooth,
         quality=result.quality,
     )
+
+
+def _normalise_rest_hr_extractor_kwargs(rest_hr_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Convert plotting-friendly rest-HR keyword aliases for the core extractor."""
+
+    kwargs = dict(rest_hr_kwargs)
+    hr_band_hz = kwargs.pop("hr_band_hz", None)
+    if hr_band_hz is None:
+        return kwargs
+    values = np.asarray(hr_band_hz, dtype=float).ravel()
+    if values.size != 2 or not np.all(np.isfinite(values)) or not 0.0 < values[0] < values[1]:
+        raise ValueError("hr_band_hz must contain two finite increasing positive values")
+    converted = (float(values[0]) * 60.0, float(values[1]) * 60.0)
+    existing = kwargs.get("hr_band_bpm")
+    if existing is not None and not np.allclose(np.asarray(existing, dtype=float), converted):
+        raise ValueError("hr_band_hz and hr_band_bpm describe different frequency ranges")
+    kwargs["hr_band_bpm"] = converted
+    return kwargs
 
 
 def _reference_hr_for_alignment_times(
