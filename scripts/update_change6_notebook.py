@@ -86,12 +86,26 @@ CONFIG_COMMENTS = {
     "ENABLE_LOW_LOCK_RECOVERY": "是否启用低锁定确认和恢复；实际仅对 LMS 生效。",
     "ENABLE_HIGH_LOCK_RECOVERY": "是否启用高锁定风险确认、恢复和冷却。",
     "ENABLE_POST_MOTION_PROTECTION": "是否启用运动结束后 reset-FFT、交叉和 gap rescue 保护。",
-    "TRACKING_RANGE_UP_BPM": "增强追踪向上搜索范围(bpm)。",
-    "TRACKING_RANGE_DOWN_BPM": "增强追踪向下搜索范围(bpm)。",
-    "TRACKING_SLEW_LIMIT_UP_BPM": "向上候选可直接接受的最大变化阈值(bpm)。",
-    "TRACKING_SLEW_STEP_UP_BPM": "超过阈值时向上每窗口最大推进步长(bpm)。",
-    "TRACKING_SLEW_LIMIT_DOWN_BPM": "向下候选可直接接受的最大变化阈值(bpm)。",
-    "TRACKING_SLEW_STEP_DOWN_BPM": "超过阈值时向下每窗口最大推进步长(bpm)。",
+    "TRACKING_RANGE_UP_BPM": "旧共享向上搜索范围兼容覆盖；None 表示使用分阶段参考参数。",
+    "TRACKING_RANGE_DOWN_BPM": "旧共享向下搜索范围兼容覆盖；None 表示使用分阶段参考参数。",
+    "TRACKING_SLEW_LIMIT_UP_BPM": "旧共享上行 limit 兼容覆盖；None 表示使用分阶段参考参数。",
+    "TRACKING_SLEW_STEP_UP_BPM": "旧共享上行 step 兼容覆盖；None 表示使用分阶段参考参数。",
+    "TRACKING_SLEW_LIMIT_DOWN_BPM": "旧共享下行 limit 兼容覆盖；None 表示使用分阶段参考参数。",
+    "TRACKING_SLEW_STEP_DOWN_BPM": "旧共享下行 step 兼容覆盖；None 表示使用分阶段参考参数。",
+    "MOTION_TRACKING_RANGE_UP_BPM": "adaptive 运动段向上候选搜索范围(bpm)。",
+    "MOTION_TRACKING_RANGE_DOWN_BPM": "adaptive 运动段向下候选搜索范围(bpm)。",
+    "MOTION_TRACKING_SLEW_LIMIT_UP_BPM": "adaptive 运动段上行可直接接受阈值(bpm)。",
+    "MOTION_TRACKING_SLEW_STEP_UP_BPM": "adaptive 运动段上行超限时单窗口推进步长(bpm)。",
+    "MOTION_TRACKING_SLEW_LIMIT_DOWN_BPM": "adaptive 运动段下行可直接接受阈值(bpm)。",
+    "MOTION_TRACKING_SLEW_STEP_DOWN_BPM": "adaptive 运动段下行超限时单窗口推进步长(bpm)。",
+    "RECOVERY_TRACKING_RANGE_UP_BPM": "adaptive 恢复段向上候选搜索范围(bpm)。",
+    "RECOVERY_TRACKING_RANGE_DOWN_BPM": "adaptive 恢复段向下候选搜索范围(bpm)。",
+    "RECOVERY_TRACKING_SLEW_LIMIT_UP_BPM": "adaptive 恢复段上行可直接接受阈值(bpm)。",
+    "RECOVERY_TRACKING_SLEW_STEP_UP_BPM": "adaptive 恢复段上行超限时单窗口推进步长(bpm)。",
+    "RECOVERY_TRACKING_SLEW_LIMIT_DOWN_BPM": "adaptive 恢复段下行可直接接受阈值(bpm)。",
+    "RECOVERY_TRACKING_SLEW_STEP_DOWN_BPM": "adaptive 恢复段下行超限时单窗口推进步长(bpm)。",
+    "CANDIDATE_PEAK_THRESHOLD_RATIO": "运动惩罚参考峰相对主峰门限；参考默认 0.30。",
+    "FULL_CANDIDATE_PEAK_THRESHOLD_RATIO": "PPG 完整候选相对主峰门限；参考默认 0.15。",
     "LOW_LOCK_MIN_BPM": "低锁定判定区间下限(bpm)。",
     "LOW_LOCK_MAX_BPM": "低锁定判定区间上限(bpm)。",
     "LOW_LOCK_MIN_WINDOWS": "进入低锁定风险前要求连续命中的窗口数。",
@@ -110,7 +124,7 @@ CONFIG_COMMENTS = {
     "HIGH_LOCK_PENALTY_EXCLUSION_BPM": "挑战峰附近免受运动惩罚影响的频带宽度(bpm)。",
     "HIGH_LOCK_DOWN_STEP_BPM": "高锁定恢复时单窗口最大下降步长(bpm)。",
     "HIGH_LOCK_UP_STEP_BPM": "高锁定冷却期内单窗口最大反向上升步长(bpm)。",
-    "POST_MOTION_GUARD_SECONDS": "运动结束后动态保护的持续时间(秒)，默认对应 post10。",
+    "POST_MOTION_GUARD_SECONDS": "旧固定 timeout 兼容值；None 表示动态保护不按时间硬退出。",
     "POST_MOTION_GUARD_MIN_ELAPSED_S": "运动后允许稳定交叉前的最短等待时间(秒)。",
     "POST_MOTION_GUARD_STABLE_WINDOWS": "运动后候选稳定交叉所需的连续窗口数。",
     "POST_MOTION_GUARD_CROSSOVER_GAP_BPM": "稳定交叉时两来源允许的最大差值(bpm)。",
@@ -118,6 +132,8 @@ CONFIG_COMMENTS = {
     "POST_MOTION_GUARD_FFT_FLOOR_BPM": "reset-FFT 候选允许的最低心率(bpm)。",
     "POST_MOTION_GUARD_RECOVERY_STEP_UP_BPM": "运动后保护期每窗口最大上调步长(bpm)。",
     "POST_MOTION_GUARD_RECOVERY_STEP_DOWN_BPM": "运动后保护期每窗口最大下调步长(bpm)。",
+    "POST_MOTION_GUARD_RISING_WINDOWS": "rising rescue 检查的连续 adaptive 窗口数。",
+    "POST_MOTION_GUARD_RISING_SLOPE_BPM_PER_WINDOW": "rising rescue 要求的每窗口最低上升幅度(bpm)。",
     "POST_MOTION_GUARD_RESCUE_GAP_BPM": "触发大间隔 rescue 的来源差值阈值(bpm)。",
     "POST_MOTION_GUARD_GAP_RESCUE_ENABLE": "是否启用运动后大间隔多数命中救援。",
     "POST_MOTION_GUARD_GAP_RESCUE_WINDOWS": "gap rescue 统计使用的最近窗口数。",
@@ -427,12 +443,26 @@ CASCADE_GUARD_RATIO_MAX = 5.0
 CASCADE_GUARD_FLAT_STD_EPS = 1e-6
 CASCADE_GUARD_USE_FINITE_ZSCORE = True
 
-TRACKING_RANGE_UP_BPM = 25.0
-TRACKING_RANGE_DOWN_BPM = 25.0
-TRACKING_SLEW_LIMIT_UP_BPM = 10.0
-TRACKING_SLEW_STEP_UP_BPM = 7.0
-TRACKING_SLEW_LIMIT_DOWN_BPM = 10.0
-TRACKING_SLEW_STEP_DOWN_BPM = 7.0
+TRACKING_RANGE_UP_BPM = None
+TRACKING_RANGE_DOWN_BPM = None
+TRACKING_SLEW_LIMIT_UP_BPM = None
+TRACKING_SLEW_STEP_UP_BPM = None
+TRACKING_SLEW_LIMIT_DOWN_BPM = None
+TRACKING_SLEW_STEP_DOWN_BPM = None
+MOTION_TRACKING_RANGE_UP_BPM = 35.0
+MOTION_TRACKING_RANGE_DOWN_BPM = 15.0
+MOTION_TRACKING_SLEW_LIMIT_UP_BPM = 5.5
+MOTION_TRACKING_SLEW_STEP_UP_BPM = 3.5
+MOTION_TRACKING_SLEW_LIMIT_DOWN_BPM = 2.0
+MOTION_TRACKING_SLEW_STEP_DOWN_BPM = 1.5
+RECOVERY_TRACKING_RANGE_UP_BPM = 20.0
+RECOVERY_TRACKING_RANGE_DOWN_BPM = 25.0
+RECOVERY_TRACKING_SLEW_LIMIT_UP_BPM = 1.5
+RECOVERY_TRACKING_SLEW_STEP_UP_BPM = 1.5
+RECOVERY_TRACKING_SLEW_LIMIT_DOWN_BPM = 3.5
+RECOVERY_TRACKING_SLEW_STEP_DOWN_BPM = 3.0
+CANDIDATE_PEAK_THRESHOLD_RATIO = 0.30
+FULL_CANDIDATE_PEAK_THRESHOLD_RATIO = 0.15
 LOW_LOCK_MIN_BPM = 50.0
 LOW_LOCK_MAX_BPM = 80.0
 LOW_LOCK_MIN_WINDOWS = 4
@@ -451,7 +481,7 @@ HIGH_LOCK_CANDIDATE_STABLE_BPM = 10.0
 HIGH_LOCK_PENALTY_EXCLUSION_BPM = 10.0
 HIGH_LOCK_DOWN_STEP_BPM = 20.0
 HIGH_LOCK_UP_STEP_BPM = 3.0
-POST_MOTION_GUARD_SECONDS = 10.0
+POST_MOTION_GUARD_SECONDS = None
 POST_MOTION_GUARD_MIN_ELAPSED_S = 5.0
 POST_MOTION_GUARD_STABLE_WINDOWS = 3
 POST_MOTION_GUARD_CROSSOVER_GAP_BPM = 2.0
@@ -459,6 +489,8 @@ POST_MOTION_GUARD_UPWARD_GAP_BPM = 1.5
 POST_MOTION_GUARD_FFT_FLOOR_BPM = 55.0
 POST_MOTION_GUARD_RECOVERY_STEP_UP_BPM = 1.5
 POST_MOTION_GUARD_RECOVERY_STEP_DOWN_BPM = 3.0
+POST_MOTION_GUARD_RISING_WINDOWS = 3
+POST_MOTION_GUARD_RISING_SLOPE_BPM_PER_WINDOW = 1.5
 POST_MOTION_GUARD_RESCUE_GAP_BPM = 20.0
 POST_MOTION_GUARD_GAP_RESCUE_ENABLE = True
 POST_MOTION_GUARD_GAP_RESCUE_WINDOWS = 4
@@ -479,9 +511,9 @@ SEARCH_SPACE.Spec_Penalty_Width = [0.1, 0.2, 0.3]
 SEARCH_SPACE.hr_range_hz = [value / 60.0 for value in (20, 25, 30, 35, 40)]
 SEARCH_SPACE.slew_limit_bpm = [8, 10, 12, 14]
 SEARCH_SPACE.slew_step_bpm = [5, 7, 9]
-SEARCH_SPACE.Rest_HR_Track_Band_BPM = [20.0, 30.0, 50.0, 60.0, 80.0]
-SEARCH_SPACE.Rest_HR_Slew_Limit_BPM = [1.0, 3.0, 5.0, 6.0, 8.0, 25.0]
-SEARCH_SPACE.Rest_HR_Slew_Step_BPM = [0.5, 2.0, 4.0, 5.0, 8.0, 12.0]
+SEARCH_SPACE.Rest_HR_Track_Band_BPM = [20.0, 30.0, 60.0, 80.0]
+SEARCH_SPACE.Rest_HR_Slew_Limit_BPM = [1.0, 3.0, 6.0, 8.0]
+SEARCH_SPACE.Rest_HR_Slew_Step_BPM = [0.5, 2.0, 4.0]
 SEARCH_SPACE.LMS_Mu_Base = [0.004, 0.006, 0.008]
 SEARCH_SPACE.RFF_LMS_Mu_Base = [0.001, 0.002, 0.004, 0.006]
 SEARCH_SPACE.alpha_u = [0.005, 0.01, 0.03, 0.05, 0.1]
@@ -577,6 +609,20 @@ TRIAL_PARAM_OVERRIDES = {
     "tracking_slew_step_up_bpm": TRACKING_SLEW_STEP_UP_BPM,
     "tracking_slew_limit_down_bpm": TRACKING_SLEW_LIMIT_DOWN_BPM,
     "tracking_slew_step_down_bpm": TRACKING_SLEW_STEP_DOWN_BPM,
+    "motion_tracking_range_up_bpm": MOTION_TRACKING_RANGE_UP_BPM,
+    "motion_tracking_range_down_bpm": MOTION_TRACKING_RANGE_DOWN_BPM,
+    "motion_tracking_slew_limit_up_bpm": MOTION_TRACKING_SLEW_LIMIT_UP_BPM,
+    "motion_tracking_slew_step_up_bpm": MOTION_TRACKING_SLEW_STEP_UP_BPM,
+    "motion_tracking_slew_limit_down_bpm": MOTION_TRACKING_SLEW_LIMIT_DOWN_BPM,
+    "motion_tracking_slew_step_down_bpm": MOTION_TRACKING_SLEW_STEP_DOWN_BPM,
+    "recovery_tracking_range_up_bpm": RECOVERY_TRACKING_RANGE_UP_BPM,
+    "recovery_tracking_range_down_bpm": RECOVERY_TRACKING_RANGE_DOWN_BPM,
+    "recovery_tracking_slew_limit_up_bpm": RECOVERY_TRACKING_SLEW_LIMIT_UP_BPM,
+    "recovery_tracking_slew_step_up_bpm": RECOVERY_TRACKING_SLEW_STEP_UP_BPM,
+    "recovery_tracking_slew_limit_down_bpm": RECOVERY_TRACKING_SLEW_LIMIT_DOWN_BPM,
+    "recovery_tracking_slew_step_down_bpm": RECOVERY_TRACKING_SLEW_STEP_DOWN_BPM,
+    "candidate_peak_threshold_ratio": CANDIDATE_PEAK_THRESHOLD_RATIO,
+    "full_candidate_peak_threshold_ratio": FULL_CANDIDATE_PEAK_THRESHOLD_RATIO,
     "low_lock_min_bpm": LOW_LOCK_MIN_BPM,
     "low_lock_max_bpm": LOW_LOCK_MAX_BPM,
     "low_lock_min_windows": LOW_LOCK_MIN_WINDOWS,
@@ -603,6 +649,8 @@ TRIAL_PARAM_OVERRIDES = {
     "post_motion_guard_fft_floor_bpm": POST_MOTION_GUARD_FFT_FLOOR_BPM,
     "post_motion_guard_recovery_step_up_bpm": POST_MOTION_GUARD_RECOVERY_STEP_UP_BPM,
     "post_motion_guard_recovery_step_down_bpm": POST_MOTION_GUARD_RECOVERY_STEP_DOWN_BPM,
+    "post_motion_guard_rising_windows": POST_MOTION_GUARD_RISING_WINDOWS,
+    "post_motion_guard_rising_slope_bpm_per_window": POST_MOTION_GUARD_RISING_SLOPE_BPM_PER_WINDOW,
     "post_motion_guard_rescue_gap_bpm": POST_MOTION_GUARD_RESCUE_GAP_BPM,
     "post_motion_guard_gap_rescue_enable": POST_MOTION_GUARD_GAP_RESCUE_ENABLE,
     "post_motion_guard_gap_rescue_windows": POST_MOTION_GUARD_GAP_RESCUE_WINDOWS,

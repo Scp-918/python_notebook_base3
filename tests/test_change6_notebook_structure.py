@@ -205,6 +205,64 @@ def test_layered_config_cells_two_three_four_have_inline_parameter_comments() ->
     assert not missing, "\n".join(missing)
 
 
+def test_notebook_uses_reference_phase_tracking_and_dynamic_guard_defaults() -> None:
+    joined = "\n".join(_sources("code"))
+    override_cell = next(source for source in _sources("code") if "TRIAL_PARAM_OVERRIDES =" in source)
+
+    expected_assignments = (
+        "MOTION_TRACKING_RANGE_UP_BPM = 35.0",
+        "MOTION_TRACKING_RANGE_DOWN_BPM = 15.0",
+        "MOTION_TRACKING_SLEW_LIMIT_UP_BPM = 5.5",
+        "MOTION_TRACKING_SLEW_STEP_UP_BPM = 3.5",
+        "MOTION_TRACKING_SLEW_LIMIT_DOWN_BPM = 2.0",
+        "MOTION_TRACKING_SLEW_STEP_DOWN_BPM = 1.5",
+        "RECOVERY_TRACKING_RANGE_UP_BPM = 20.0",
+        "RECOVERY_TRACKING_RANGE_DOWN_BPM = 25.0",
+        "RECOVERY_TRACKING_SLEW_LIMIT_UP_BPM = 1.5",
+        "RECOVERY_TRACKING_SLEW_STEP_UP_BPM = 1.5",
+        "RECOVERY_TRACKING_SLEW_LIMIT_DOWN_BPM = 3.5",
+        "RECOVERY_TRACKING_SLEW_STEP_DOWN_BPM = 3.0",
+        "CANDIDATE_PEAK_THRESHOLD_RATIO = 0.30",
+        "FULL_CANDIDATE_PEAK_THRESHOLD_RATIO = 0.15",
+        "POST_MOTION_GUARD_SECONDS = None",
+        "POST_MOTION_GUARD_RISING_WINDOWS = 3",
+        "POST_MOTION_GUARD_RISING_SLOPE_BPM_PER_WINDOW = 1.5",
+        "SEARCH_SPACE.Rest_HR_Track_Band_BPM = [20.0, 30.0, 60.0, 80.0]",
+        "SEARCH_SPACE.Rest_HR_Slew_Limit_BPM = [1.0, 3.0, 6.0, 8.0]",
+        "SEARCH_SPACE.Rest_HR_Slew_Step_BPM = [0.5, 2.0, 4.0]",
+    )
+    for assignment in expected_assignments:
+        assert assignment in joined
+
+    for legacy_name in (
+        "TRACKING_RANGE_UP_BPM",
+        "TRACKING_RANGE_DOWN_BPM",
+        "TRACKING_SLEW_LIMIT_UP_BPM",
+        "TRACKING_SLEW_STEP_UP_BPM",
+        "TRACKING_SLEW_LIMIT_DOWN_BPM",
+        "TRACKING_SLEW_STEP_DOWN_BPM",
+    ):
+        assert f"{legacy_name} = None" in joined
+
+    for field_name in (
+        "motion_tracking_range_up_bpm",
+        "recovery_tracking_range_down_bpm",
+        "candidate_peak_threshold_ratio",
+        "full_candidate_peak_threshold_ratio",
+        "post_motion_guard_rising_windows",
+        "post_motion_guard_rising_slope_bpm_per_window",
+    ):
+        assert f'"{field_name}":' in override_cell
+
+
+def test_readme_distinguishes_motion_post10_from_dynamic_guard_lifetime() -> None:
+    readme = Path("notebooks/readme.md").read_text(encoding="utf-8")
+
+    assert "adaptive_rising_rescue" in readme
+    assert "motion_post10" in readme
+    assert "不作为运动后保护的固定退出时间" in readme
+
+
 def test_notebook_safe_defaults_execute_without_creating_outputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

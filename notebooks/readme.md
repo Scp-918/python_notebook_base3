@@ -27,6 +27,16 @@ Notebook 首个代码单元提供 `legacy/enhanced` 总开关和六项独立开�
 `enhanced` 且全部开启。这些字段会进入参数 JSON/CSV、cache key、模式 checkpoint
 指纹和 replay 参数恢复。
 
+增强模式按来源和阶段使用参考方向参数：普通 raw/baseline 路径保持独立的静息
+追踪；adaptive 在运动段使用 `35/15 bpm` 搜索范围，在恢复段使用 `20/25 bpm`；
+运动结束后 reset-FFT 会清空自身历史并独立启动。恢复期最初继续输出 adaptive，随后
+依次检查 `stable_crossover`、`gap_rescue` 和 `adaptive_rising_rescue`。切换到
+reset-FFT 后不再回跳；若没有足够证据，则保持 adaptive 到记录结束。
+
+`motion_post10` 只表示默认 objective 评价运动结束后 10 秒内的窗口，不作为运动后保护的固定退出时间。
+`POST_MOTION_GUARD_SECONDS=None` 是新默认；只有显式填写数值时才恢复旧的 timeout
+兼容行为。PPG 完整候选峰门限为 `0.15`，运动惩罚参考峰门限为 `0.30`。
+
 ## 输出与断点目录
 
 Notebook 和 Python 后端统一使用以下确定性目录：
