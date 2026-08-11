@@ -120,6 +120,22 @@ def test_notebook_restores_replay_diagnostics_sections_ten_through_fifteen() -> 
     assert "run_batch_reference_compare(" in joined
 
 
+def test_notebook_adds_subject_batch_target_redraw_section_and_mode_progress() -> None:
+    markdown = _sources("markdown")
+    headings = [line for source in markdown for line in source.splitlines() if line.startswith("## ")]
+    joined = "\n".join(_sources("code"))
+
+    assert any(line.startswith("## 16.") for line in headings)
+    assert "redraw_subject_target_hr_curves(" in joined
+    assert "progress_callback=notebook_progress" in joined
+    assert 'info.get("stage") != "optimization_mode_completed"' in joined
+    assert "posthoc_final_aae_bpm" in joined
+    assert "acc_compare_posthoc_aae_bpm" in joined
+    assert 'RUN_BATCH_TARGET_HR_REDRAW = False' in joined
+    assert 'BATCH_TARGET_CASCADE_SCHEME = CascadeScheme.ACC.value' in joined
+    assert 'BATCH_TARGET_OUTPUT_DIR = Path(RESULTS_ROOT) / "batch_target_hr_curves"' in joined
+
+
 def test_replay_uses_subject_pair_selectors_and_run_subdirectories() -> None:
     joined = "\n".join(_sources("code"))
 
@@ -135,6 +151,7 @@ def test_replay_uses_subject_pair_selectors_and_run_subdirectories() -> None:
         'CROSS_OUTPUT_DIR = Path(RESULTS_ROOT) / "cross_replay"',
         'CROSS_DIAGNOSTIC_OUTPUT_DIR = Path(RESULTS_ROOT) / "cross_window_diagnostics"',
         'REFERENCE_COMPARE_OUTPUT_DIR = Path(RESULTS_ROOT) / "batch_reference_compare"',
+        'BATCH_TARGET_OUTPUT_DIR = Path(RESULTS_ROOT) / "batch_target_hr_curves"',
     ):
         assert assignment in joined
 
@@ -145,6 +162,7 @@ def test_replay_uses_subject_pair_selectors_and_run_subdirectories() -> None:
         "RUN_CROSS_STAGE7_REPLAY",
         "RUN_CROSS_WINDOW_DIAGNOSTICS",
         "RUN_BATCH_REFERENCE_COMPARE",
+        "RUN_BATCH_TARGET_HR_REDRAW",
     ):
         assert f"{flag} = False" in joined
 
@@ -285,5 +303,6 @@ def test_notebook_safe_defaults_execute_without_creating_outputs(
         "RUN_CROSS_STAGE7_REPLAY",
         "RUN_CROSS_WINDOW_DIAGNOSTICS",
         "RUN_BATCH_REFERENCE_COMPARE",
+        "RUN_BATCH_TARGET_HR_REDRAW",
     ):
         assert namespace[name] is False

@@ -191,6 +191,7 @@ CONFIG_COMMENTS = {
     "RUN_CROSS_STAGE7_REPLAY": "是否运行第 13 节跨 scheme 回放。",
     "RUN_CROSS_WINDOW_DIAGNOSTICS": "是否运行第 14 节跨 scheme 窗口诊断。",
     "RUN_BATCH_REFERENCE_COMPARE": "是否运行第 15 节批量参考 scheme 对比。",
+    "RUN_BATCH_TARGET_HR_REDRAW": "是否运行第 16 节并批量重绘当前受试者全部目标段 HR 图。",
     "CONNECTIVITY_MAX_ITERATIONS": "连通性检查每模式 trial 数；默认 1，避免误跑正式预算。",
 }
 
@@ -295,6 +296,7 @@ from ppg_hr.experimental.run_batch_protocol import (
     build_subject_output_dir,
     plot_window_diagnostics_from_records,
     replay_best_record_hr_curves,
+    redraw_subject_target_hr_curves,
     run_batch_adaptive_protocol,
     run_batch_reference_compare,
 )
@@ -673,6 +675,7 @@ RUN_CROSS_MOTION_SUMMARY = False
 RUN_CROSS_STAGE7_REPLAY = False
 RUN_CROSS_WINDOW_DIAGNOSTICS = False
 RUN_BATCH_REFERENCE_COMPARE = False
+RUN_BATCH_TARGET_HR_REDRAW = False
 CONNECTIVITY_MAX_ITERATIONS = 1
 '''
         ),
@@ -864,6 +867,29 @@ else:
 # 输出：调用时返回 BatchProtocolResult。
 # 是否写文件：定义函数时不写；实际调用会写入 RUN_OUTPUT_DIR。
 # 耗时风险：定义无风险；调用会运行 Optuna，请只在明确打开训练开关时执行。
+def notebook_progress(info):
+    """每个运动-模式完成或从断点恢复后，仅打印一次最终 post-hoc 指标。"""
+    if info.get("stage") != "optimization_mode_completed":
+        return
+    state = "断点恢复" if info.get("resumed") else ("训练完成" if info.get("success") else "训练失败")
+    current = f"{int(info.get('mode_current', 0))}/{int(info.get('mode_total', 0))}"
+    mode = (
+        f"{info.get('motion_type')} / {info.get('target_scope_value')} / "
+        f"{info.get('cascade_scheme_display')} / {str(info.get('adaptive_filter')).upper()}"
+    )
+    if info.get("success"):
+        print(
+            f"[{current}] {state}: {mode} | "
+            f"final post-hoc AAE={float(info.get('posthoc_final_aae_bpm')):.3f} bpm, "
+            f"accuracy={float(info.get('posthoc_final_acc_pct')):.2f}% | "
+            f"ACC(同参数) post-hoc AAE={float(info.get('acc_compare_posthoc_aae_bpm')):.3f} bpm, "
+            f"accuracy={float(info.get('acc_compare_posthoc_accuracy_pct')):.2f}% | "
+            f"耗时={float(info.get('training_elapsed_s', 0.0)):.1f}s"
+        )
+    else:
+        print(f"[{current}] {state}: {mode} | 原因={info.get('reason', '')} | 耗时={float(info.get('training_elapsed_s', 0.0)):.1f}s")
+
+
 def run_training_cell(*, max_iterations, target_scopes, cascade_schemes, adaptive_filters):
     return run_batch_adaptive_protocol(
         subject_dir=SUBJECT_DIR,
@@ -891,6 +917,7 @@ def run_training_cell(*, max_iterations, target_scopes, cascade_schemes, adaptiv
         cascade_train_budgets=CASCADE_TRAIN_BUDGETS,
         project_root=SUBJECT_DIR.parent,
         clean_outputs=CLEAN_OUTPUTS,
+        progress_callback=notebook_progress,
     )
 ''',
     )
@@ -1264,6 +1291,45 @@ if RUN_BATCH_REFERENCE_COMPARE:
     display(pd.read_csv(reference_compare_paths["csv"]))
 else:
     print("RUN_BATCH_REFERENCE_COMPARE=False，跳过批量参考通道对比。")
+''',
+    )
+    cells += section(
+        16,
+        "批量重绘当前受试者全部目标段真实 HR—预测 HR",
+        "选择一个已训练 scheme，按 write/gripper/run/rope 和 index 顺序回放全部样本；只绘制 post-hoc 对齐参考 HR 与 final HR。",
+        r'''
+# 用途：一次调用批量输出当前受试者全部 motion/index 的目标段真实 HR—最终预测 HR 图。
+# 输入：SUBJECT_DIR、RESULTS_ROOT，以及下面单个可配置模式；读取已有 Stage-6 最优参数。
+# 输出：每样本 PNG/CSV 和 batch_target_hr_manifest.csv，并在下方显示汇总表。
+# 是否写文件：是，仅在 RUN_BATCH_TARGET_HR_REDRAW=True 时；不会创建 Optuna study。
+# 耗时风险：中到高；每个样本回放一次滤波流程，但不训练、不搜索超参数。
+BATCH_TARGET_SCOPE = TargetScope.MOTION_POST10.value  # 目标段；默认运动段至运动结束后 10 秒，仅控制评价范围。
+BATCH_TARGET_CASCADE_SCHEME = CascadeScheme.ACC.value  # 每次只回放一个 scheme；可改为其余五种 change6 scheme。
+BATCH_TARGET_ADAPTIVE_FILTER = "lms"  # 选择已训练滤波器；应与 Stage-6 最优记录完全匹配。
+BATCH_TARGET_DATA_SPLIT_MODE = "all_train"  # 选择记录中的 mode；默认同 motion 全 index 联合训练。
+BATCH_TARGET_TW_F = TW_F  # 匹配最优记录的前置收敛上下文；None 表示不按 TW_F 筛选。
+BATCH_TARGET_OUTPUT_DIR = Path(RESULTS_ROOT) / "batch_target_hr_curves"  # 输出基目录；后端会追加模式签名。
+batch_target_manifest = pd.DataFrame()
+if RUN_BATCH_TARGET_HR_REDRAW:
+    batch_target_manifest = redraw_subject_target_hr_curves(
+        subject_dir=SUBJECT_DIR,
+        results_root=RESULTS_ROOT,
+        target_scope=BATCH_TARGET_SCOPE,
+        cascade_scheme=BATCH_TARGET_CASCADE_SCHEME,
+        adaptive_filter=BATCH_TARGET_ADAPTIVE_FILTER,
+        data_split_mode=BATCH_TARGET_DATA_SPLIT_MODE,
+        TW_F=BATCH_TARGET_TW_F,
+        output_dir=BATCH_TARGET_OUTPUT_DIR,
+        fs_origin=FS_ORIGIN,
+        postprocess_method_override=REDRAW_HR_POSTPROCESS_METHOD,
+    )
+    success_count = int((batch_target_manifest["status"] == "ok").sum())
+    failed_count = int((batch_target_manifest["status"] != "ok").sum())
+    print(f"批量目标段重绘完成：成功 {success_count}，失败 {failed_count}")
+    print("manifest:", batch_target_manifest.attrs.get("manifest_path"))
+    display(batch_target_manifest)
+else:
+    print("RUN_BATCH_TARGET_HR_REDRAW=False，跳过全受试者目标段批量重绘。")
 ''',
     )
 

@@ -3406,11 +3406,12 @@ def redraw_subject_target_hr_curves(
     mode_signature = (
         f"{scope.value}__{scheme.value}__{filter_name}__{data_split_mode}__{tw_label}"
     )
-    out_root = (
+    output_base = (
         Path(output_dir).resolve()
         if output_dir is not None
-        else results_path / "batch_target_hr_curves" / mode_signature
+        else results_path / "batch_target_hr_curves"
     )
+    out_root = output_base / mode_signature
     out_root.mkdir(parents=True, exist_ok=True)
 
     mode_cache: dict[str, tuple[pd.Series, ProtocolTrialParams]] = {}

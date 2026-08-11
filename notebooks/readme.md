@@ -54,12 +54,18 @@ SUBJECT_DIR.parent/
         ├── summary_tables/
         ├── cross_replay/
         ├── cross_window_diagnostics/
-        └── batch_reference_compare/
+        ├── batch_reference_compare/
+        └── batch_target_hr_curves/   # 单 scheme、全 motion/index 的目标段 HR 图与 manifest
 ```
 
 `run_signature` 包含 scope、scheme、filter、objective、split、`TW_F` 和 HR 后处理方式。
 重复使用相同配置时路径保持不变，因此可以恢复模式级 checkpoint。默认
 `CLEAN_OUTPUTS=False`；不要在需要续跑时打开清理开关。
+
+正式训练通过 Notebook 的精简回调在每个“motion × scope × scheme × filter”完成后
+打印一次结果，包括 final 的 post-hoc AAE/±5 bpm 准确率、同一套最优参数改用 ACC
+信号源后的对照指标，以及该模式优化与最终复算耗时。恢复断点时会明确标记为断点恢复，
+不会伪装成本次重新训练。
 
 ## Notebook 章节
 
@@ -72,6 +78,9 @@ SUBJECT_DIR.parent/
 - 第 9 节：Stage-6、history 和 checkpoint 完整性检查。
 - 第 10–12 节：单样本 replay、窗口诊断和跨运动汇总。
 - 第 13–15 节：跨 scheme replay/窗口诊断和批量参考通道对比。
+- 第 16 节：读取既有 Stage-6 最优参数，批量重绘当前受试者全部 motion/index 的
+  post-hoc 对齐真实 HR—final HR 目标段曲线；输出目录会追加 scope、scheme、filter、
+  split 和 `TW_F` 模式签名，不会启动 Optuna。
 
 replay 和诊断通过 `motion_type + motion_index` 从当前 `SUBJECT_DIR` 的配对结果选择
 样本，不再填写独立的传感器或 HR CSV 路径。
@@ -82,7 +91,7 @@ replay 和诊断通过 `motion_type + motion_index` 从当前 `SUBJECT_DIR` 的�
 2. 运行“只读发现、严格配对与标定检查”。
 3. 运行单对静态预处理，检查 CF2/HF2/HF2comp/UD2、序号 QC 与标定元数据。
 4. 如需训练，先核对 `RUN_OUTPUT_DIR`，再把 `RUN_ALL_TRAIN` 改为 `True`。
-5. 训练完成后，按需打开第 9–15 节各自的 `RUN_*` 开关。
+5. 训练完成后，按需打开第 9–16 节各自的 `RUN_*` 开关。
 
 默认所有训练、写图、回放和诊断开关均为 `False`，因此顺序执行 Notebook 不会创建
 Optuna study 或输出目录。训练仍只按模式保存 history、manifest 和 checkpoint，
