@@ -159,6 +159,15 @@ def test_mode_checkpoint_fingerprint_covers_inputs_calibration_space_and_budget(
     )
 
 
+def test_ud_preprocessing_marker_only_invalidates_ud_modes() -> None:
+    marker = {"ud_preprocessing": "calibrated_formula_qc_interpolated_no_bandpass_v1"}
+
+    assert rbp._ud_preprocessing_fingerprint_fields(CascadeScheme.UD2) == marker
+    assert rbp._ud_preprocessing_fingerprint_fields(CascadeScheme.ACC_UD2) == marker
+    assert rbp._ud_preprocessing_fingerprint_fields(CascadeScheme.ACC) == {}
+    assert rbp._ud_preprocessing_fingerprint_fields(CascadeScheme.HF2) == {}
+
+
 def test_one_all_train_objective_receives_all_indices_of_one_motion(monkeypatch) -> None:
     dataset_ids = [f"subject_name_write_{index}" for index in (1, 2, 3, 4)]
     datasets = {item: SimpleNamespace() for item in dataset_ids}

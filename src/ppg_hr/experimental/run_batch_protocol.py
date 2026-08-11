@@ -542,6 +542,7 @@ def run_batch_adaptive_protocol(
                             "penalty_value": float(penalty_value),
                             "delay_estimation_mode": delay_estimation_mode,
                             "trial_param_overrides": trial_overrides,
+                            **_ud_preprocessing_fingerprint_fields(scheme),
                         },
                     )
                     resumed = restored_by_key.get(mode_key)
@@ -2160,6 +2161,14 @@ def _build_mode_fingerprint(
     }
     text = json.dumps(_jsonify(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _ud_preprocessing_fingerprint_fields(scheme: CascadeScheme) -> dict[str, str]:
+    """Invalidate only modes whose numerical inputs changed with raw-formula UD."""
+
+    if scheme in {CascadeScheme.UD2, CascadeScheme.ACC_UD2}:
+        return {"ud_preprocessing": "calibrated_formula_qc_interpolated_no_bandpass_v1"}
+    return {}
 
 
 def _mode_history_path(motion_dir: Path, result: _ModeOptimisation) -> Path:
