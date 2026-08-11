@@ -61,6 +61,7 @@ __all__ = [
     "build_cross_motion_summary_table",
     "flatten_params_for_record",
     "build_output_run_name",
+    "build_subject_output_dir",
     "plot_window_diagnostics_from_records",
     "protocol_params_from_record",
     "replay_best_record_hr_curves",
@@ -169,6 +170,32 @@ def build_output_run_name(
         f"{scopes}__{schemes}__{filters}__{objective_mode}__{data_split_mode}"
         f"__{_tw_f_run_label(tw_f_s)}__{_postprocess_run_label(postprocess_method)}"
     )
+
+
+def build_subject_output_dir(
+    *,
+    subject_dir: str | Path,
+    target_scopes: list[str | TargetScope],
+    cascade_schemes: list[str | CascadeScheme],
+    adaptive_filters: list[str],
+    objective_mode: str,
+    data_split_mode: str,
+    tw_f_s: float = 0.0,
+    postprocess_method: str = "fft",
+) -> Path:
+    """Return ``subject_dir.parent/outputs/{subject}__{run_signature}``."""
+
+    subject = Path(subject_dir).resolve()
+    run_signature = build_output_run_name(
+        target_scopes,
+        cascade_schemes,
+        adaptive_filters,
+        objective_mode,
+        data_split_mode,
+        tw_f_s=tw_f_s,
+        postprocess_method=postprocess_method,
+    )
+    return subject.parent / "outputs" / f"{subject.name}__{run_signature}"
 
 
 def _tw_f_run_label(value: float) -> str:
@@ -288,16 +315,16 @@ def run_batch_adaptive_protocol(
         if csv_out_dir is not None:
             root_out = Path(csv_out_dir).resolve().parent
         else:
-            run_name = build_output_run_name(
-                scopes,
-                schemes,
-                filters,
-                objective_mode,
-                data_split_mode,
+            root_out = build_subject_output_dir(
+                subject_dir=input_path,
+                target_scopes=scopes,
+                cascade_schemes=schemes,
+                adaptive_filters=filters,
+                objective_mode=objective_mode,
+                data_split_mode=data_split_mode,
                 tw_f_s=float(trial_overrides.get("TW_F", 0.0)),
                 postprocess_method=str(trial_overrides.get("postprocess_method", "fft")),
             )
-            root_out = input_path.parent / "outputs" / run_name
     else:
         root_out = Path(output_root).resolve()
     inferred_project = Path(project_root).resolve() if project_root is not None else root_out.parent.parent
