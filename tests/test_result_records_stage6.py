@@ -73,6 +73,8 @@ def test_motion_type_outputs_include_stage6_record_files(tmp_path: Path) -> None
         "best_tdelay_s",
         "acc3_compare_aae_bpm",
         "acc3_compare_accuracy_pct",
+        "acc_compare_posthoc_aae_bpm",
+        "acc_compare_posthoc_accuracy_pct",
         "acc3_compare_num_windows",
         "acc3_compare_status",
         "acc3_compare_reason",

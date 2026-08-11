@@ -15,6 +15,7 @@ import math
 import os
 import shutil
 import subprocess
+import time
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, fields, replace
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -124,6 +125,7 @@ class _ModeOptimisation:
     history: list[dict[str, Any]]
     success: bool
     reason: str
+    training_elapsed_s: float = 0.0
     fold_id: int | None = None
     heldout_group_id: str = ""
     train_group_ids: list[str] = field(default_factory=list)
@@ -544,8 +546,17 @@ def run_batch_adaptive_protocol(
                     resumed = restored_by_key.get(mode_key)
                     if resumed is not None and resumed.run_fingerprint == expected_fingerprint:
                         mode_results.append(resumed)
+                        _progress(
+                            _mode_completion_progress_payload(
+                                resumed,
+                                mode_idx=mode_counter,
+                                mode_total=total_modes,
+                                resumed=True,
+                            )
+                        )
                         gc.collect()
                         continue
+                    mode_started_at = time.perf_counter()
                     if not valid_folds:
                         reason = str(folds[0].get("reason", "no valid folds")) if folds else "no valid folds"
                         result = _failed_mode_optimisation(
@@ -650,6 +661,7 @@ def run_batch_adaptive_protocol(
                             train_group_ids=train_ids,
                             test_group_id=test_ids[0] if len(test_ids) == 1 else "",
                         )
+                    result.training_elapsed_s = max(0.0, time.perf_counter() - mode_started_at)
                     result.run_fingerprint = expected_fingerprint
                     mode_results.append(result)
                     _finalize_completed_mode(
@@ -658,6 +670,14 @@ def run_batch_adaptive_protocol(
                         mode_results,
                         result,
                         write_best_params_all=False,
+                    )
+                    _progress(
+                        _mode_completion_progress_payload(
+                            result,
+                            mode_idx=mode_counter,
+                            mode_total=total_modes,
+                            resumed=False,
+                        )
                     )
                     gc.collect()
         all_mode_results[motion_type] = mode_results
@@ -1831,6 +1851,8 @@ def _acc3_compare_fields(metrics: dict[str, Any], *, status: str, reason: str) -
     return {
         "acc3_compare_aae_bpm": metrics.get("final_aae_bpm", metrics.get("adaptive_aae_bpm", float("nan"))),
         "acc3_compare_accuracy_pct": metrics.get("final_acc_pct", metrics.get("adaptive_acc_pct", float("nan"))),
+        "acc_compare_posthoc_aae_bpm": metrics.get("posthoc_final_aae_bpm", float("nan")),
+        "acc_compare_posthoc_accuracy_pct": metrics.get("posthoc_final_acc_pct", float("nan")),
         "acc3_compare_num_windows": int(metrics.get("num_windows", 0) or 0),
         "acc3_compare_status": str(status),
         "acc3_compare_reason": str(reason),
@@ -1841,9 +1863,47 @@ def _empty_acc3_compare_fields(status: str = "", reason: str = "") -> dict[str, 
     return {
         "acc3_compare_aae_bpm": float("nan"),
         "acc3_compare_accuracy_pct": float("nan"),
+        "acc_compare_posthoc_aae_bpm": float("nan"),
+        "acc_compare_posthoc_accuracy_pct": float("nan"),
         "acc3_compare_num_windows": 0,
         "acc3_compare_status": str(status),
         "acc3_compare_reason": str(reason),
+    }
+
+
+def _mode_completion_progress_payload(
+    result: _ModeOptimisation,
+    *,
+    mode_idx: int,
+    mode_total: int,
+    resumed: bool,
+) -> dict[str, Any]:
+    """Build the single progress event emitted after one motion/mode is ready."""
+
+    compare = _acc3_compare_metrics_for(result)
+    return {
+        "stage": "optimization_mode_completed",
+        "mode_idx": int(mode_idx),
+        "mode_current": int(mode_idx),
+        "mode_total": int(mode_total),
+        "motion_type": result.motion_type,
+        "target_scope": result.target_scope.name,
+        "target_scope_value": result.target_scope.value,
+        "cascade_scheme": result.cascade_scheme.value,
+        "cascade_scheme_display": result.cascade_scheme.display_name,
+        "adaptive_filter": result.adaptive_filter,
+        "success": bool(result.success),
+        "reason": str(result.reason),
+        "resumed": bool(resumed),
+        "training_elapsed_s": float(result.training_elapsed_s),
+        "posthoc_final_aae_bpm": result.test_metrics.get("posthoc_final_aae_bpm", float("nan")),
+        "posthoc_final_acc_pct": result.test_metrics.get("posthoc_final_acc_pct", float("nan")),
+        "acc_compare_posthoc_aae_bpm": compare.get("acc_compare_posthoc_aae_bpm", float("nan")),
+        "acc_compare_posthoc_accuracy_pct": compare.get(
+            "acc_compare_posthoc_accuracy_pct", float("nan")
+        ),
+        "acc_compare_status": compare.get("acc3_compare_status", ""),
+        "acc_compare_reason": compare.get("acc3_compare_reason", ""),
     }
 
 
@@ -2138,6 +2198,7 @@ def _mode_manifest_payload(result: _ModeOptimisation) -> dict[str, Any]:
         "test_metrics": result.test_metrics,
         "success": result.success,
         "reason": result.reason,
+        "training_elapsed_s": result.training_elapsed_s,
         "fold_id": result.fold_id,
         "heldout_group_id": result.heldout_group_id,
         "train_group_ids": result.train_group_ids,
@@ -2176,6 +2237,7 @@ def _mode_result_from_manifest_payload(payload: dict[str, Any]) -> _ModeOptimisa
         history=[],
         success=bool(payload.get("success", False)),
         reason=str(payload.get("reason", "")),
+        training_elapsed_s=float(payload.get("training_elapsed_s", 0.0) or 0.0),
         fold_id=(None if payload.get("fold_id", None) in ("", None) else int(payload.get("fold_id"))),
         heldout_group_id=str(payload.get("heldout_group_id", "")),
         train_group_ids=[str(item) for item in payload.get("train_group_ids", [])],
@@ -2698,6 +2760,7 @@ def _best_params_alignment_record(result: _ModeOptimisation) -> dict[str, Any]:
         "no_posthoc_final_acc_pct": metrics.get("final_acc_pct"),
         "posthoc_final_aae_bpm": metrics.get("posthoc_final_aae_bpm"),
         "posthoc_final_acc_pct": metrics.get("posthoc_final_acc_pct"),
+        "training_elapsed_s": float(result.training_elapsed_s),
         "baseline_aae_bpm": metrics.get("baseline_aae_bpm"),
         "baseline_acc_pct": metrics.get("baseline_acc_pct"),
         "adaptive_aae_bpm": metrics.get("adaptive_aae_bpm"),
@@ -2732,6 +2795,7 @@ def _best_metrics_record(result: _ModeOptimisation) -> dict[str, Any]:
         "posthoc_baseline_acc_pct": metrics.get("posthoc_baseline_acc_pct"),
         "posthoc_adaptive_acc_pct": metrics.get("posthoc_adaptive_acc_pct"),
         "posthoc_final_acc_pct": metrics.get("posthoc_final_acc_pct"),
+        "training_elapsed_s": float(result.training_elapsed_s),
         "n_windows": int(metrics.get("num_windows", 0) or 0),
         "n_valid_windows": int(metrics.get("num_windows", 0) or 0),
         "n_qc_fallback": int(metrics.get("n_qc_fallback", 0) or 0),
@@ -2772,8 +2836,10 @@ def _best_params_alignment_columns() -> list[str]:
         "time_bias_after_s", "alignment_score_mode", "pre_align_metric_json",
         "no_posthoc_final_aae_bpm", "no_posthoc_final_acc_pct",
         "posthoc_final_aae_bpm", "posthoc_final_acc_pct",
+        "training_elapsed_s",
         "baseline_aae_bpm", "baseline_acc_pct", "adaptive_aae_bpm", "adaptive_acc_pct",
         "acc3_compare_aae_bpm", "acc3_compare_accuracy_pct", "acc3_compare_num_windows",
+        "acc_compare_posthoc_aae_bpm", "acc_compare_posthoc_accuracy_pct",
         "acc3_compare_status", "acc3_compare_reason",
         *_param_record_columns(),
     ]
@@ -2786,6 +2852,7 @@ def _best_metrics_columns() -> list[str]:
         "baseline_acc_pct", "adaptive_acc_pct", "final_acc_pct",
         "posthoc_baseline_aae_bpm", "posthoc_adaptive_aae_bpm", "posthoc_final_aae_bpm",
         "posthoc_baseline_acc_pct", "posthoc_adaptive_acc_pct", "posthoc_final_acc_pct",
+        "training_elapsed_s",
         "n_windows", "n_valid_windows", "n_qc_fallback", "n_recovery_fallback",
     ]
 
@@ -2844,6 +2911,7 @@ def _summary_row(result: _ModeOptimisation) -> dict[str, Any]:
         "best_trial_idx": result.best_trial_idx,
         "success": result.success,
         "reason": result.reason,
+        "training_elapsed_s": float(result.training_elapsed_s),
     }
     for prefix, metrics in (
         ("train", result.train_metrics),
@@ -2938,6 +3006,7 @@ def _summary_columns() -> list[str]:
         "best_trial_idx",
         "success",
         "reason",
+        "training_elapsed_s",
         "train_aae_bpm",
         "train_accuracy_pct",
         "train_baseline_aae_bpm",
@@ -3019,6 +3088,8 @@ def _summary_columns() -> list[str]:
         "test_posthoc_n_valid_windows",
         "acc3_compare_aae_bpm",
         "acc3_compare_accuracy_pct",
+        "acc_compare_posthoc_aae_bpm",
+        "acc_compare_posthoc_accuracy_pct",
         "acc3_compare_num_windows",
         "acc3_compare_status",
         "acc3_compare_reason",
