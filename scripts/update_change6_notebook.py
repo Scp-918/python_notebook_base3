@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import nbformat
@@ -10,11 +11,199 @@ import nbformat
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / "notebooks" / "run_batch_adaptive_protocol.ipynb"
 
+CONFIG_LINE_RE = re.compile(
+    r'^\s*(?:[A-Z][A-Z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?\s*=|"[A-Za-z_][A-Za-z0-9_]*"\s*:)'
+)
+
+CONFIG_COMMENTS = {
+    # Sampling, preprocessing, alignment, post-hoc alignment and recovery.
+    "FS_ORIGIN": "原始采样率(Hz)；change6/Pydisplay 数据固定按 100 Hz 与序号校验。",
+    "FS_TARGET": "预览绘图目标采样率(Hz)；训练候选由 SEARCH_SPACE.Fs_Target 单独控制。",
+    "TW": "预览分段窗口长度(秒)；训练窗口候选由 SEARCH_SPACE.TW 控制。",
+    "TW_F": "自适应滤波前置收敛上下文(秒)；0 表示不额外增加前置上下文。",
+    "NORMALIZATION_MODE": "参考通道归一化方式；minmax 为当前默认和推荐配置。",
+    "QC_POLICY": "坏窗口策略；fallback_baseline 表示保留计算并回退 baseline HR。",
+    "DELAY_ESTIMATION_MODE": "参考通道时延估计方式；envelope 为默认，direct 保留直接相关模式。",
+    "ALIGNMENT_TW": "静息段全局 Tdelay 提取 HR 的窗口长度(秒)，不等同训练 TW。",
+    "ALIGNMENT_STEP_S": "静息对齐窗口步长(秒)；越小时间分辨率越高、计算越慢。",
+    "REST_HR_BAND_BPM": "静息 HR 合法范围(bpm)；用于对齐阶段的频带限制。",
+    "REST_HR_BAND_HZ": "由 REST_HR_BAND_BPM 换算的 Hz 频带，供频谱接口使用。",
+    "REST_HR_TRACK_BAND_BPM": "静息 HR 相邻窗口搜索带宽(bpm)；训练候选由搜索空间控制。",
+    "REST_HR_SLEW_LIMIT_BPM": "静息 HR 允许直接接受的相邻变化阈值(bpm)。",
+    "REST_HR_SLEW_STEP_BPM": "超过静息变化阈值时每窗口最大修正步长(bpm)。",
+    "REST_HR_SMOOTH_METHOD": "静息 HR 平滑方法；median 对孤立异常峰更稳健。",
+    "REST_HR_SMOOTH_WIN": "静息 HR 平滑窗口数；应使用正奇数以保持中心对齐。",
+    "REST_HR_PEAK_PERCENT": "候选频谱峰相对主峰的最低幅值比例。",
+    "REST_HR_SPEC_PENALTY_ENABLE": "是否在静息 HR 提取时启用运动频率惩罚。",
+    "REST_HR_SPEC_PENALTY_WEIGHT": "静息运动频率惩罚权重；越大越抑制运动相关峰。",
+    "REST_HR_SPEC_PENALTY_WIDTH_HZ": "静息运动峰惩罚半宽(Hz)；决定受抑制频带范围。",
+    "REST_ALIGNMENT_SCORE_MODE": "Tdelay 评分指标；aae 为当前默认，std 用于兼容旧实验。",
+    "ENABLE_TIME_BIAS_AFTER": "是否计算滤波后 post-hoc 时间偏移诊断。",
+    "TIME_BIAS_AFTER_RANGE_S": "post-hoc 时间偏移搜索区间(秒)，按(最小,最大)设置。",
+    "TIME_BIAS_AFTER_STEP_S": "post-hoc 时间偏移搜索步长(秒)。",
+    "TIME_BIAS_AFTER_MODE": "post-hoc 对齐语义；oracle 只用于诊断指标，不参与部署选择。",
+    "RECOVERY_GRACE_S": "运动结束后的恢复宽限时间(秒)。",
+    "RECOVERY_DIFF_BPM": "恢复阶段候选与连续轨迹允许的最大差值(bpm)。",
+    "RECOVERY_CROSS_DIFF_BPM": "恢复阶段跨来源切换允许的差值阈值(bpm)。",
+    "PPG_INPUT_TRANSFORM": "PPG 输入变换；默认 log_absorbance，也可选择后端支持的既有变换。",
+    "LOG_ABSORBANCE_BASELINE_MODE": "log-absorbance 基线估计方法；rolling_median 抑制慢漂移。",
+    "LOG_ABSORBANCE_BASELINE_WINDOW_S": "滚动基线窗口长度(秒)；越大越保留低频趋势。",
+    "LOG_ABSORBANCE_EPS": "log 比值的数值稳定下限，防止零值导致无穷大。",
+    "LOG_ABSORBANCE_RATIO_CLIP": "进入 log 前的比值裁剪范围，防止极端异常值。",
+    "GLOBAL_OBJECTIVE_STRATEGY": "全局目标组合策略；current_global_adaptive 沿用当前融合语义。",
+    "REST_HR_KWARGS": "汇总静息 HR 绘图参数；键值直接传给第 3/4/6 节绘图接口。",
+    # HR postprocessing and fixed adaptive-filter controls.
+    "TRAIN_HR_POSTPROCESS_METHOD": "训练 HR 后处理方法；fft 为默认，ssr 启用稀疏频谱重建。",
+    "SSR_NUM_ATOMS": "SSR 稀疏表示使用的原子数；越大表达力和计算量越高。",
+    "SSR_LAMBDA": "SSR 稀疏正则权重；越大产生越稀疏的频谱解。",
+    "SSR_HARMONIC_TOL_BPM": "SSR 谐波匹配容差(bpm)。",
+    "SSR_FALLBACK_TO_FFT": "SSR 失败时是否回退既有 FFT 跟踪器。",
+    "SSR_GRID_RESOLUTION_BPM": "SSR 心率搜索网格分辨率(bpm)；越小越精细但更慢。",
+    "LMS_MU_MIN": "LMS/Volterra/RFF-LMS 更新步长下限，避免步长退化为零。",
+    "TRACKING_SMOOTH_WIN_LEN": "最终 HR 轨迹平滑窗口数；使用正奇数。",
+    "SPEC_PENALTY_WEIGHT": "通用运动频谱惩罚权重；越大越排斥参考通道峰。",
+    "RFF_SIGMA": "旧记录缺少 sigma_scale 时使用的固定 RBF sigma 兼容值。",
+    "RFF_UPDATE_MODE": "RFF 权重更新方式；nlms 按特征能量归一化，稳定性更好。",
+    "RFF_NLMS_EPS": "RFF-NLMS 分母稳定项，防止特征能量接近零。",
+    "RFF_LEAKAGE": "RFF 权重泄漏系数；0 表示不衰减历史权重。",
+    "RFF_ERR_CLIP": "RFF 更新误差裁剪阈值；None 表示不额外裁剪。",
+    "RFF_THETA_NORM_GUARD": "RFF 权重范数保护阈值；None 表示关闭该保护。",
+    "KLMS_MAX_DICTIONARY_SIZE": "KLMS 字典中心上限；越大拟合能力和内存占用越高。",
+    "KLMS_CENTER_PRUNE_POLICY": "KLMS 达到字典上限后的策略；freeze_new_centers 停止加中心。",
+    "KLMS_DISTANCE_MODE": "KLMS 新颖度距离语义；normalized 可减弱 tap 维数影响。",
+    "KLMS_NORMALIZED_UPDATE": "是否按核特征能量归一化 KLMS 更新。",
+    "KLMS_NLMS_EPS": "KLMS 归一化更新的分母稳定项。",
+    # Cascade guard and enhanced tracking.
+    "CASCADE_GUARD_POLICY": "级联保护策略；none 关闭，rms_guard 按级输出 RMS 决定回退。",
+    "CASCADE_GUARD_RATIO_MIN": "当前级/上一级 RMS 比值下限，低于时判定异常。",
+    "CASCADE_GUARD_RATIO_MAX": "当前级/上一级 RMS 比值上限，高于时判定异常。",
+    "CASCADE_GUARD_FLAT_STD_EPS": "近似平坦输出的标准差阈值。",
+    "CASCADE_GUARD_USE_FINITE_ZSCORE": "是否把有限 z-score 检查纳入级联保护。",
+    "TRACKER_MODE": "频谱追踪总模式；legacy 保留旧算法，enhanced 启用六项增强开关。",
+    "ENABLE_DIRECTIONAL_TRACKING": "是否启用上行/下行不同搜索范围和 slew 限制。",
+    "ENABLE_DYNAMIC_PENALTY": "是否按置信度和谐波存在性动态调整频谱惩罚。",
+    "ENABLE_CONTINUITY_PROTECTION": "是否用连续性与挑战峰确认保护当前锁定。",
+    "ENABLE_LOW_LOCK_RECOVERY": "是否启用低锁定确认和恢复；实际仅对 LMS 生效。",
+    "ENABLE_HIGH_LOCK_RECOVERY": "是否启用高锁定风险确认、恢复和冷却。",
+    "ENABLE_POST_MOTION_PROTECTION": "是否启用运动结束后 reset-FFT、交叉和 gap rescue 保护。",
+    "TRACKING_RANGE_UP_BPM": "增强追踪向上搜索范围(bpm)。",
+    "TRACKING_RANGE_DOWN_BPM": "增强追踪向下搜索范围(bpm)。",
+    "TRACKING_SLEW_LIMIT_UP_BPM": "向上候选可直接接受的最大变化阈值(bpm)。",
+    "TRACKING_SLEW_STEP_UP_BPM": "超过阈值时向上每窗口最大推进步长(bpm)。",
+    "TRACKING_SLEW_LIMIT_DOWN_BPM": "向下候选可直接接受的最大变化阈值(bpm)。",
+    "TRACKING_SLEW_STEP_DOWN_BPM": "超过阈值时向下每窗口最大推进步长(bpm)。",
+    "LOW_LOCK_MIN_BPM": "低锁定判定区间下限(bpm)。",
+    "LOW_LOCK_MAX_BPM": "低锁定判定区间上限(bpm)。",
+    "LOW_LOCK_MIN_WINDOWS": "进入低锁定风险前要求连续命中的窗口数。",
+    "LOW_LOCK_TARGET_MIN_BPM": "低锁定恢复候选的最低目标心率(bpm)。",
+    "LOW_LOCK_MIN_JUMP_BPM": "恢复候选相对低锁定轨迹的最小上跳幅度(bpm)。",
+    "LOW_LOCK_MIN_AMP_RATIO": "低锁定恢复候选相对主峰的最低幅值比例。",
+    "LOW_LOCK_CANDIDATE_STABLE_BPM": "低锁定恢复候选跨窗口稳定容差(bpm)。",
+    "LOW_LOCK_CONFIRM_WINDOWS": "接受低锁定恢复候选前的确认窗口数。",
+    "LOW_LOCK_STEP_BPM": "低锁定恢复时单窗口允许的最大上调步长(bpm)。",
+    "HIGH_LOCK_CONFIRM_WINDOWS": "确认高锁定风险所需的连续窗口数。",
+    "HIGH_LOCK_COOLDOWN_WINDOWS": "高锁定恢复后的冷却窗口数，防止立即反复触发。",
+    "HIGH_LOCK_MIN_GAP_BPM": "高锁定轨迹与较低挑战峰之间的最小间隔(bpm)。",
+    "HIGH_LOCK_MIN_AMP_RATIO": "高锁定恢复挑战峰相对主峰的最低幅值比例。",
+    "HIGH_LOCK_CANDIDATE_MIN_BPM": "高锁定恢复候选允许的最低心率(bpm)。",
+    "HIGH_LOCK_CANDIDATE_STABLE_BPM": "高锁定恢复候选跨窗口稳定容差(bpm)。",
+    "HIGH_LOCK_PENALTY_EXCLUSION_BPM": "挑战峰附近免受运动惩罚影响的频带宽度(bpm)。",
+    "HIGH_LOCK_DOWN_STEP_BPM": "高锁定恢复时单窗口最大下降步长(bpm)。",
+    "HIGH_LOCK_UP_STEP_BPM": "高锁定冷却期内单窗口最大反向上升步长(bpm)。",
+    "POST_MOTION_GUARD_SECONDS": "运动结束后动态保护的持续时间(秒)，默认对应 post10。",
+    "POST_MOTION_GUARD_MIN_ELAPSED_S": "运动后允许稳定交叉前的最短等待时间(秒)。",
+    "POST_MOTION_GUARD_STABLE_WINDOWS": "运动后候选稳定交叉所需的连续窗口数。",
+    "POST_MOTION_GUARD_CROSSOVER_GAP_BPM": "稳定交叉时两来源允许的最大差值(bpm)。",
+    "POST_MOTION_GUARD_UPWARD_GAP_BPM": "运动后向上切换要求的最小优势差值(bpm)。",
+    "POST_MOTION_GUARD_FFT_FLOOR_BPM": "reset-FFT 候选允许的最低心率(bpm)。",
+    "POST_MOTION_GUARD_RECOVERY_STEP_UP_BPM": "运动后保护期每窗口最大上调步长(bpm)。",
+    "POST_MOTION_GUARD_RECOVERY_STEP_DOWN_BPM": "运动后保护期每窗口最大下调步长(bpm)。",
+    "POST_MOTION_GUARD_RESCUE_GAP_BPM": "触发大间隔 rescue 的来源差值阈值(bpm)。",
+    "POST_MOTION_GUARD_GAP_RESCUE_ENABLE": "是否启用运动后大间隔多数命中救援。",
+    "POST_MOTION_GUARD_GAP_RESCUE_WINDOWS": "gap rescue 统计使用的最近窗口数。",
+    "POST_MOTION_GUARD_GAP_RESCUE_MIN_HITS": "gap rescue 在统计窗口内要求的最少命中数。",
+    "POST_MOTION_GUARD_FFT_STABLE_WINDOWS": "reset-FFT 被视为稳定前要求的连续窗口数。",
+    "POST_MOTION_GUARD_FFT_STABLE_BPM": "reset-FFT 跨窗口稳定容差(bpm)。",
+    # Search-space rows.
+    "SEARCH_SPACE": "Optuna 离散候选集合；下方逐项列表可直接增删候选值。",
+    "SEARCH_SPACE.Fs_Target": "训练重采样率候选(Hz)；较低值更快，较高值时间分辨率更高。",
+    "SEARCH_SPACE.TW": "训练窗口长度候选(秒)；影响频率分辨率、窗口数和响应速度。",
+    "SEARCH_SPACE.Kstop": "级联停止阈值候选；控制继续增加参考级的条件。",
+    "SEARCH_SPACE.max_order": "每级最大 tap 阶数候选；越大建模能力和计算量越高。",
+    "SEARCH_SPACE.M_base": "级联基础 tap 数候选。",
+    "SEARCH_SPACE.C_scale": "级联阶数增长比例候选。",
+    "SEARCH_SPACE.K_max": "级联 tap/阶数上限候选。",
+    "SEARCH_SPACE.Spec_Penalty_Width": "运动频谱惩罚带宽候选(Hz)。",
+    "SEARCH_SPACE.hr_range_hz": "相邻 HR 搜索范围候选(Hz)，列表由 bpm 换算。",
+    "SEARCH_SPACE.slew_limit_bpm": "HR 轨迹直接接受变化阈值候选(bpm)。",
+    "SEARCH_SPACE.slew_step_bpm": "超限时 HR 每窗口最大修正步长候选(bpm)。",
+    "SEARCH_SPACE.Rest_HR_Track_Band_BPM": "静息 HR 搜索带宽候选(bpm)。",
+    "SEARCH_SPACE.Rest_HR_Slew_Limit_BPM": "静息 HR 直接接受变化阈值候选(bpm)。",
+    "SEARCH_SPACE.Rest_HR_Slew_Step_BPM": "静息 HR 超限修正步长候选(bpm)。",
+    "SEARCH_SPACE.LMS_Mu_Base": "LMS/Volterra 基础步长候选。",
+    "SEARCH_SPACE.RFF_LMS_Mu_Base": "RFF-LMS 特征空间更新步长候选。",
+    "SEARCH_SPACE.alpha_u": "Volterra 非线性项混合系数候选。",
+    "SEARCH_SPACE.M2": "Volterra 二阶记忆长度候选。",
+    "SEARCH_SPACE.rff_D": "RFF 随机特征维数候选；越大越慢且占用更多内存。",
+    "SEARCH_SPACE.rff_sigma_scale": "基于 tap robust 距离的 RFF sigma 缩放候选。",
+    "SEARCH_SPACE.klms_step_size": "KLMS 核权重更新步长候选。",
+    "SEARCH_SPACE.klms_sigma": "KLMS RBF 核宽度候选。",
+    "SEARCH_SPACE.klms_epsilon": "KLMS 新中心新颖度阈值候选。",
+    # Execution, cache, split and safety switches.
+    "NUM_SEED_POINTS": "TPE 启动前的随机探索 trial 数；不得超过总 trial 预算。",
+    "N_JOBS": "并行 worker 数；1 最稳定，增大时注意内存和可复现性。",
+    "PARALLEL_REPEATS": "重复实验并行数；当前实际并行度由 n_jobs 优先控制。",
+    "TRIAL_CACHE_MAX_ENTRIES": "trial 结果内存缓存上限；越大越占内存。",
+    "SAVE_STAGE_JSON": "是否保存详细 stage JSON；调试有用但会增加磁盘文件。",
+    "DEBUG_MODE": "调试模式；会保留更多中间记录并隐式启用 stage JSON。",
+    "CLEAN_OUTPUTS": "是否清空当前运行目录；续跑 checkpoint 时必须保持 False。",
+    "VAL_GROUPS_PER_TYPE": "split 模式每个运动类型的验证组数；all_train 下不使用。",
+    "TEST_GROUPS_PER_TYPE": "split 模式每个运动类型的测试组数；all_train 下不使用。",
+    "CASCADE_TRAIN_BUDGETS": "按 scheme 覆盖 trial/repeat 预算；None 使用全局预算。",
+    "TRIAL_PARAM_OVERRIDES": "固定 trial 参数映射；覆盖默认值并进入元数据、缓存键和断点指纹。",
+    "RUN_STATIC_QC": "是否在第 1 节读取各文件前 10 秒并显示静态 QC。",
+    "RUN_PREPROCESS_PREVIEW": "是否在第 2 节完整预处理一个所选样本。",
+    "RUN_ALIGNMENT_DIAGNOSTICS": "是否运行第 3 节并写静息 Tdelay 对齐图。",
+    "RUN_FULLFIELD_PLOT": "是否运行第 4 节并写全段未对齐 PPG-HR 图。",
+    "RUN_RAW_PPG_PLOT": "是否运行第 6 节并写原始 PPG 双轴图。",
+    "RUN_ALL_TRAIN": "是否运行第 7 节正式 200-trial 模式级优化。",
+    "RUN_CONNECTIVITY_CHECK": "是否运行第 8 节小预算模式连通性检查。",
+    "RUN_OUTPUT_CHECK": "是否运行第 9 节只读检查 Stage-6 和断点文件。",
+    "RUN_STAGE7_REPLAY": "是否运行第 10 节单样本 best-params 回放。",
+    "RUN_WINDOW_DIAGNOSTICS": "是否运行第 11 节窗口波形/频谱诊断。",
+    "RUN_CROSS_MOTION_SUMMARY": "是否运行第 12 节跨运动汇总。",
+    "RUN_CROSS_STAGE7_REPLAY": "是否运行第 13 节跨 scheme 回放。",
+    "RUN_CROSS_WINDOW_DIAGNOSTICS": "是否运行第 14 节跨 scheme 窗口诊断。",
+    "RUN_BATCH_REFERENCE_COMPARE": "是否运行第 15 节批量参考 scheme 对比。",
+    "CONNECTIVITY_MAX_ITERATIONS": "连通性检查每模式 trial 数；默认 1，避免误跑正式预算。",
+}
+
 
 def code(source: str) -> nbformat.NotebookNode:
     """Create one normalized code cell."""
 
     return nbformat.v4.new_code_cell(source.strip() + "\n")
+
+
+def config_code(source: str) -> nbformat.NotebookNode:
+    """Create a config cell and require an inline explanation on every option."""
+
+    annotated: list[str] = []
+    for raw_line in source.strip().splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if CONFIG_LINE_RE.match(line) and "#" not in line:
+            if stripped.startswith('"'):
+                value_name = stripped.split(":", 1)[1].split(",", 1)[0].strip()
+                lookup = value_name
+            else:
+                lookup = stripped.split("=", 1)[0].strip()
+            comment = CONFIG_COMMENTS.get(lookup)
+            if comment is None:
+                raise ValueError(f"Missing inline config explanation for {lookup}: {stripped}")
+            line = f"{line}  # {comment}"
+        annotated.append(line)
+    return nbformat.v4.new_code_cell("\n".join(annotated) + "\n")
 
 
 def markdown(source: str) -> nbformat.NotebookNode:
@@ -145,7 +334,7 @@ print("SUBJECT_DIR:", SUBJECT_DIR)
 print("RUN_OUTPUT_DIR:", RUN_OUTPUT_DIR)
 '''
         ),
-        code(
+        config_code(
             r'''
 # 用途：配置采样、预处理、静息 HR、Tdelay、post-hoc 对齐和恢复策略。
 # 输入：这些值会进入预览、训练、缓存键、结果元数据和 replay 参数恢复。
@@ -203,7 +392,7 @@ REST_HR_KWARGS = {
 }
 '''
         ),
-        code(
+        config_code(
             r'''
 # 用途：配置 HR 后处理、四种自适应滤波器、级联保护和增强追踪全部固定阈值。
 # 输入：固定值覆盖 Optuna 解码后的同名字段；搜索参数范围由 SEARCH_SPACE 控制。
@@ -304,7 +493,7 @@ SEARCH_SPACE.klms_sigma = [0.5, 1.0, 2.0, 5.0]
 SEARCH_SPACE.klms_epsilon = [0.005, 0.01, 0.02, 0.05, 0.1]
 '''
         ),
-        code(
+        config_code(
             r'''
 # 用途：汇总固定 trial 参数、搜索空间、并行/缓存策略和各章节安全开关。
 # 输入：前面三个配置单元；修改任一固定参数会进入结果元数据和 checkpoint 指纹。

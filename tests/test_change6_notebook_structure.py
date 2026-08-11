@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 
 import nbformat
@@ -187,6 +188,21 @@ def test_section_two_documents_every_preview_parameter() -> None:
     assert "write/gripper/run/rope" in markdown_source
     assert "100 Hz" in markdown_source
     assert "Optuna" in markdown_source
+
+
+def test_layered_config_cells_two_three_four_have_inline_parameter_comments() -> None:
+    config_cells = _sources("code")[1:4]
+    configurable_line = re.compile(
+        r'^\s*(?:[A-Z][A-Z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?\s*=|"[A-Za-z_][A-Za-z0-9_]*"\s*:)'
+    )
+
+    missing: list[str] = []
+    for cell_number, source in enumerate(config_cells, start=2):
+        for line_number, line in enumerate(source.splitlines(), start=1):
+            if configurable_line.match(line) and "#" not in line:
+                missing.append(f"cell {cell_number}, line {line_number}: {line.strip()}")
+
+    assert not missing, "\n".join(missing)
 
 
 def test_notebook_safe_defaults_execute_without_creating_outputs(
