@@ -46,20 +46,16 @@ def test_notebook_has_layered_protocol_configuration() -> None:
     assert "OUTPUT_ROOT = SUBJECT_DIR.parent / \"outputs\"" in first
     assert "RUN_OUTPUT_DIR = build_subject_output_dir(" in first
     assert 'UD_CALCULATION_MODE = "smoothed"' in first
-    assert "UD_SMOOTHING_WINDOW_S = 0.05" in first
+    assert "UD_SMOOTHING_WINDOW_S = 0.1" in first
     for name in (
         "FS_ORIGIN",
-        "TW_F",
+        "prewarm_s",
         "NORMALIZATION_MODE",
         "QC_POLICY",
         "DELAY_ESTIMATION_MODE",
-        "ALIGNMENT_TW",
+        "EVALUATION_WINDOW_S",
         "PPG_INPUT_TRANSFORM",
         "TRAIN_HR_POSTPROCESS_METHOD",
-        "SSR_NUM_ATOMS",
-        "RFF_UPDATE_MODE",
-        "KLMS_MAX_DICTIONARY_SIZE",
-        "CASCADE_GUARD_POLICY",
         "SEARCH_SPACE",
         "TRIAL_PARAM_OVERRIDES",
         "CLEAN_OUTPUTS",
@@ -103,7 +99,7 @@ def test_notebook_documents_cell_risk_and_compiles_zero_through_nine() -> None:
     assert joined.count("# \u7528\u9014：") >= 10
     assert "# \u662f\u5426\u5199\u6587\u4ef6：" in joined
     assert "# \u8017\u65f6\u98ce\u9669：" in joined
-    assert "multi_" not in joined
+    assert "multi_tiaosheng" not in joined
     assert "D:\\" not in joined
     for index, cell in enumerate(code_cells):
         compile(str(cell.source), f"{NOTEBOOK_PATH.name}:cell-{index}", "exec")
@@ -136,7 +132,7 @@ def test_notebook_adds_subject_batch_target_redraw_section_and_mode_progress() -
     assert "posthoc_final_aae_bpm" in joined
     assert "acc_compare_posthoc_aae_bpm" in joined
     assert 'RUN_BATCH_TARGET_HR_REDRAW = False' in joined
-    assert 'BATCH_TARGET_CASCADE_SCHEME = CascadeScheme.ACC.value' in joined
+    assert "BATCH_TARGET_REFERENCE_ORDER_KEY = ReferenceConfig(('ACC',)).reference_order_key" in joined
     assert 'BATCH_TARGET_OUTPUT_DIR = Path(RESULTS_ROOT) / "batch_target_hr_curves"' in joined
 
 
@@ -201,7 +197,7 @@ def test_section_two_documents_every_preview_parameter() -> None:
         "PREVIEW_MOTION_TYPE",
         "PREVIEW_MOTION_INDEX",
         "FS_ORIGIN",
-        "TW",
+        "hr_window_s",
         "SUBJECT_DIR",
         "calibration",
     ):
@@ -227,62 +223,22 @@ def test_layered_config_cells_two_three_four_have_inline_parameter_comments() ->
     assert not missing, "\n".join(missing)
 
 
-def test_notebook_uses_reference_phase_tracking_and_dynamic_guard_defaults() -> None:
+def test_notebook_uses_frozen_preset_and_four_dimensional_grid() -> None:
     joined = "\n".join(_sources("code"))
-    override_cell = next(source for source in _sources("code") if "TRIAL_PARAM_OVERRIDES =" in source)
-
-    expected_assignments = (
-        "MOTION_TRACKING_RANGE_UP_BPM = 35.0",
-        "MOTION_TRACKING_RANGE_DOWN_BPM = 15.0",
-        "MOTION_TRACKING_SLEW_LIMIT_UP_BPM = 5.5",
-        "MOTION_TRACKING_SLEW_STEP_UP_BPM = 3.5",
-        "MOTION_TRACKING_SLEW_LIMIT_DOWN_BPM = 2.0",
-        "MOTION_TRACKING_SLEW_STEP_DOWN_BPM = 1.5",
-        "RECOVERY_TRACKING_RANGE_UP_BPM = 20.0",
-        "RECOVERY_TRACKING_RANGE_DOWN_BPM = 25.0",
-        "RECOVERY_TRACKING_SLEW_LIMIT_UP_BPM = 1.5",
-        "RECOVERY_TRACKING_SLEW_STEP_UP_BPM = 1.5",
-        "RECOVERY_TRACKING_SLEW_LIMIT_DOWN_BPM = 3.5",
-        "RECOVERY_TRACKING_SLEW_STEP_DOWN_BPM = 3.0",
-        "CANDIDATE_PEAK_THRESHOLD_RATIO = 0.30",
-        "FULL_CANDIDATE_PEAK_THRESHOLD_RATIO = 0.15",
-        "POST_MOTION_GUARD_SECONDS = None",
-        "POST_MOTION_GUARD_RISING_WINDOWS = 3",
-        "POST_MOTION_GUARD_RISING_SLOPE_BPM_PER_WINDOW = 1.5",
-        "SEARCH_SPACE.Rest_HR_Track_Band_BPM = [20.0, 30.0, 60.0, 80.0]",
-        "SEARCH_SPACE.Rest_HR_Slew_Limit_BPM = [1.0, 3.0, 6.0, 8.0]",
-        "SEARCH_SPACE.Rest_HR_Slew_Step_BPM = [0.5, 2.0, 4.0]",
-    )
-    for assignment in expected_assignments:
-        assert assignment in joined
-
-    for legacy_name in (
-        "TRACKING_RANGE_UP_BPM",
-        "TRACKING_RANGE_DOWN_BPM",
-        "TRACKING_SLEW_LIMIT_UP_BPM",
-        "TRACKING_SLEW_STEP_UP_BPM",
-        "TRACKING_SLEW_LIMIT_DOWN_BPM",
-        "TRACKING_SLEW_STEP_DOWN_BPM",
-    ):
-        assert f"{legacy_name} = None" in joined
-
-    for field_name in (
-        "motion_tracking_range_up_bpm",
-        "recovery_tracking_range_down_bpm",
-        "candidate_peak_threshold_ratio",
-        "full_candidate_peak_threshold_ratio",
-        "post_motion_guard_rising_windows",
-        "post_motion_guard_rising_slope_bpm_per_window",
-    ):
-        assert f'"{field_name}":' in override_cell
+    assert "resolve_core_config(" in joined
+    assert "PRESET_METADATA = core_preset_metadata(" in joined
+    assert "SEARCH_SPACE = default_protocol_search_space()" in joined
+    assert "ENABLE_LOW_LOCK_RECOVERY = True" not in joined
+    assert "ENABLE_HIGH_LOCK_RECOVERY = True" not in joined
+    assert "SEARCH_SPACE.Rest_HR_Track_Band_BPM" not in joined
 
 
-def test_readme_distinguishes_motion_post10_from_dynamic_guard_lifetime() -> None:
+def test_readme_documents_scope_and_frozen_handoff() -> None:
     readme = Path("notebooks/readme.md").read_text(encoding="utf-8")
 
-    assert "adaptive_rising_rescue" in readme
+    assert "core_enhanced_v1" in readme
     assert "motion_post10" in readme
-    assert "不作为运动后保护的固定退出时间" in readme
+    assert "reset-FFT" in readme
 
 
 def test_notebook_safe_defaults_execute_without_creating_outputs(

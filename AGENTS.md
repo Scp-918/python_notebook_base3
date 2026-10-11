@@ -35,7 +35,7 @@ $env:PYTHONPATH="src"; conda run -n PPG_sensor_env ruff check src/ tests/
 
 Python 代码使用 4 空格缩进。新增公共函数应保留类型标注和简短 docstring。求解参数只在 `src/ppg_hr/params.py` 增加，并提供默认值，避免在 Notebook 或流程代码中散落硬编码默认参数。
 
-函数、变量、模块名使用 `snake_case`；类、dataclass、Enum 使用 `PascalCase`。保留既有协议命名，例如 `ACC3`、`HF2_CF2`、`motion_only`、`rff_lms`。
+函数、变量、模块名使用 `snake_case`；类、dataclass、Enum 使用 `PascalCase`。reference 配置以 `reference_groups_order` 有序 tuple 为真源，输出统一使用派生 canonical key，例如 `ACC+HF`；其余保留 `motion_only`、`rff_lms` 等协议命名。
 
 ## 测试指南
 

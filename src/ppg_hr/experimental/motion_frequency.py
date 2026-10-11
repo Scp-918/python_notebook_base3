@@ -43,17 +43,14 @@ def estimate_motion_frequency(
         return float(default_hz)
 
     fs = int(fs)
-    start = max(0, int(round(motion_segment.motion_start_s * fs)))
-    end = min(len(accx), int(round(motion_segment.motion_end_s * fs)))
-    if end - start < max(8, fs):
-        warnings.warn("motion frequency fallback: motion segment too short", RuntimeWarning, stacklevel=2)
+    runs = motion_segment.motion_runs
+    if not runs:
         return float(default_hz)
-
-    axes = [
-        np.asarray(accx, dtype=float)[start:end],
-        np.asarray(accy, dtype=float)[start:end],
-        np.asarray(accz, dtype=float)[start:end],
-    ]
+    ranges = [(max(0,int(round(start*fs))),min(len(accx),int(round(end*fs)))) for start,end in runs]
+    axes = [np.concatenate([np.asarray(axis,dtype=float)[start:end] for start,end in ranges])
+            for axis in (accx,accy,accz)]
+    if len(axes[0]) < max(8,fs):
+        return float(default_hz)
     energies = [float(np.nansum((axis - np.nanmean(axis)) ** 2)) for axis in axes]
     sig = axes[int(np.argmax(energies))]
     sig = sig - np.nanmean(sig)

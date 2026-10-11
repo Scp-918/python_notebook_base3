@@ -32,10 +32,13 @@ except ModuleNotFoundError:  # pragma: no cover - only used in lean environments
     optuna = None
     TPESampler = None
 
-from ..params import CascadeScheme, MotionType, ProtocolParams, TargetScope
+from ..params import (DEFAULT_REFERENCE_CONFIGS, RESULT_SCHEMA_VERSION, ReferenceConfig, MotionType, ProtocolParams, TargetScope,
+                      resolve_core_config, core_preset_metadata, CORE_SEARCH_FIELDS,
+                      CORE_EXPERIMENT_FIELDS, CORE_EVALUATION_FIELDS)
 from ..preprocess.calibration import load_subject_calibration
+from .penalty_policy import PenaltyPolicy, spectrum_peaks
 from .batch_pairing import SamplePair, discover_sample_pairs_with_unpaired
-from .alignment import _window_fft_hr, search_time_bias_after
+from .alignment import _window_fft_hr
 from .cascade_solver import (
     MetricArrays,
     ProtocolRunResult,
@@ -50,6 +53,7 @@ from .preprocess_protocol import (
     _validate_ud_calculation_config,
     load_and_preprocess_protocol,
     resample_protocol_dataset,
+    apply_ppg_input_transform,
 )
 from .protocol_outputs import SampleOutputPaths, plot_signal_figures, write_qc_tables
 from .protocol_search_space import (
@@ -59,7 +63,7 @@ from .protocol_search_space import (
     default_protocol_search_space,
 )
 from .qc import QcResult, quality_filter_sample
-from .segmentation import detect_activity_segments
+from .segmentation import apply_motion_protocol, detect_source_imu_segments
 from .spectral_utils import compute_power_spectrum
 
 __all__ = [
@@ -115,7 +119,7 @@ class _ModeOptimisation:
 
     motion_type: str
     target_scope: TargetScope
-    cascade_scheme: CascadeScheme
+    reference_config: ReferenceConfig
     adaptive_filter: str
     objective_mode: str
     data_split_mode: str
@@ -144,8 +148,8 @@ class _ModeOptimisation:
     mode_manifest_path: str = ""
     fold_results: list["_ModeOptimisation"] = field(default_factory=list, repr=False)
     metric_arrays_by_split: dict[str, MetricArrays] = field(default_factory=dict, repr=False)
-    acc3_compare_metrics: dict[str, Any] = field(default_factory=dict)
-    acc3_compare_arrays: MetricArrays = field(default_factory=dict, repr=False)
+    acc_compare_metrics: dict[str, Any] = field(default_factory=dict)
+    acc_compare_arrays: MetricArrays = field(default_factory=dict, repr=False)
     result_level: str = "fold"
     aggregation: str = ""
     params_semantics: str = ""
@@ -158,28 +162,28 @@ class _ModeOptimisation:
         return _mode_key_for(
             self.motion_type,
             self.target_scope,
-            self.cascade_scheme,
+            self.reference_config,
             self.adaptive_filter,
         )
 
 
 def build_output_run_name(
     target_scopes: list[str | TargetScope],
-    cascade_schemes: list[str | CascadeScheme],
+    reference_group_orders: list[tuple[str, ...] | ReferenceConfig],
     adaptive_filters: list[str],
     objective_mode: str,
     data_split_mode: str,
-    tw_f_s: float = 0.0,
+    prewarm_s: float = 0.0,
     postprocess_method: str = "fft",
 ) -> str:
     """Build the run_name required by the Notebook output layout."""
 
     scopes = "-".join(TargetScope(x).value for x in target_scopes)
-    schemes = "-".join(CascadeScheme(x).value for x in cascade_schemes)
+    schemes = "-".join(ReferenceConfig(x).reference_order_key for x in reference_group_orders)
     filters = "-".join(str(x) for x in adaptive_filters)
     return (
         f"{scopes}__{schemes}__{filters}__{objective_mode}__{data_split_mode}"
-        f"__{_tw_f_run_label(tw_f_s)}__{_postprocess_run_label(postprocess_method)}"
+        f"__{_prewarm_run_label(prewarm_s)}__{_postprocess_run_label(postprocess_method)}"
     )
 
 
@@ -187,11 +191,11 @@ def build_subject_output_dir(
     *,
     subject_dir: str | Path,
     target_scopes: list[str | TargetScope],
-    cascade_schemes: list[str | CascadeScheme],
+    reference_group_orders: list[tuple[str, ...] | ReferenceConfig],
     adaptive_filters: list[str],
     objective_mode: str,
     data_split_mode: str,
-    tw_f_s: float = 0.0,
+    prewarm_s: float = 0.0,
     postprocess_method: str = "fft",
 ) -> Path:
     """Return ``subject_dir.parent/outputs/{subject}__{run_signature}``."""
@@ -199,24 +203,24 @@ def build_subject_output_dir(
     subject = Path(subject_dir).resolve()
     run_signature = build_output_run_name(
         target_scopes,
-        cascade_schemes,
+        reference_group_orders,
         adaptive_filters,
         objective_mode,
         data_split_mode,
-        tw_f_s=tw_f_s,
+        prewarm_s=prewarm_s,
         postprocess_method=postprocess_method,
     )
     return subject.parent / "outputs" / f"{subject.name}__{run_signature}"
 
 
-def _tw_f_run_label(value: float) -> str:
-    """Return a compact output-folder label for fixed TW_F seconds."""
+def _prewarm_run_label(value: float) -> str:
+    """Return a compact output-folder label for fixed prewarm_s seconds."""
 
     value_f = float(value)
     if value_f.is_integer():
-        return f"TW_F{int(value_f)}s"
+        return f"prewarm_s{int(value_f)}s"
     text = f"{value_f:g}".replace(".", "p").replace("-", "m")
-    return f"TW_F{text}s"
+    return f"prewarm_s{text}s"
 
 
 def _postprocess_run_label(value: str) -> str:
@@ -284,7 +288,7 @@ def run_batch_adaptive_protocol(
     search_space: ProtocolSearchSpace | None = None,
     trial_param_overrides: dict[str, Any] | None = None,
     target_scopes: list[TargetScope | str] | None = None,
-    cascade_schemes: list[CascadeScheme | str] | None = None,
+    reference_group_orders: list[ReferenceConfig | tuple[str, ...]] | None = None,
     adaptive_filters: list[str] | None = None,
     objective_mode: str = "posthoc_aae",
     data_split_mode: str = "all_train",
@@ -321,7 +325,7 @@ def run_batch_adaptive_protocol(
     )
 
     scopes = [TargetScope(x) for x in (target_scopes or [TargetScope.MOTION_POST10])]
-    schemes = [CascadeScheme(x) for x in (cascade_schemes or list(CascadeScheme))]
+    schemes = [ReferenceConfig(x) for x in (reference_group_orders or list(DEFAULT_REFERENCE_CONFIGS))]
     filters = [str(x) for x in (adaptive_filters or ["lms"])]
     unsupported = [x for x in filters if x not in _VALID_FILTERS]
     if unsupported:
@@ -336,11 +340,11 @@ def run_batch_adaptive_protocol(
             root_out = build_subject_output_dir(
                 subject_dir=input_path,
                 target_scopes=scopes,
-                cascade_schemes=schemes,
+                reference_group_orders=schemes,
                 adaptive_filters=filters,
                 objective_mode=objective_mode,
                 data_split_mode=data_split_mode,
-                tw_f_s=float(trial_overrides.get("TW_F", 0.0)),
+                prewarm_s=float(trial_overrides.get("prewarm_s", 0.0)),
                 postprocess_method=str(trial_overrides.get("postprocess_method", "fft")),
             )
     else:
@@ -452,7 +456,7 @@ def run_batch_adaptive_protocol(
             )
             datasets[pair.motion_id] = dataset
             pair_by_group[pair.motion_id] = pair
-            seg_for_plot = detect_activity_segments(dataset.accx, dataset.accy, dataset.accz, dataset.fs, TW=8)
+            seg_for_plot = apply_motion_protocol(detect_source_imu_segments(dataset.source_imu), trial_overrides.get("motion_policy", "single_bout"))
             signal_figures[pair.motion_id] = plot_signal_figures(
                 sensor_csv=pair.sensor_csv,
                 dataset=dataset,
@@ -542,7 +546,7 @@ def run_batch_adaptive_protocol(
                             "motion_type": motion_type,
                             "target_scope": scope.name,
                             "target_scope_value": scope.value,
-                            "cascade_scheme": scheme.value,
+                            "reference_order_key": scheme.reference_order_key,
                             "adaptive_filter": adaptive_filter,
                         }
                     )
@@ -902,12 +906,12 @@ def _unique_ids_from_folds(folds: list[dict[str, Any]]) -> list[str]:
 
 def _budget_for_scheme(
     budgets: dict[str, dict[str, int]] | None,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     cfg: ProtocolParams,
 ) -> dict[str, int]:
     """Return per-cascade n_trials/n_repeats with config fallback."""
 
-    item = (budgets or {}).get(scheme.value, {})
+    item = (budgets or {}).get(scheme.reference_order_key, {})
     return {
         "n_trials": int(item.get("n_trials", cfg.max_iterations)),
         "n_repeats": int(item.get("n_repeats", cfg.num_repeats)),
@@ -921,7 +925,7 @@ def _run_one_optuna_repeat(
     objective_sets: dict[str, ProtocolDataset],
     objective_split: str,
     scope: TargetScope,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     adaptive_filter: str,
     objective_mode: str,
     delay_estimation_mode: str,
@@ -986,7 +990,7 @@ def _run_one_optuna_repeat(
                 nonlocal best_value, best_params, best_trial_idx, best_so_far
 
                 idx_map = {
-                    name: trial.suggest_int(name, 0, len(space.options(name)) - 1)
+                    name: trial.suggest_int(name, 0, len(space.options(name, adaptive_filter=adaptive_filter)) - 1)
                     for name in space.names_for_filter(adaptive_filter)
                 }
                 params = _decode_with_seed(
@@ -1038,7 +1042,7 @@ def _run_one_optuna_repeat(
             )
             for trial_idx in range(int(n_trials)):
                 idx_map = {
-                    name: int(rng.integers(0, len(space.options(name))))
+                    name: int(rng.integers(0, len(space.options(name, adaptive_filter=adaptive_filter))))
                     for name in space.names_for_filter(adaptive_filter)
                 }
                 params = _decode_with_seed(
@@ -1103,7 +1107,7 @@ def _optimise_group_mode(
     val_sets: dict[str, ProtocolDataset],
     test_sets: dict[str, ProtocolDataset],
     scope: TargetScope,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     adaptive_filter: str,
     objective_mode: str,
     data_split_mode: str,
@@ -1219,7 +1223,7 @@ def _optimise_group_mode(
                 "mode_total": mode_total,
                 "target_scope": scope.name,
                 "target_scope_value": scope.value,
-                "cascade_scheme": scheme.value,
+                "reference_order_key": scheme.reference_order_key,
                 "adaptive_filter": adaptive_filter,
                 "fold_id": "" if fold_id is None else int(fold_id),
                 "heldout_group_id": heldout_group_id,
@@ -1274,7 +1278,7 @@ def _optimise_group_mode(
                         "mode_total": mode_total,
                         "target_scope": scope.name,
                         "target_scope_value": scope.value,
-                        "cascade_scheme": scheme.value,
+                        "reference_order_key": scheme.reference_order_key,
                         "adaptive_filter": adaptive_filter,
                         "fold_id": "" if fold_id is None else int(fold_id),
                         "heldout_group_id": heldout_group_id,
@@ -1309,7 +1313,7 @@ def _optimise_group_mode(
                 nonlocal best_value, best_params, best_repeat_idx, best_trial_idx, best_so_far
 
                 idx_map = {
-                    name: trial.suggest_int(name, 0, len(space.options(name)) - 1)
+                    name: trial.suggest_int(name, 0, len(space.options(name, adaptive_filter=adaptive_filter)) - 1)
                     for name in space.names_for_filter(adaptive_filter)
                 }
                 params = _decode_with_seed(
@@ -1380,7 +1384,7 @@ def _optimise_group_mode(
             )
             for trial_idx in range(int(n_trials)):
                 idx_map = {
-                    name: int(rng.integers(0, len(space.options(name))))
+                    name: int(rng.integers(0, len(space.options(name, adaptive_filter=adaptive_filter))))
                     for name in space.names_for_filter(adaptive_filter)
                 }
                 params = _decode_with_seed(
@@ -1442,7 +1446,7 @@ def _optimise_group_mode(
     result = _ModeOptimisation(
         motion_type=motion_type,
         target_scope=scope,
-        cascade_scheme=scheme,
+        reference_config=scheme,
         adaptive_filter=adaptive_filter,
         objective_mode=objective_mode,
         data_split_mode=data_split_mode,
@@ -1466,7 +1470,7 @@ def _optimise_group_mode(
         result_level="fold" if data_split_mode == "leave_one_group_out" else "single_split",
         params_semantics="fold_best_params" if data_split_mode == "leave_one_group_out" else "best_params_for_this_split",
     )
-    _attach_acc3_compare(
+    _attach_acc_compare(
         result,
         test_sets=test_sets,
         trial_cache=trial_cache,
@@ -1485,10 +1489,11 @@ def _normalise_trial_param_overrides(overrides: dict[str, Any] | None) -> dict[s
 
     if not overrides:
         return {}
-    valid_names = {item.name for item in fields(ProtocolTrialParams)}
-    unknown = sorted(set(overrides) - valid_names)
-    if unknown:
-        raise ValueError(f"Unknown ProtocolTrialParams overrides: {unknown}")
+    allowed = CORE_SEARCH_FIELDS | CORE_EXPERIMENT_FIELDS | CORE_EVALUATION_FIELDS
+    rejected = sorted(set(overrides) - allowed)
+    if rejected:
+        raise ValueError(f"Frozen or unknown core_enhanced_v1 overrides: {rejected}")
+    resolve_core_config(overrides)
     return dict(overrides)
 
 
@@ -1502,16 +1507,13 @@ def _default_params_for_filter(
 ) -> ProtocolTrialParams:
     values = {}
     for name in space.names_for_filter(adaptive_filter):
-        value = space.options(name)[0]
-        if name == "RFF_LMS_Mu_Base":
-            values["LMS_Mu_Base"] = value
-        else:
-            values[name] = value
+        value = space.options(name, adaptive_filter=adaptive_filter)[0]
+        values[name] = value
     values["adaptive_filter"] = adaptive_filter
     values["objective_mode"] = objective_mode
     values["delay_estimation_mode"] = str(delay_estimation_mode)
     values.update(_normalise_trial_param_overrides(trial_param_overrides))
-    return ProtocolTrialParams(**values)
+    return resolve_core_config(values)
 
 
 def _decode_with_seed(
@@ -1552,7 +1554,7 @@ def _failed_mode_optimisation(
     *,
     motion_type: str,
     scope: TargetScope,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     adaptive_filter: str,
     objective_mode: str,
     data_split_mode: str,
@@ -1573,7 +1575,7 @@ def _failed_mode_optimisation(
     result = _ModeOptimisation(
         motion_type=motion_type,
         target_scope=scope,
-        cascade_scheme=scheme,
+        reference_config=scheme,
         adaptive_filter=adaptive_filter,
         objective_mode=objective_mode,
         data_split_mode=data_split_mode,
@@ -1595,7 +1597,7 @@ def _failed_mode_optimisation(
         history=[],
         success=False,
         reason=reason,
-        acc3_compare_metrics=_empty_acc3_compare_fields("failed", reason),
+        acc_compare_metrics=_empty_acc_compare_fields("failed", reason),
         result_level="aggregate" if data_split_mode == "leave_one_group_out" else "single_split",
         aggregation="logo_window_concat" if data_split_mode == "leave_one_group_out" else "",
         params_semantics=(
@@ -1611,7 +1613,7 @@ def _aggregate_logo_fold_results(
     *,
     motion_type: str,
     scope: TargetScope,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     adaptive_filter: str,
     objective_mode: str,
     data_split_mode: str,
@@ -1630,7 +1632,7 @@ def _aggregate_logo_fold_results(
         return _ModeOptimisation(
             motion_type=motion_type,
             target_scope=scope,
-            cascade_scheme=scheme,
+            reference_config=scheme,
             adaptive_filter=adaptive_filter,
             objective_mode=objective_mode,
             data_split_mode=data_split_mode,
@@ -1646,7 +1648,7 @@ def _aggregate_logo_fold_results(
             history=[],
             success=False,
             reason=reason,
-            acc3_compare_metrics=_empty_acc3_compare_fields("failed", reason),
+            acc_compare_metrics=_empty_acc_compare_fields("failed", reason),
             result_level="aggregate",
             aggregation="logo_window_concat",
             params_semantics="representative_fold_best_params_not_global",
@@ -1675,7 +1677,7 @@ def _aggregate_logo_fold_results(
     result = _ModeOptimisation(
         motion_type=motion_type,
         target_scope=scope,
-        cascade_scheme=scheme,
+        reference_config=scheme,
         adaptive_filter=adaptive_filter,
         objective_mode=objective_mode,
         data_split_mode=data_split_mode,
@@ -1698,30 +1700,30 @@ def _aggregate_logo_fold_results(
         representative_fold_id=best_fold.fold_id,
         representative_heldout_group_id=best_fold.heldout_group_id,
     )
-    if scheme == CascadeScheme.ACC3:
-        result.acc3_compare_metrics = _acc3_compare_fields(test_metrics, status="same_as_original", reason="")
-        result.acc3_compare_arrays = test_arrays
+    if scheme == ReferenceConfig(('ACC',)):
+        result.acc_compare_metrics = _acc_compare_fields(test_metrics, status="same_as_original", reason="")
+        result.acc_compare_arrays = test_arrays
     else:
-        acc3_arrays = _concat_metric_arrays([r.acc3_compare_arrays for r in fold_results])
+        acc_arrays = _concat_metric_arrays([r.acc_compare_arrays for r in fold_results])
         failures = [
-            str(r.acc3_compare_metrics.get("acc3_compare_reason", ""))
+            str(r.acc_compare_metrics.get("acc_compare_reason", ""))
             for r in fold_results
-            if str(r.acc3_compare_metrics.get("acc3_compare_status", "")) not in {"ok", "same_as_original"}
+            if str(r.acc_compare_metrics.get("acc_compare_status", "")) not in {"ok", "same_as_original"}
         ]
-        acc3_metrics = _metrics_from_arrays_with_status(acc3_arrays, "test", failures)
-        result.acc3_compare_metrics = _acc3_compare_fields(
-            acc3_metrics,
-            status="ok" if bool(acc3_metrics.get("success", False)) else "failed",
-            reason=str(acc3_metrics.get("reason", "")),
+        acc_metrics = _metrics_from_arrays_with_status(acc_arrays, "test", failures)
+        result.acc_compare_metrics = _acc_compare_fields(
+            acc_metrics,
+            status="ok" if bool(acc_metrics.get("success", False)) else "failed",
+            reason=str(acc_metrics.get("reason", "")),
         )
-        result.acc3_compare_arrays = acc3_arrays
+        result.acc_compare_arrays = acc_arrays
     return result
 
 
 def _evaluate_dataset_map(
     datasets: dict[str, ProtocolDataset],
     scope: TargetScope,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     params: ProtocolTrialParams,
     split_name: str,
     trial_cache: OrderedDict[tuple[Any, ...], ProtocolRunResult] | dict[tuple[Any, ...], ProtocolRunResult],
@@ -1749,9 +1751,9 @@ def _evaluate_dataset_map(
             eval_mode,
             group_id,
             int(params.Fs_Target),
-            int(params.TW),
+            int(params.hr_window_s),
             scope.value,
-            scheme.value,
+            scheme.reference_order_key,
             str(params.adaptive_filter),
             params.cache_key(),
         )
@@ -1841,28 +1843,28 @@ def _aggregate_runs(
     }
 
 
-def _attach_acc3_compare(
+def _attach_acc_compare(
     result: _ModeOptimisation,
     *,
     test_sets: dict[str, ProtocolDataset],
     trial_cache: OrderedDict[tuple[Any, ...], ProtocolRunResult] | dict[tuple[Any, ...], ProtocolRunResult],
     trial_cache_max_entries: int,
 ) -> None:
-    """Attach same-best-params ACC3 diagnostic test metrics to one completed mode."""
+    """Attach same-best-params ACC diagnostic test metrics to one completed mode."""
 
-    if result.cascade_scheme == CascadeScheme.ACC3:
-        result.acc3_compare_metrics = _acc3_compare_fields(
+    if result.reference_config == ReferenceConfig(('ACC',)):
+        result.acc_compare_metrics = _acc_compare_fields(
             result.test_metrics,
             status="same_as_original",
             reason="",
         )
-        result.acc3_compare_arrays = result.metric_arrays_by_split.get("test", {})
+        result.acc_compare_arrays = result.metric_arrays_by_split.get("test", {})
         return
     try:
         metrics, _, arrays = _evaluate_dataset_map(
             test_sets,
             result.target_scope,
-            CascadeScheme.ACC3,
+            ReferenceConfig(('ACC',)),
             result.best_params,
             "test",
             trial_cache,
@@ -1870,38 +1872,38 @@ def _attach_acc3_compare(
             trial_cache_max_entries=trial_cache_max_entries,
         )
         status = "ok" if bool(metrics.get("success", False)) else "failed"
-        result.acc3_compare_metrics = _acc3_compare_fields(
+        result.acc_compare_metrics = _acc_compare_fields(
             metrics,
             status=status,
             reason=str(metrics.get("reason", "")),
         )
-        result.acc3_compare_arrays = arrays
+        result.acc_compare_arrays = arrays
     except Exception as exc:
-        result.acc3_compare_metrics = _empty_acc3_compare_fields("failed", str(exc))
-        result.acc3_compare_arrays = {}
+        result.acc_compare_metrics = _empty_acc_compare_fields("failed", str(exc))
+        result.acc_compare_arrays = {}
 
 
-def _acc3_compare_fields(metrics: dict[str, Any], *, status: str, reason: str) -> dict[str, Any]:
+def _acc_compare_fields(metrics: dict[str, Any], *, status: str, reason: str) -> dict[str, Any]:
     return {
-        "acc3_compare_aae_bpm": metrics.get("final_aae_bpm", metrics.get("adaptive_aae_bpm", float("nan"))),
-        "acc3_compare_accuracy_pct": metrics.get("final_acc_pct", metrics.get("adaptive_acc_pct", float("nan"))),
+        "acc_compare_aae_bpm": metrics.get("final_aae_bpm", metrics.get("adaptive_aae_bpm", float("nan"))),
+        "acc_compare_accuracy_pct": metrics.get("final_acc_pct", metrics.get("adaptive_acc_pct", float("nan"))),
         "acc_compare_posthoc_aae_bpm": metrics.get("posthoc_final_aae_bpm", float("nan")),
         "acc_compare_posthoc_accuracy_pct": metrics.get("posthoc_final_acc_pct", float("nan")),
-        "acc3_compare_num_windows": int(metrics.get("num_windows", 0) or 0),
-        "acc3_compare_status": str(status),
-        "acc3_compare_reason": str(reason),
+        "acc_compare_num_windows": int(metrics.get("num_windows", 0) or 0),
+        "acc_compare_status": str(status),
+        "acc_compare_reason": str(reason),
     }
 
 
-def _empty_acc3_compare_fields(status: str = "", reason: str = "") -> dict[str, Any]:
+def _empty_acc_compare_fields(status: str = "", reason: str = "") -> dict[str, Any]:
     return {
-        "acc3_compare_aae_bpm": float("nan"),
-        "acc3_compare_accuracy_pct": float("nan"),
+        "acc_compare_aae_bpm": float("nan"),
+        "acc_compare_accuracy_pct": float("nan"),
         "acc_compare_posthoc_aae_bpm": float("nan"),
         "acc_compare_posthoc_accuracy_pct": float("nan"),
-        "acc3_compare_num_windows": 0,
-        "acc3_compare_status": str(status),
-        "acc3_compare_reason": str(reason),
+        "acc_compare_num_windows": 0,
+        "acc_compare_status": str(status),
+        "acc_compare_reason": str(reason),
     }
 
 
@@ -1914,7 +1916,7 @@ def _mode_completion_progress_payload(
 ) -> dict[str, Any]:
     """Build the single progress event emitted after one motion/mode is ready."""
 
-    compare = _acc3_compare_metrics_for(result)
+    compare = _acc_compare_metrics_for(result)
     return {
         "stage": "optimization_mode_completed",
         "mode_idx": int(mode_idx),
@@ -1923,8 +1925,7 @@ def _mode_completion_progress_payload(
         "motion_type": result.motion_type,
         "target_scope": result.target_scope.name,
         "target_scope_value": result.target_scope.value,
-        "cascade_scheme": result.cascade_scheme.value,
-        "cascade_scheme_display": result.cascade_scheme.display_name,
+        "reference_order_key": result.reference_config.reference_order_key,
         "adaptive_filter": result.adaptive_filter,
         "success": bool(result.success),
         "reason": str(result.reason),
@@ -1936,8 +1937,8 @@ def _mode_completion_progress_payload(
         "acc_compare_posthoc_accuracy_pct": compare.get(
             "acc_compare_posthoc_accuracy_pct", float("nan")
         ),
-        "acc_compare_status": compare.get("acc3_compare_status", ""),
-        "acc_compare_reason": compare.get("acc3_compare_reason", ""),
+        "acc_compare_status": compare.get("acc_compare_status", ""),
+        "acc_compare_reason": compare.get("acc_compare_reason", ""),
     }
 
 
@@ -1979,7 +1980,7 @@ def _per_group_row(
         "split": split_name,
         "group_id": group_id,
         "target_scope": run.target_scope.value,
-        "cascade_scheme": run.cascade_scheme.value,
+        "reference_order_key": run.reference_config.reference_order_key,
         "adaptive_filter": run.adaptive_filter,
         "success": bool(run.success),
         "reason": run.reason,
@@ -2040,7 +2041,8 @@ def flatten_params_for_record(params: ProtocolTrialParams, prefix: str = "param_
     None 写成空字符串，读取时由 :func:`protocol_params_from_record` 还原。
     """
 
-    out: dict[str, Any] = {}
+    out: dict[str, Any] = {"result_schema_version": RESULT_SCHEMA_VERSION,
+                           "preset_metadata_json": json.dumps(core_preset_metadata(params), sort_keys=True)}
     for name, value in params.to_dict().items():
         key = f"{prefix}{name}"
         if value is None:
@@ -2053,44 +2055,40 @@ def flatten_params_for_record(params: ProtocolTrialParams, prefix: str = "param_
 
 
 def protocol_params_from_record(row: Any) -> ProtocolTrialParams:
-    """Restore trial params from CSV/Series/dict records.
-
-    中文说明：重绘时优先读取 ``param_*`` 分列；旧输出没有分列时回退
-    ``best_params_json`` 或 ``params`` JSON；再回退旧裸字段列，最后使用 dataclass
-    默认值。若多处冲突，以 ``param_*`` 为准。
-    """
-
+    """Restore complete current-schema trial parameters, preferring param columns."""
     record = _record_to_dict(row)
-    values: dict[str, Any] = {}
-    saw_rff_sigma = False
-    saw_rff_sigma_scale = False
-    for json_column in ("best_params_json", "params"):
-        payload = _parse_stage6_params_json(record.get(json_column, ""))
-        saw_rff_sigma = saw_rff_sigma or "rff_sigma" in payload
-        saw_rff_sigma_scale = saw_rff_sigma_scale or "rff_sigma_scale" in payload
-        values.update({name: payload[name] for name in _protocol_param_names() if name in payload})
+    _require_result_schema(record, "parameter record")
+    values = _parse_stage6_params_json(record.get("best_params_json", ""))
     for item in fields(ProtocolTrialParams):
-        if item.name in record and not _record_value_missing(record[item.name]):
-            values[item.name] = _coerce_protocol_param_value(record[item.name], item)
-            if item.name == "rff_sigma":
-                saw_rff_sigma = True
-            if item.name == "rff_sigma_scale":
-                saw_rff_sigma_scale = True
-    for item in fields(ProtocolTrialParams):
-        param_name = f"param_{item.name}"
-        if param_name in record and not _record_value_missing(record[param_name]):
-            values[item.name] = _coerce_protocol_param_value(record[param_name], item)
-            if item.name == "rff_sigma":
-                saw_rff_sigma = True
-            if item.name == "rff_sigma_scale":
-                saw_rff_sigma_scale = True
-        elif param_name in record and _record_value_missing(record[param_name]) and item.default is None:
-            values[item.name] = None
-            if item.name == "rff_sigma_scale":
-                saw_rff_sigma_scale = True
-    if saw_rff_sigma and not saw_rff_sigma_scale:
-        values["rff_sigma_scale"] = None
-    return ProtocolTrialParams(**values)
+        column = f"param_{item.name}"
+        if column in record:
+            if _record_value_missing(record[column]):
+                if item.default is None:
+                    values[item.name] = None
+                else:
+                    raise ValueError(f"Missing parameter value: {column}")
+            else:
+                values[item.name] = _coerce_protocol_param_value(record[column], item)
+    missing = _protocol_param_names() - values.keys()
+    unknown = values.keys() - _protocol_param_names()
+    if missing or unknown:
+        raise ValueError(f"Invalid parameter record fields: missing={sorted(missing)}, unknown={sorted(unknown)}")
+    values = {item.name: _coerce_protocol_param_value(values[item.name], item) for item in fields(ProtocolTrialParams)}
+    return resolve_core_config(values)
+
+
+def _require_result_schema(payload: dict[str, Any], source: str) -> None:
+    """Reject artifacts from any other result schema."""
+    version = payload.get("result_schema_version")
+    if isinstance(version, bool) or version != RESULT_SCHEMA_VERSION:
+        raise ValueError(f"Unsupported result schema in {source}: {version!r}; expected {RESULT_SCHEMA_VERSION}")
+
+
+def _require_result_table_schema(frame: pd.DataFrame, source: str) -> None:
+    if "result_schema_version" not in frame.columns:
+        raise ValueError(f"Missing result schema in {source}")
+    for version in frame["result_schema_version"]:
+        _require_result_schema({"result_schema_version": version}, source)
 
 
 def _record_to_dict(row: Any) -> dict[str, Any]:
@@ -2129,12 +2127,12 @@ def _mode_artifact_dir(motion_dir: Path, result: _ModeOptimisation) -> Path:
 def _mode_key_for(
     motion_type: str,
     scope: TargetScope,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     adaptive_filter: str,
 ) -> str:
     """Return a globally unique optimisation/checkpoint identity."""
 
-    return f"{motion_type}__{scope.value}__{scheme.value}__{adaptive_filter}"
+    return f"{motion_type}__{scope.value}__{scheme.reference_order_key}__{adaptive_filter}"
 
 
 def _derive_mode_seed(
@@ -2142,7 +2140,7 @@ def _derive_mode_seed(
     random_state: int,
     motion_type: str,
     scope: TargetScope,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     adaptive_filter: str,
     repeat_idx: int,
 ) -> int:
@@ -2153,7 +2151,7 @@ def _derive_mode_seed(
             "random_state": int(random_state),
             "motion_type": str(motion_type),
             "target_scope": scope.value,
-            "cascade_scheme": scheme.value,
+            "reference_order_key": scheme.reference_order_key,
             "adaptive_filter": str(adaptive_filter),
             "repeat_idx": int(repeat_idx),
         }
@@ -2164,7 +2162,7 @@ def _build_mode_fingerprint(
     *,
     motion_type: str,
     scope: TargetScope,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     adaptive_filter: str,
     objective_mode: str,
     data_split_mode: str,
@@ -2178,9 +2176,11 @@ def _build_mode_fingerprint(
     """Hash every input that determines whether a mode checkpoint is reusable."""
 
     payload = {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
+        "preset": core_preset_metadata(resolve_core_config()),
         "motion_type": str(motion_type),
         "target_scope": scope.value,
-        "cascade_scheme": scheme.value,
+        "reference_order_key": scheme.reference_order_key,
         "adaptive_filter": str(adaptive_filter),
         "objective_mode": str(objective_mode),
         "data_split_mode": str(data_split_mode),
@@ -2196,7 +2196,7 @@ def _build_mode_fingerprint(
 
 
 def _ud_preprocessing_fingerprint_fields(
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     *,
     mode: str,
     window_s: float,
@@ -2204,7 +2204,7 @@ def _ud_preprocessing_fingerprint_fields(
 ) -> dict[str, Any]:
     """Invalidate only modes whose numerical inputs changed with raw-formula UD."""
 
-    if scheme in {CascadeScheme.UD2, CascadeScheme.ACC_UD2}:
+    if "UD" in scheme.reference_groups_order:
         return {
             "ud_preprocessing": "calibrated_formula_optional_voltage_smoothing_no_bandpass_v2",
             "ud_calculation_mode": str(mode),
@@ -2235,10 +2235,13 @@ def _fold_per_group_path(motion_dir: Path, result: _ModeOptimisation, fold: _Mod
 
 def _mode_manifest_payload(result: _ModeOptimisation) -> dict[str, Any]:
     return {
+        **core_preset_metadata(result.best_params),
+        "reference_groups_order": result.reference_config.reference_groups_order,
+        "reference_sequence": result.reference_config.reference_sequence,
+        "result_schema_version": RESULT_SCHEMA_VERSION,
         "motion_type": result.motion_type,
         "target_scope": result.target_scope.value,
-        "cascade_scheme": result.cascade_scheme.value,
-        "cascade_scheme_display": result.cascade_scheme.display_name,
+        "reference_order_key": result.reference_config.reference_order_key,
         "adaptive_filter": result.adaptive_filter,
         "objective_mode": result.objective_mode,
         "data_split_mode": result.data_split_mode,
@@ -2263,7 +2266,7 @@ def _mode_manifest_payload(result: _ModeOptimisation) -> dict[str, Any]:
         "history_path": result.history_path,
         "per_group_path": result.per_group_path,
         "mode_manifest_path": result.mode_manifest_path,
-        "acc3_compare_metrics": result.acc3_compare_metrics,
+        "acc_compare_metrics": result.acc_compare_metrics,
         "result_level": result.result_level,
         "aggregation": result.aggregation,
         "params_semantics": result.params_semantics,
@@ -2275,52 +2278,54 @@ def _mode_manifest_payload(result: _ModeOptimisation) -> dict[str, Any]:
 
 
 def _mode_result_from_manifest_payload(payload: dict[str, Any]) -> _ModeOptimisation:
+    _require_result_schema(payload, "mode manifest")
+    params = protocol_params_from_record({
+        "result_schema_version": payload["result_schema_version"],
+        "best_params_json": payload["best_params"],
+    })
     return _ModeOptimisation(
-        motion_type=str(payload.get("motion_type", "")),
-        target_scope=TargetScope(str(payload.get("target_scope", TargetScope.MOTION_ONLY.value))),
-        cascade_scheme=CascadeScheme(str(payload.get("cascade_scheme", CascadeScheme.ACC3.value))),
-        adaptive_filter=str(payload.get("adaptive_filter", "lms")),
-        objective_mode=str(payload.get("objective_mode", "aae")),
-        data_split_mode=str(payload.get("data_split_mode", "split")),
-        best_params=ProtocolTrialParams(**dict(payload.get("best_params", {}))),
-        best_repeat_idx=int(payload.get("best_repeat_idx", 0) or 0),
-        best_trial_idx=int(payload.get("best_trial_idx", 0) or 0),
-        n_trials=int(payload.get("n_trials", 0) or 0),
-        n_repeats=int(payload.get("n_repeats", 0) or 0),
-        train_metrics=dict(payload.get("train_metrics", {})),
-        val_metrics=dict(payload.get("val_metrics", {})),
-        test_metrics=dict(payload.get("test_metrics", {})),
+        motion_type=str(payload["motion_type"]),
+        target_scope=TargetScope(str(payload["target_scope"])),
+        reference_config=ReferenceConfig.from_key(str(payload["reference_order_key"])),
+        adaptive_filter=str(payload["adaptive_filter"]),
+        objective_mode=str(payload["objective_mode"]),
+        data_split_mode=str(payload["data_split_mode"]),
+        best_params=params,
+        best_repeat_idx=int(payload["best_repeat_idx"] or 0),
+        best_trial_idx=int(payload["best_trial_idx"] or 0),
+        n_trials=int(payload["n_trials"] or 0),
+        n_repeats=int(payload["n_repeats"] or 0),
+        train_metrics=dict(payload["train_metrics"]),
+        val_metrics=dict(payload["val_metrics"]),
+        test_metrics=dict(payload["test_metrics"]),
         per_group_rows=[],
         history=[],
-        success=bool(payload.get("success", False)),
-        reason=str(payload.get("reason", "")),
-        training_elapsed_s=float(payload.get("training_elapsed_s", 0.0) or 0.0),
-        ud_calculation_mode=str(payload.get("ud_calculation_mode", "smoothed")),
-        ud_smoothing_window_s=float(payload.get("ud_smoothing_window_s", 0.1) or 0.1),
-        ud_smoothing_window_samples=int(payload.get("ud_smoothing_window_samples", 10) or 10),
-        fold_id=(None if payload.get("fold_id", None) in ("", None) else int(payload.get("fold_id"))),
-        heldout_group_id=str(payload.get("heldout_group_id", "")),
-        train_group_ids=[str(item) for item in payload.get("train_group_ids", [])],
-        test_group_id=str(payload.get("test_group_id", "")),
-        history_path=str(payload.get("history_path", "")),
-        per_group_path=str(payload.get("per_group_path", "")),
-        mode_manifest_path=str(payload.get("mode_manifest_path", "")),
-        acc3_compare_metrics=dict(payload.get("acc3_compare_metrics", {})),
+        success=bool(payload["success"]),
+        reason=str(payload["reason"]),
+        training_elapsed_s=float(payload["training_elapsed_s"] or 0.0),
+        ud_calculation_mode=str(payload["ud_calculation_mode"]),
+        ud_smoothing_window_s=float(payload["ud_smoothing_window_s"] or 0.1),
+        ud_smoothing_window_samples=int(payload["ud_smoothing_window_samples"] or 10),
+        fold_id=None if payload["fold_id"] in ("", None) else int(payload["fold_id"]),
+        heldout_group_id=str(payload["heldout_group_id"]),
+        train_group_ids=[str(item) for item in payload["train_group_ids"]],
+        test_group_id=str(payload["test_group_id"]),
+        history_path=str(payload["history_path"]),
+        per_group_path=str(payload["per_group_path"]),
+        mode_manifest_path=str(payload["mode_manifest_path"]),
+        acc_compare_metrics=dict(payload["acc_compare_metrics"]),
         fold_results=[
-            _mode_result_from_manifest_payload(dict(item))
-            for item in payload.get("fold_results", [])
-            if isinstance(item, dict)
+            _mode_result_from_manifest_payload(dict(item)) for item in payload["fold_results"]
         ],
-        result_level=str(payload.get("result_level", "fold")),
-        aggregation=str(payload.get("aggregation", "")),
-        params_semantics=str(payload.get("params_semantics", "")),
+        result_level=str(payload["result_level"]),
+        aggregation=str(payload["aggregation"]),
+        params_semantics=str(payload["params_semantics"]),
         representative_fold_id=(
-            None
-            if payload.get("representative_fold_id", None) in ("", None)
-            else int(payload.get("representative_fold_id"))
+            None if payload["representative_fold_id"] in ("", None)
+            else int(payload["representative_fold_id"])
         ),
-        representative_heldout_group_id=str(payload.get("representative_heldout_group_id", "")),
-        run_fingerprint=str(payload.get("run_fingerprint", "")),
+        representative_heldout_group_id=str(payload["representative_heldout_group_id"]),
+        run_fingerprint=str(payload["run_fingerprint"]),
     )
 
 
@@ -2341,21 +2346,18 @@ def _write_mode_manifest(motion_dir: Path, result: _ModeOptimisation) -> Path:
 def _read_motion_checkpoint(motion_dir: Path) -> dict[str, Any]:
     path = motion_dir / "_checkpoint.json"
     if not path.exists():
-        return {"motion_type": motion_dir.name, "modes": {}}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {"motion_type": motion_dir.name, "modes": {}}
+        return {"result_schema_version": RESULT_SCHEMA_VERSION, "motion_type": motion_dir.name, "modes": {}}
+    payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
-        return {"motion_type": motion_dir.name, "modes": {}}
-    modes = payload.get("modes", {})
-    return {
-        "motion_type": str(payload.get("motion_type", motion_dir.name)),
-        "modes": dict(modes) if isinstance(modes, dict) else {},
-    }
+        raise ValueError(f"Invalid result schema checkpoint: {path}")
+    _require_result_schema(payload, str(path))
+    if not isinstance(payload["modes"], dict):
+        raise ValueError(f"Invalid modes in checkpoint: {path}")
+    return payload
 
 
 def _write_motion_checkpoint(motion_dir: Path, checkpoint: dict[str, Any]) -> Path:
+    _require_result_schema(checkpoint, "checkpoint")
     path = motion_dir / "_checkpoint.json"
     path.write_text(json.dumps(_jsonify(checkpoint), ensure_ascii=False, indent=2), encoding="utf-8")
     return path
@@ -2437,15 +2439,17 @@ def _coerce_protocol_param_value(value: Any, item: Any) -> Any:
 
     default = item.default
     if _record_value_missing(value):
-        return None if default is None else default
+        if default is None:
+            return None
+        raise ValueError(f"Missing parameter value: {item.name}")
     if default is None:
         text = str(value).strip() if isinstance(value, str) else value
         if isinstance(text, str) and text.lower() in {"none", "null", "nan"}:
             return None
         try:
             return float(text)
-        except (TypeError, ValueError):
-            return text
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid optional numeric parameter: {item.name}={value!r}") from exc
     if isinstance(default, bool):
         return _parse_bool_param(value)
     if isinstance(default, int) and not isinstance(default, bool):
@@ -2461,7 +2465,7 @@ def _append_history(
     history: list[dict[str, Any]],
     motion_type: str,
     scope: TargetScope,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     adaptive_filter: str,
     params: ProtocolTrialParams,
     repeat_idx: int,
@@ -2473,11 +2477,12 @@ def _append_history(
     heldout_group_id: str = "",
 ) -> None:
     row = {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
         "fold_id": "" if fold_id is None else int(fold_id),
         "heldout_group_id": str(heldout_group_id),
         "motion_type": motion_type,
         "target_scope": scope.value,
-        "cascade_scheme": scheme.value,
+        "reference_order_key": scheme.reference_order_key,
         "adaptive_filter": adaptive_filter,
         "repeat_idx": int(repeat_idx),
         "trial_idx": int(trial_idx),
@@ -2547,7 +2552,7 @@ def _emit_trial_progress(
     cfg: ProtocolParams,
     motion_type: str,
     scope: TargetScope,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     adaptive_filter: str,
     objective_mode: str,
     objective_value: float,
@@ -2568,7 +2573,7 @@ def _emit_trial_progress(
             "mode_total": mode_total,
             "target_scope": scope.name,
             "target_scope_value": scope.value,
-            "cascade_scheme": scheme.value,
+            "reference_order_key": scheme.reference_order_key,
             "adaptive_filter": adaptive_filter,
             "objective_mode": objective_mode,
             "objective_value": float(objective_value),
@@ -2611,25 +2616,13 @@ def _write_motion_type_outputs(
     per_group.to_csv(motion_dir / "per_group_aae.csv", index=False, encoding="utf-8-sig")
     per_group.to_csv(motion_dir / "per_group_accuracy.csv", index=False, encoding="utf-8-sig")
 
-    for adaptive_filter in _VALID_FILTERS:
-        rows = [
-            _best_param_row(item)
-            for r in results
-            if r.adaptive_filter == adaptive_filter
-            for item in (r.fold_results if r.fold_results else [r])
-        ]
-        pd.DataFrame(rows, columns=_best_param_columns()).to_csv(
-            motion_dir / f"best_params_{adaptive_filter}.csv",
-            index=False,
-            encoding="utf-8-sig",
-        )
-
     if write_best_params_all:
         payload = {
             r.mode_key: {
+                "result_schema_version": RESULT_SCHEMA_VERSION,
                 "motion_type": motion_type,
                 "target_scope": r.target_scope.value,
-                "cascade_scheme": r.cascade_scheme.value,
+                "reference_order_key": r.reference_config.reference_order_key,
                 "adaptive_filter": r.adaptive_filter,
                 "objective_mode": r.objective_mode,
                 "data_split_mode": r.data_split_mode,
@@ -2649,7 +2642,7 @@ def _write_motion_type_outputs(
                 "train_metrics": r.train_metrics,
                 "val_metrics": r.val_metrics,
                 "test_metrics": r.test_metrics,
-                "acc3_compare_metrics": _acc3_compare_metrics_for(r),
+                "acc_compare_metrics": _acc_compare_metrics_for(r),
                 "fold_results": [
                     {
                         "fold_id": fold.fold_id,
@@ -2667,7 +2660,7 @@ def _write_motion_type_outputs(
                         "train_metrics": fold.train_metrics,
                         "val_metrics": fold.val_metrics,
                         "test_metrics": fold.test_metrics,
-                        "acc3_compare_metrics": _acc3_compare_metrics_for(fold),
+                        "acc_compare_metrics": _acc_compare_metrics_for(fold),
                         "success": fold.success,
                         "reason": fold.reason,
                         "trial_history": fold.history if fold.history else _load_history_rows_from_path(fold.history_path),
@@ -2731,11 +2724,7 @@ def _write_stage6_record_files(
     motion_type: str,
     results: list[_ModeOptimisation],
 ) -> None:
-    """Write compact deployment-oriented result records.
-
-    中文说明：这些文件是新 replay、诊断图和跨运动汇总的稳定读取入口；旧的
-    best_params_lms.csv / mode_summary_*.csv 暂时保留，避免破坏已有 Notebook。
-    """
+    """Write current-schema deployment result records."""
 
     records = [item for result in results for item in (result.fold_results if result.fold_results else [result])]
     pd.DataFrame(
@@ -2751,6 +2740,8 @@ def _write_stage6_record_files(
         columns=_motion_frequency_params_columns(),
     ).to_csv(motion_dir / "motion_frequency_and_params.csv", index=False, encoding="utf-8-sig")
     report = {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
+        "preset": core_preset_metadata(resolve_core_config()),
         "motion_type": motion_type,
         "config": {
             "result_files": [
@@ -2798,17 +2789,18 @@ def _best_params_alignment_record(result: _ModeOptimisation) -> dict[str, Any]:
     params = result.best_params
     metrics = result.test_metrics
     row = {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
         "motion_type": result.motion_type,
         "split": _result_split_name(result),
         "mode": result.data_split_mode,
         "target_scope": result.target_scope.value,
         "objective_mode": result.objective_mode,
-        "cascade_scheme": result.cascade_scheme.value,
+        "reference_order_key": result.reference_config.reference_order_key,
         "adaptive_filter": result.adaptive_filter,
-        "adaptive_data_type": result.cascade_scheme.value,
-        "adaptive_data_type_display": result.cascade_scheme.display_name,
-        "TW": float(params.TW),
-        "TW_F": float(getattr(params, "TW_F", 0.0)),
+        "adaptive_data_type": result.reference_config.reference_order_key,
+        "adaptive_data_type_display": result.reference_config.reference_order_key,
+        "hr_window_s": float(params.hr_window_s),
+        "prewarm_s": float(getattr(params, "prewarm_s", 0.0)),
         "Fs_Target": int(params.Fs_Target),
         "normalization_mode": str(getattr(params, "normalization_mode", "minmax")),
         "best_params_json": json.dumps(_jsonify(params.to_dict()), ensure_ascii=False, sort_keys=True),
@@ -2829,7 +2821,7 @@ def _best_params_alignment_record(result: _ModeOptimisation) -> dict[str, Any]:
         "adaptive_aae_bpm": metrics.get("adaptive_aae_bpm"),
         "adaptive_acc_pct": metrics.get("adaptive_acc_pct"),
     }
-    row.update(_acc3_compare_metrics_for(result))
+    row.update(_acc_compare_metrics_for(result))
     row.update(flatten_params_for_record(params))
     return row
 
@@ -2838,14 +2830,15 @@ def _best_metrics_record(result: _ModeOptimisation) -> dict[str, Any]:
     params = result.best_params
     metrics = result.test_metrics
     return {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
         "motion_type": result.motion_type,
         "split": _result_split_name(result),
         "mode": result.data_split_mode,
         "target_scope": result.target_scope.value,
         "filter_type": result.adaptive_filter,
-        "adaptive_data_type": result.cascade_scheme.value,
-        "TW": float(params.TW),
-        "TW_F": float(getattr(params, "TW_F", 0.0)),
+        "adaptive_data_type": result.reference_config.reference_order_key,
+        "hr_window_s": float(params.hr_window_s),
+        "prewarm_s": float(getattr(params, "prewarm_s", 0.0)),
         "baseline_aae_bpm": metrics.get("baseline_aae_bpm"),
         "adaptive_aae_bpm": metrics.get("adaptive_aae_bpm"),
         "final_aae_bpm": metrics.get("final_aae_bpm"),
@@ -2869,17 +2862,19 @@ def _best_metrics_record(result: _ModeOptimisation) -> dict[str, Any]:
 def _motion_frequency_params_record(result: _ModeOptimisation) -> dict[str, Any]:
     params = result.best_params
     row = {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
         "motion_type": result.motion_type,
         "split": _result_split_name(result),
         "mode": result.data_split_mode,
         "motion_frequency_hz": result.test_metrics.get("motion_frequency_hz", float("nan")),
         "penalty_ref_channel": result.test_metrics.get("penalty_ref_channel", ""),
-        "cascade_scheme": result.cascade_scheme.value,
+        "reference_order_key": result.reference_config.reference_order_key,
         "adaptive_filter": result.adaptive_filter,
-        "adaptive_data_type": result.cascade_scheme.value,
-        "TW": float(params.TW),
-        "TW_F": float(getattr(params, "TW_F", 0.0)),
-        "max_order": int(params.max_order),
+        "adaptive_data_type": result.reference_config.reference_order_key,
+        "hr_window_s": float(params.hr_window_s),
+        "prewarm_s": float(getattr(params, "prewarm_s", 0.0)),
+        "memory_ms": float(params.memory_ms),
+        "history_tap_limit": params.history_tap_limit,
         "M_base": int(params.M_base),
         "C_scale": float(params.C_scale),
         "K_max": int(params.K_max),
@@ -2893,8 +2888,9 @@ def _motion_frequency_params_record(result: _ModeOptimisation) -> dict[str, Any]
 
 def _best_params_alignment_columns() -> list[str]:
     return [
+        "result_schema_version",
         "motion_type", "split", "mode", "target_scope", "objective_mode",
-        "cascade_scheme", "adaptive_filter", "adaptive_data_type", "TW", "TW_F",
+        "reference_order_key", "adaptive_filter", "adaptive_data_type", "hr_window_s", "prewarm_s",
         "Fs_Target", "normalization_mode", "best_params_json", "best_tdelay_s",
         "time_bias_after_s", "alignment_score_mode", "pre_align_metric_json",
         "no_posthoc_final_aae_bpm", "no_posthoc_final_acc_pct",
@@ -2902,17 +2898,18 @@ def _best_params_alignment_columns() -> list[str]:
         "training_elapsed_s",
         "ud_calculation_mode", "ud_smoothing_window_s", "ud_smoothing_window_samples",
         "baseline_aae_bpm", "baseline_acc_pct", "adaptive_aae_bpm", "adaptive_acc_pct",
-        "acc3_compare_aae_bpm", "acc3_compare_accuracy_pct", "acc3_compare_num_windows",
+        "acc_compare_aae_bpm", "acc_compare_accuracy_pct", "acc_compare_num_windows",
         "acc_compare_posthoc_aae_bpm", "acc_compare_posthoc_accuracy_pct",
-        "acc3_compare_status", "acc3_compare_reason",
+        "acc_compare_status", "acc_compare_reason",
         *_param_record_columns(),
     ]
 
 
 def _best_metrics_columns() -> list[str]:
     return [
+        "result_schema_version",
         "motion_type", "split", "mode", "target_scope", "filter_type", "adaptive_data_type",
-        "TW", "TW_F", "baseline_aae_bpm", "adaptive_aae_bpm", "final_aae_bpm",
+        "hr_window_s", "prewarm_s", "baseline_aae_bpm", "adaptive_aae_bpm", "final_aae_bpm",
         "baseline_acc_pct", "adaptive_acc_pct", "final_acc_pct",
         "posthoc_baseline_aae_bpm", "posthoc_adaptive_aae_bpm", "posthoc_final_aae_bpm",
         "posthoc_baseline_acc_pct", "posthoc_adaptive_acc_pct", "posthoc_final_acc_pct",
@@ -2923,9 +2920,10 @@ def _best_metrics_columns() -> list[str]:
 
 def _motion_frequency_params_columns() -> list[str]:
     return [
+        "result_schema_version",
         "motion_type", "split", "mode", "motion_frequency_hz", "penalty_ref_channel",
-        "cascade_scheme", "adaptive_filter", "adaptive_data_type", "TW", "TW_F",
-        "max_order", "M_base", "C_scale", "K_max",
+        "reference_order_key", "adaptive_filter", "adaptive_data_type", "hr_window_s", "prewarm_s",
+        "memory_ms", "history_tap_limit", "M_base", "C_scale", "K_max",
         "Spec_Penalty_Width", "Spec_Penalty_Weight", "reference_channel_ranking_summary",
         *_param_record_columns(),
     ]
@@ -2956,7 +2954,7 @@ def _summary_row(result: _ModeOptimisation) -> dict[str, Any]:
     row = {
         "motion_type": result.motion_type,
         "target_scope": result.target_scope.value,
-        "cascade_scheme": result.cascade_scheme.value,
+        "reference_order_key": result.reference_config.reference_order_key,
         "adaptive_filter": result.adaptive_filter,
         "objective_mode": result.objective_mode,
         "data_split_mode": result.data_split_mode,
@@ -3011,31 +3009,21 @@ def _summary_row(result: _ModeOptimisation) -> dict[str, Any]:
     # 对多样本聚合若不存在唯一 bias，聚合函数会保留 NaN，避免伪装成全局泛化参数。
     for key, value in _posthoc_metrics_from(result.test_metrics).items():
         row[key] = value
-    row.update(_acc3_compare_metrics_for(result))
+    row.update(_acc_compare_metrics_for(result))
     return row
 
 
-def _acc3_compare_metrics_for(result: _ModeOptimisation) -> dict[str, Any]:
-    metrics = dict(getattr(result, "acc3_compare_metrics", {}) or {})
-    required = _empty_acc3_compare_fields()
+def _acc_compare_metrics_for(result: _ModeOptimisation) -> dict[str, Any]:
+    metrics = dict(getattr(result, "acc_compare_metrics", {}) or {})
+    required = _empty_acc_compare_fields()
     if metrics:
         required.update({key: metrics.get(key, required[key]) for key in required})
         return required
-    if result.cascade_scheme == CascadeScheme.ACC3:
-        return _acc3_compare_fields(result.test_metrics, status="same_as_original", reason="")
+    if result.reference_config == ReferenceConfig(('ACC',)):
+        return _acc_compare_fields(result.test_metrics, status="same_as_original", reason="")
     return required
 
 
-def _best_param_row(result: _ModeOptimisation) -> dict[str, Any]:
-    return {**_summary_row(result), **result.best_params.to_dict(), **flatten_params_for_record(result.best_params)}
-
-
-def _best_param_columns() -> list[str]:
-    """Return stable best-params CSV columns, including headers for empty files."""
-
-    summary_cols = _summary_columns()
-    param_cols = [item.name for item in fields(ProtocolTrialParams) if item.name not in summary_cols]
-    return [*summary_cols, *param_cols, *_param_record_columns()]
 
 
 def _param_record_columns() -> list[str]:
@@ -3054,7 +3042,7 @@ def _summary_columns() -> list[str]:
     return [
         "motion_type",
         "target_scope",
-        "cascade_scheme",
+        "reference_order_key",
         "adaptive_filter",
         "objective_mode",
         "data_split_mode",
@@ -3156,13 +3144,13 @@ def _summary_columns() -> list[str]:
         "test_posthoc_baseline_aae_bpm",
         "test_posthoc_baseline_acc_pct",
         "test_posthoc_n_valid_windows",
-        "acc3_compare_aae_bpm",
-        "acc3_compare_accuracy_pct",
+        "acc_compare_aae_bpm",
+        "acc_compare_accuracy_pct",
         "acc_compare_posthoc_aae_bpm",
         "acc_compare_posthoc_accuracy_pct",
-        "acc3_compare_num_windows",
-        "acc3_compare_status",
-        "acc3_compare_reason",
+        "acc_compare_num_windows",
+        "acc_compare_status",
+        "acc_compare_reason",
     ]
 
 
@@ -3186,7 +3174,7 @@ def _plot_bayes_curves(
     for ax, result in zip(flat, results, strict=False):
         hist = result.history if result.history else _load_history_rows_from_path(result.history_path)
         ax.grid(True, alpha=0.25)
-        ax.set_title(f"{result.target_scope.value} / {result.cascade_scheme.value} / {result.adaptive_filter}")
+        ax.set_title(f"{result.target_scope.value} / {result.reference_config.reference_order_key} / {result.adaptive_filter}")
         ax.set_xlabel("trial index")
         ax.set_ylabel("objective value")
         if not hist:
@@ -3223,7 +3211,7 @@ def _write_final_summary(
     header = [
         "motion_type",
         "target_scope",
-        "cascade_scheme",
+        "reference_order_key",
         "adaptive_filter",
         "result_level",
         "aggregation",
@@ -3279,7 +3267,7 @@ def _write_final_summary(
                             {
                                 "motion_type": motion_type,
                                 "target_scope": scope.value,
-                                "cascade_scheme": result.cascade_scheme.value,
+                                "reference_order_key": result.reference_config.reference_order_key,
                                 "adaptive_filter": result.adaptive_filter,
                                 "result_level": result.result_level,
                                 "aggregation": result.aggregation,
@@ -3316,7 +3304,7 @@ def redraw_best_param_hr_curves(
     sensor_csv_path: str | Path,
     ref_csv_path: str | Path,
     target_scope: str,
-    cascade_scheme: str,
+    reference_config: str,
     adaptive_filter: str,
     best_param_csv_path: str | Path,
     output_dir: str | Path,
@@ -3339,7 +3327,7 @@ def redraw_best_param_hr_curves(
     """
 
     scope = TargetScope(target_scope)
-    scheme = CascadeScheme(cascade_scheme)
+    scheme = ReferenceConfig.from_key(reference_config)
     adaptive_filter = str(adaptive_filter)
     best_row = _best_param_row_from_csv(
         best_param_csv_path,
@@ -3374,9 +3362,9 @@ def redraw_best_param_hr_curves(
     out.mkdir(parents=True, exist_ok=True)
     plt = _prepare_matplotlib(out)
     group_id = Path(sensor_csv_path).stem.removeprefix("multi_")
-    train_path = out / f"manual_training_hr_{group_id}_{scope.value}_{scheme.value}_{adaptive_filter}.png"
-    global_path = out / f"manual_global_hr_{group_id}_{scope.value}_{scheme.value}_{adaptive_filter}.png"
-    global_csv_path = out / f"manual_global_hr_{group_id}_{scope.value}_{scheme.value}_{adaptive_filter}.csv"
+    train_path = out / f"manual_training_hr_{group_id}_{scope.value}_{scheme.reference_order_key}_{adaptive_filter}.png"
+    global_path = out / f"manual_global_hr_{group_id}_{scope.value}_{scheme.reference_order_key}_{adaptive_filter}.png"
+    global_csv_path = out / f"manual_global_hr_{group_id}_{scope.value}_{scheme.reference_order_key}_{adaptive_filter}.csv"
 
     frame = run.frame.copy()
     train_frame = frame.loc[frame["is_filtered_segment"].astype(bool)].copy()
@@ -3384,7 +3372,7 @@ def redraw_best_param_hr_curves(
         plt,
         train_frame,
         train_path,
-        title=f"{group_id} training-scope HR ({scope.value} / {scheme.value} / {adaptive_filter})",
+        title=f"{group_id} training-scope HR ({scope.value} / {scheme.reference_order_key} / {adaptive_filter})",
         adaptive_label=(
             f"adaptive HR AAE={run.adaptive_aae_bpm:.2f} bpm, "
             f"accuracy={run.adaptive_acc_pct:.1f}%"
@@ -3398,6 +3386,7 @@ def redraw_best_param_hr_curves(
         frame,
         combined,
         params,
+        current_run=run,
         enable_time_bias_after=enable_time_bias_after,
         time_bias_after_range_s=time_bias_after_range_s,
         time_bias_after_step_s=time_bias_after_step_s,
@@ -3431,7 +3420,7 @@ def redraw_best_param_hr_curves(
         global_frame,
         global_path,
         title=(
-            f"{group_id} global HR ({scope.value} / {scheme.value} / {adaptive_filter}) | "
+            f"{group_id} global HR ({scope.value} / {scheme.reference_order_key} / {adaptive_filter}) | "
             f"Tdelay={tdelay:.2f}s, time_bias_after={float(bias):.2f}s, "
             f"posthoc AAE={posthoc_aae:.2f} bpm, hit-rate={posthoc_acc:.1f}%"
         ),
@@ -3445,10 +3434,10 @@ def redraw_subject_target_hr_curves(
     subject_dir: str | Path,
     results_root: str | Path,
     target_scope: str = "motion_post10",
-    cascade_scheme: str = "ACC",
+    reference_config: str = "ACC",
     adaptive_filter: str = "lms",
     data_split_mode: str = "all_train",
-    TW_F: float | None = None,
+    prewarm_s: float | None = None,
     output_dir: str | Path | None = None,
     fs_origin: int = 100,
     ud_calculation_mode: str = "smoothed",
@@ -3474,19 +3463,19 @@ def redraw_subject_target_hr_curves(
         raise ValueError(f"No complete sensor/HR pairs found under {subject_path}")
 
     scope = TargetScope(target_scope)
-    scheme = CascadeScheme(cascade_scheme)
+    scheme = ReferenceConfig.from_key(reference_config)
     filter_name = str(adaptive_filter)
     motion_rank = {item.value: idx for idx, item in enumerate(MotionType)}
     pairs = sorted(
         discovery.pairs,
         key=lambda item: (motion_rank.get(item.motion_type, len(motion_rank)), int(item.motion_index)),
     )
-    tw_label = "auto" if TW_F is None else _tw_f_run_label(float(TW_F))
+    tw_label = "auto" if prewarm_s is None else _prewarm_run_label(float(prewarm_s))
     ud_mode, ud_window_samples = _validate_ud_calculation_config(
         ud_calculation_mode, ud_smoothing_window_s, int(fs_origin)
     )
     ud_label = f"UD_{ud_mode}_{_compact_float_label(float(ud_smoothing_window_s))}s"
-    mode_signature = f"{scope.value}__{scheme.value}__{filter_name}__{data_split_mode}__{tw_label}__{ud_label}"
+    mode_signature = f"{scope.value}__{scheme.reference_order_key}__{filter_name}__{data_split_mode}__{tw_label}__{ud_label}"
     output_base = (
         Path(output_dir).resolve()
         if output_dir is not None
@@ -3504,10 +3493,10 @@ def redraw_subject_target_hr_curves(
             "motion_type": pair.motion_type,
             "motion_index": int(pair.motion_index),
             "target_scope": scope.value,
-            "cascade_scheme": scheme.value,
+            "reference_order_key": scheme.reference_order_key,
             "adaptive_filter": filter_name,
             "data_split_mode": data_split_mode,
-            "TW_F": TW_F,
+            "prewarm_s": prewarm_s,
             "ud_calculation_mode": ud_mode,
             "ud_smoothing_window_s": float(ud_smoothing_window_s),
             "ud_smoothing_window_samples": int(ud_window_samples),
@@ -3532,14 +3521,14 @@ def redraw_subject_target_hr_curves(
                     motion_type=pair.motion_type,
                     data_split_mode=data_split_mode,
                     target_scope=scope.value,
-                    cascade_scheme=scheme.value,
+                    reference_config=scheme.reference_order_key,
                     adaptive_filter=filter_name,
-                    TW_F=TW_F,
+                    prewarm_s=prewarm_s,
                 )
                 params = _params_from_stage6_record(
                     best_row,
                     adaptive_filter=filter_name,
-                    TW_F=TW_F,
+                    prewarm_s=prewarm_s,
                 )
                 if postprocess_method_override:
                     params = replace(params, postprocess_method=str(postprocess_method_override))
@@ -3575,7 +3564,7 @@ def redraw_subject_target_hr_curves(
                 plot_path,
                 detail,
                 title=(
-                    f"{pair.sample_id} | {scope.value} / {scheme.display_name} / {filter_name} | "
+                    f"{pair.sample_id} | {scope.value} / {scheme.reference_order_key} / {filter_name} | "
                     f"post-hoc AAE={metrics['aae']:.2f} bpm, accuracy={metrics['accuracy']:.1f}%"
                 ),
             )
@@ -3610,9 +3599,9 @@ def _select_subject_batch_best_record(
     motion_type: str,
     data_split_mode: str,
     target_scope: str,
-    cascade_scheme: str,
+    reference_config: str,
     adaptive_filter: str,
-    TW_F: float | None,
+    prewarm_s: float | None,
 ) -> pd.Series:
     """Select exactly one Stage-6 row; batch replay never falls back silently."""
 
@@ -3621,22 +3610,22 @@ def _select_subject_batch_best_record(
         "motion_type": motion_type,
         "mode": data_split_mode,
         "target_scope": target_scope,
-        "cascade_scheme": cascade_scheme,
+        "reference_order_key": reference_config,
         "adaptive_filter": adaptive_filter,
     }
     for column, expected in selectors.items():
         if column not in candidates.columns:
             raise ValueError(f"Stage-6 best params missing selector column: {column}")
         candidates = candidates[candidates[column].astype(str) == str(expected)]
-    if TW_F is not None:
-        if "TW_F" not in candidates.columns:
-            raise ValueError("Stage-6 best params missing selector column: TW_F")
-        values = pd.to_numeric(candidates["TW_F"], errors="coerce")
-        candidates = candidates[np.isclose(values, float(TW_F), equal_nan=False)]
+    if prewarm_s is not None:
+        if "prewarm_s" not in candidates.columns:
+            raise ValueError("Stage-6 best params missing selector column: prewarm_s")
+        values = pd.to_numeric(candidates["prewarm_s"], errors="coerce")
+        candidates = candidates[np.isclose(values, float(prewarm_s), equal_nan=False)]
     if len(candidates) != 1:
         raise ValueError(
             "Expected exactly one Stage-6 best-param row for "
-            f"{motion_type}/{target_scope}/{cascade_scheme}/{adaptive_filter}/{data_split_mode}, "
+            f"{motion_type}/{target_scope}/{reference_config}/{adaptive_filter}/{data_split_mode}, "
             f"found {len(candidates)}"
         )
     return candidates.iloc[0]
@@ -3667,7 +3656,7 @@ def _build_subject_target_replay_frame(
     target = frame["is_filtered_segment"].astype(bool).to_numpy()
     final = frame["final_hr_bpm"].to_numpy(dtype=float)
     valid = target & np.isfinite(reference) & np.isfinite(final)
-    baseline = frame.get("baseline_hr_bpm", frame.get("baseline_ppg_hr_bpm", np.nan))
+    baseline = frame["baseline_hr_bpm"]
     detail = pd.DataFrame(
         {
             "time_s": time_s,
@@ -3711,8 +3700,8 @@ def _plot_subject_target_hr_curve(out_path: Path, frame: pd.DataFrame, *, title:
 def run_batch_reference_compare(
     *,
     motion_type: str,
-    best_param_source_cascade_scheme: str,
-    actual_reference_cascade_scheme: str,
+    best_param_source_reference_config: str,
+    actual_reference_reference_config: str,
     target_scope: str,
     adaptive_filter: str,
     best_param_csv_path: str | Path,
@@ -3729,8 +3718,8 @@ def run_batch_reference_compare(
     """
 
     scope = TargetScope(target_scope)
-    source_scheme = CascadeScheme(best_param_source_cascade_scheme)
-    actual_scheme = CascadeScheme(actual_reference_cascade_scheme)
+    source_scheme = ReferenceConfig.from_key(best_param_source_reference_config)
+    actual_scheme = ReferenceConfig.from_key(actual_reference_reference_config)
     adaptive_filter = str(adaptive_filter)
     best_path = Path(best_param_csv_path)
     params = _params_from_best_csv(
@@ -3784,8 +3773,8 @@ def run_batch_reference_compare(
                     "group_id": group_id,
                     "target_scope": scope.value,
                     "adaptive_filter": adaptive_filter,
-                    "source_cascade_scheme": source_scheme.value,
-                    "actual_reference_cascade_scheme": actual_scheme.value,
+                    "source_reference_config": source_scheme.reference_order_key,
+                    "actual_reference_reference_config": actual_scheme.reference_order_key,
                     **_batch_compare_run_fields("source", source_run),
                     **_batch_compare_run_fields("actual", actual_run),
                 }
@@ -3797,8 +3786,8 @@ def run_batch_reference_compare(
                     "group_id": group_id,
                     "target_scope": scope.value,
                     "adaptive_filter": adaptive_filter,
-                    "source_cascade_scheme": source_scheme.value,
-                    "actual_reference_cascade_scheme": actual_scheme.value,
+                    "source_reference_config": source_scheme.reference_order_key,
+                    "actual_reference_reference_config": actual_scheme.reference_order_key,
                     **_empty_batch_compare_run_fields("source", str(exc)),
                     **_empty_batch_compare_run_fields("actual", str(exc)),
                 }
@@ -3846,8 +3835,8 @@ def _batch_reference_compare_columns() -> list[str]:
         "group_id",
         "target_scope",
         "adaptive_filter",
-        "source_cascade_scheme",
-        "actual_reference_cascade_scheme",
+        "source_reference_config",
+        "actual_reference_reference_config",
         "source_success",
         "source_reason",
         "source_final_aae_bpm",
@@ -3872,67 +3861,22 @@ def _time_bias_after_for_redraw(
     combined_hr_bpm: np.ndarray,
     params: ProtocolTrialParams,
     *,
+    current_run: ProtocolRunResult,
     enable_time_bias_after: bool | None,
     time_bias_after_range_s: tuple[float, float] | None,
     time_bias_after_step_s: float | None,
     time_bias_after_mode: str | None,
 ) -> tuple[float, str, str]:
-    """Return the post-hoc bias used by manual redraw.
-
-    中文说明：手动重画优先复用 best_params CSV 中已保存的
-    ``time_bias_after_s``。若旧 CSV 没有该列且启用了后对齐，才在本次重画中
-    对已经生成的 HR 曲线重新做 post-hoc 搜索，并标记来源为
-    ``computed_during_redraw``。
-    """
-
-    mode = str(time_bias_after_mode or getattr(params, "Time_Bias_After_Mode", "posthoc_oracle_alignment"))
-    if "time_bias_after_s" in best_row and pd.notna(best_row["time_bias_after_s"]):
-        try:
-            value = float(best_row["time_bias_after_s"])
-            if np.isfinite(value):
-                saved_mode = str(best_row.get("time_bias_after_mode", mode) or mode)
-                return value, "saved_best_params", saved_mode
-        except (TypeError, ValueError):
-            pass
-
-    enabled = bool(getattr(params, "Enable_Time_Bias_After", True)) if enable_time_bias_after is None else bool(
-        enable_time_bias_after
-    )
-    if not enabled:
-        return 0.0, "disabled", mode
-
-    search_range = (
-        tuple(float(x) for x in time_bias_after_range_s)
-        if time_bias_after_range_s is not None
-        else tuple(float(x) for x in getattr(params, "Time_Bias_After_Range_S", (-5.0, 5.0)))
-    )
-    if len(search_range) != 2:
-        raise ValueError("time_bias_after_range_s must contain exactly two values")
-    search_step = (
-        float(time_bias_after_step_s)
-        if time_bias_after_step_s is not None
-        else float(getattr(params, "Time_Bias_After_Step_S", 1.0))
-    )
-    mask = frame["is_filtered_segment"].astype(bool).to_numpy() if "is_filtered_segment" in frame else np.ones(
-        len(frame),
-        dtype=bool,
-    )
-    adaptive = (
-        frame["adaptive_hr_bpm"].to_numpy(dtype=float)
-        if "adaptive_hr_bpm" in frame
-        else np.asarray(combined_hr_bpm, dtype=float)
-    )
-    result = search_time_bias_after(
-        frame["time_s"].to_numpy(dtype=float)[mask],
-        adaptive[mask],
-        np.asarray(dataset.ref_time_s, dtype=float),
-        np.asarray(dataset.ref_hr_bpm, dtype=float),
-        search_range_s=(float(search_range[0]), float(search_range[1])),
-        search_step_s=search_step,
-        min_valid=2,
-        mode=mode,
-    )
-    return float(result.time_bias_after_s), "computed_during_redraw", str(result.mode)
+    """Reuse saved scalar bias, or the current sample bias for aggregate records."""
+    value = float(best_row["time_bias_after_s"])
+    if np.isnan(value) and current_run.time_bias_after is not None:
+        sample_bias = float(current_run.time_bias_after.time_bias_after_s)
+        if np.isfinite(sample_bias):
+            return sample_bias, "current_run", str(current_run.time_bias_after.mode)
+    if not np.isfinite(value):
+        raise ValueError("Invalid saved time_bias_after_s and no finite current sample bias")
+    mode = str(time_bias_after_mode or params.Time_Bias_After_Mode)
+    return value, "saved_best_params", mode
 
 
 def _write_manual_global_hr_csv(frame: pd.DataFrame, path: Path) -> None:
@@ -3978,7 +3922,7 @@ def _plot_manual_global_hr_frame(
 def _params_from_best_csv(
     best_param_csv_path: str | Path,
     scope: TargetScope,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     adaptive_filter: str,
     *,
     fold_id: int | None = None,
@@ -4011,7 +3955,7 @@ def _parse_bool_param(value: Any) -> bool:
 def _best_param_row_from_csv(
     best_param_csv_path: str | Path,
     scope: TargetScope,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     adaptive_filter: str,
     *,
     fold_id: int | None = None,
@@ -4020,10 +3964,11 @@ def _best_param_row_from_csv(
     """Select the best-params row used by manual redraw and params decoding."""
 
     df = pd.read_csv(best_param_csv_path)
+    _require_result_table_schema(df, str(best_param_csv_path))
     mask = pd.Series(True, index=df.index)
     for column, value in (
         ("target_scope", scope.value),
-        ("cascade_scheme", scheme.value),
+        ("reference_order_key", scheme.reference_order_key),
         ("adaptive_filter", adaptive_filter),
     ):
         if column in df.columns:
@@ -4035,28 +3980,17 @@ def _best_param_row_from_csv(
     if mask.any():
         candidates = df.loc[mask].copy()
         row = _select_best_param_row_for_redraw(candidates, fold_id, heldout_group_id)
-    elif not df.empty:
-        row = df.iloc[0]
     else:
         raise ValueError(f"best param CSV is empty: {best_param_csv_path}")
     return row
 
 
 def _parse_tuple_param(value: Any, default: tuple[Any, ...]) -> tuple[Any, ...]:
-    """从 best_params CSV 中恢复 tuple 参数，保证手动重画复用同一套配置。
-
-    CSV 会把 ``(40.0, 180.0)`` 这类参数写成字符串；这里用安全的
-    ``ast.literal_eval`` 解析，解析失败时回退到默认值，避免旧 CSV 或手工编辑
-    的文件破坏后续 Tdelay 缓存 key。
-    """
-
-    try:
-        parsed = ast.literal_eval(value) if isinstance(value, str) else value
-        if not isinstance(parsed, (list, tuple)):
-            return default
-        return tuple(type(default[idx])(item) if idx < len(default) else item for idx, item in enumerate(parsed))
-    except (SyntaxError, ValueError, TypeError):
-        return default
+    """Restore a tuple parameter from its current CSV JSON representation."""
+    parsed = ast.literal_eval(value) if isinstance(value, str) else value
+    if not isinstance(parsed, (list, tuple)) or len(parsed) != len(default):
+        raise ValueError(f"Invalid tuple parameter: {value!r}")
+    return tuple(type(default[idx])(item) for idx, item in enumerate(parsed))
 
 
 def _select_best_param_row_for_redraw(
@@ -4102,7 +4036,7 @@ def _global_combined_hr(
         return frame["adaptive_hr_bpm"].to_numpy(dtype=float)
     ds = base.aligned.dataset
     fs = int(ds.fs)
-    win_len = int(round(float(params.TW) * fs))
+    win_len = int(round(float(params.hr_window_s) * fs))
     fft_hr: list[float] = []
     for idx in frame["window_idx"].to_numpy(dtype=int):
         if idx >= len(base.aligned.window_starts_s):
@@ -4266,9 +4200,9 @@ def build_cross_motion_summary_table(
     results_root: str | Path,
     adaptive_filter: str,
     adaptive_data_type: str = "",
-    cascade_scheme: str | None = None,
+    reference_config: str | None = None,
     target_scope: str = "motion_only",
-    TW_F: float | None = None,
+    prewarm_s: float | None = None,
 ) -> Path:
     """Aggregate Stage-6 result records across all motion types.
 
@@ -4278,7 +4212,7 @@ def build_cross_motion_summary_table(
 
     output_dir = Path(table_output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    data_type = adaptive_data_type or str(cascade_scheme or "")
+    data_type = adaptive_data_type or str(reference_config or "")
     rows: list[dict[str, Any]] = []
     for motion_dir in _scan_stage6_motion_dirs(Path(results_root)):
         metrics_path = motion_dir / "best_metrics.csv"
@@ -4287,30 +4221,33 @@ def build_cross_motion_summary_table(
         if not (metrics_path.exists() and params_path.exists() and freq_path.exists()):
             continue
         metrics_df = pd.read_csv(metrics_path)
+        _require_result_table_schema(metrics_df, str(metrics_path))
         params_df = pd.read_csv(params_path)
+        _require_result_table_schema(params_df, str(params_path))
         freq_df = pd.read_csv(freq_path)
+        _require_result_table_schema(freq_df, str(freq_path))
         selected_metrics = _filter_cross_motion_records(
             metrics_df,
             adaptive_filter=adaptive_filter,
             adaptive_data_type=data_type,
-            cascade_scheme=cascade_scheme,
+            reference_config=reference_config,
             target_scope=target_scope,
-            TW_F=TW_F,
+            prewarm_s=prewarm_s,
             filter_column="filter_type",
         )
         fusion_distribution = _read_fusion_distribution(motion_dir / "full_report.json")
         for _, metric_row in selected_metrics.iterrows():
             motion_type = _row_value(metric_row, "motion_type", motion_dir.name)
-            params_row = _first_matching_summary_row(params_df, metric_row, adaptive_filter, data_type, cascade_scheme, TW_F)
-            freq_row = _first_matching_summary_row(freq_df, metric_row, adaptive_filter, data_type, cascade_scheme, TW_F)
+            params_row = _first_matching_summary_row(params_df, metric_row, adaptive_filter, data_type, reference_config, prewarm_s)
+            freq_row = _first_matching_summary_row(freq_df, metric_row, adaptive_filter, data_type, reference_config, prewarm_s)
             rows.append(
                 {
                     "motion_type": motion_type,
                     "target_scope": _row_value(metric_row, "target_scope", target_scope),
                     "split": _row_value(metric_row, "split", _row_value(params_row, "split", "")),
                     "mode": _row_value(metric_row, "mode", _row_value(params_row, "mode", "")),
-                    "TW": _row_float(metric_row, "TW", _row_float(params_row, "TW")),
-                    "TW_F": _row_float(metric_row, "TW_F", _row_float(params_row, "TW_F")),
+                    "hr_window_s": _row_float(metric_row, "hr_window_s", _row_float(params_row, "hr_window_s")),
+                    "prewarm_s": _row_float(metric_row, "prewarm_s", _row_float(params_row, "prewarm_s")),
                     "baseline_aae": _row_float(metric_row, "baseline_aae_bpm"),
                     "adaptive_aae": _row_float(metric_row, "adaptive_aae_bpm"),
                     "final_aae": _row_float(metric_row, "final_aae_bpm"),
@@ -4329,7 +4266,7 @@ def build_cross_motion_summary_table(
                     "penalty_ref_channel": _row_value(freq_row, "penalty_ref_channel", ""),
                     "adaptive_filter": adaptive_filter,
                     "adaptive_data_type": data_type,
-                    "cascade_scheme": str(cascade_scheme or _row_value(params_row, "cascade_scheme", data_type)),
+                    "reference_order_key": str(reference_config or _row_value(params_row, "reference_order_key", data_type)),
                     "final_source_distribution": fusion_distribution,
                 }
             )
@@ -4342,7 +4279,7 @@ def build_cross_motion_summary_table(
             .drop(columns="_motion_rank")
             .reset_index(drop=True)
         )
-    out_path = output_dir / f"summary_{adaptive_filter}_{data_type}_{_tw_f_run_label(float(TW_F or 0.0))}.csv"
+    out_path = output_dir / f"summary_{adaptive_filter}_{data_type}_{_prewarm_run_label(float(prewarm_s or 0.0))}.csv"
     summary.to_csv(out_path, index=False, encoding="utf-8-sig")
     return out_path
 
@@ -4366,9 +4303,9 @@ def _filter_cross_motion_records(
     *,
     adaptive_filter: str,
     adaptive_data_type: str,
-    cascade_scheme: str | None,
+    reference_config: str | None,
     target_scope: str,
-    TW_F: float | None,
+    prewarm_s: float | None,
     filter_column: str,
 ) -> pd.DataFrame:
     """Filter one Stage-6 table by the summary selectors that are present."""
@@ -4379,7 +4316,7 @@ def _filter_cross_motion_records(
         (filter_column, adaptive_filter),
         ("adaptive_filter", adaptive_filter),
         ("adaptive_data_type", adaptive_data_type),
-        ("cascade_scheme", str(cascade_scheme or "")),
+        ("reference_order_key", str(reference_config or "")),
     ]
     for column, expected in selectors:
         if not expected or column not in selected.columns:
@@ -4387,9 +4324,9 @@ def _filter_cross_motion_records(
         narrowed = selected[selected[column].astype(str) == str(expected)]
         if not narrowed.empty:
             selected = narrowed
-    if TW_F is not None and "TW_F" in selected.columns:
-        values = pd.to_numeric(selected["TW_F"], errors="coerce")
-        narrowed = selected[np.isclose(values.astype(float), float(TW_F), equal_nan=False)]
+    if prewarm_s is not None and "prewarm_s" in selected.columns:
+        values = pd.to_numeric(selected["prewarm_s"], errors="coerce")
+        narrowed = selected[np.isclose(values.astype(float), float(prewarm_s), equal_nan=False)]
         if not narrowed.empty:
             selected = narrowed
     return selected
@@ -4400,8 +4337,8 @@ def _first_matching_summary_row(
     metric_row: pd.Series,
     adaptive_filter: str,
     adaptive_data_type: str,
-    cascade_scheme: str | None,
-    TW_F: float | None,
+    reference_config: str | None,
+    prewarm_s: float | None,
 ) -> pd.Series:
     """Pick metadata row matching one metrics row; return an empty row if absent."""
 
@@ -4418,9 +4355,9 @@ def _first_matching_summary_row(
         selected,
         adaptive_filter=adaptive_filter,
         adaptive_data_type=adaptive_data_type,
-        cascade_scheme=cascade_scheme,
+        reference_config=reference_config,
         target_scope=_row_value(metric_row, "target_scope", "motion_only"),
-        TW_F=TW_F,
+        prewarm_s=prewarm_s,
         filter_column="filter_type",
     )
     return selected.iloc[0] if not selected.empty else pd.Series(dtype=object)
@@ -4435,6 +4372,7 @@ def _read_fusion_distribution(report_path: Path) -> str:
         payload = json.loads(report_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return "{}"
+    _require_result_schema(payload, str(report_path))
     distribution = payload.get("fusion_source_distribution", {})
     if not isinstance(distribution, dict):
         distribution = {}
@@ -4458,37 +4396,6 @@ def _row_float(row: pd.Series, column: str, default: float = float("nan")) -> fl
         return float(default)
 
 
-def _with_cascade_guard_policy(params: ProtocolTrialParams, policy: str) -> ProtocolTrialParams:
-    """Return a params copy with only the cascade guard policy changed."""
-
-    policy_text = str(policy)
-    if policy_text not in {"none", "rms_guard"}:
-        raise ValueError("cascade_guard_policy must be 'none' or 'rms_guard'")
-    return replace(params, cascade_guard_policy=policy_text)
-
-
-def _apply_guard_overrides(
-    params: ProtocolTrialParams,
-    *,
-    guard_ratio_min_override: float | None = None,
-    guard_ratio_max_override: float | None = None,
-    guard_flat_std_eps_override: float | None = None,
-    guard_use_finite_zscore_override: bool | None = None,
-) -> ProtocolTrialParams:
-    """Return a params copy with only explicit guard threshold overrides applied."""
-
-    updates: dict[str, Any] = {}
-    if guard_ratio_min_override is not None:
-        updates["cascade_guard_ratio_min"] = float(guard_ratio_min_override)
-    if guard_ratio_max_override is not None:
-        updates["cascade_guard_ratio_max"] = float(guard_ratio_max_override)
-    if guard_flat_std_eps_override is not None:
-        updates["cascade_guard_flat_std_eps"] = float(guard_flat_std_eps_override)
-    if guard_use_finite_zscore_override is not None:
-        updates["cascade_guard_use_finite_zscore"] = bool(guard_use_finite_zscore_override)
-    return replace(params, **updates) if updates else params
-
-
 def plot_window_diagnostics_from_records(
     *,
     signal_csv: str | Path,
@@ -4496,11 +4403,11 @@ def plot_window_diagnostics_from_records(
     output_dir: str | Path,
     adaptive_filter: str,
     adaptive_data_type: str = "",
-    cascade_scheme: str | None = None,
-    override_cascade_scheme: str | None = None,
+    reference_config: str | None = None,
+    override_reference_config: str | None = None,
     results_root: str | Path,
-    aligned_fft_start_s: float,
-    TW_F: float | None = None,
+    window_start_s: float,
+    prewarm_s: float | None = None,
     motion_type: str,
     split: str = "",
     mode: str = "",
@@ -4508,16 +4415,12 @@ def plot_window_diagnostics_from_records(
     fs_origin: int = 100,
     ud_calculation_mode: str = "smoothed",
     ud_smoothing_window_s: float = 0.1,
-    guard_ratio_min_override: float | None = None,
-    guard_ratio_max_override: float | None = None,
-    guard_flat_std_eps_override: float | None = None,
-    guard_use_finite_zscore_override: bool | None = None,
     postprocess_method_override: str | None = None,
 ) -> dict[str, Any]:
-    """Draw waveform and spectrum diagnostics for one aligned FFT sub-window.
+    """Draw waveform and spectrum diagnostics for one sensor-domain FFT sub-window.
 
-    中文说明：``aligned_fft_start_s`` 始终表示对齐后的 FFT 子窗起点；诊断图会同时
-    标出 ``TW_F`` 前置收敛上下文和最终 FFT/HR 提取区间。函数只读取 Stage-6 记录
+    中文说明：``window_start_s`` 始终表示传感器时间域的 FFT 子窗起点；诊断图会同时
+    标出 ``prewarm_s`` 前置收敛上下文和最终 FFT/HR 提取区间。函数只读取 Stage-6 记录
     恢复参数，不重新训练，也不读取 ref HR 来决定 final 融合。
     """
 
@@ -4533,15 +4436,15 @@ def plot_window_diagnostics_from_records(
         target_scope=TargetScope(target_scope).value,
         adaptive_filter=adaptive_filter,
         adaptive_data_type=adaptive_data_type,
-        cascade_scheme=cascade_scheme,
-        TW_F=TW_F,
+        reference_config=reference_config,
+        prewarm_s=prewarm_s,
     )
-    params = _params_from_stage6_record(best_row, adaptive_filter=adaptive_filter, TW_F=TW_F)
+    params = _params_from_stage6_record(best_row, adaptive_filter=adaptive_filter, prewarm_s=prewarm_s)
     if postprocess_method_override:
         params = replace(params, postprocess_method=str(postprocess_method_override))
-    scheme_text = str(cascade_scheme or _stage6_row_text(best_row, "cascade_scheme") or adaptive_data_type)
-    scheme_to_run = override_cascade_scheme if override_cascade_scheme else scheme_text
-    scheme = CascadeScheme(scheme_to_run)
+    scheme_text = str(reference_config or _stage6_row_text(best_row, "reference_order_key") or adaptive_data_type)
+    scheme_to_run = override_reference_config if override_reference_config else scheme_text
+    scheme = ReferenceConfig.from_key(scheme_to_run)
     scope = TargetScope(target_scope)
     dataset = load_and_preprocess_protocol(
         signal_csv,
@@ -4552,86 +4455,40 @@ def plot_window_diagnostics_from_records(
     )
     dataset = resample_protocol_dataset(dataset, fs_target=int(params.Fs_Target))
     label_data_type = adaptive_data_type or scheme_text
-    if override_cascade_scheme:
-        title_prefix = f"Params: {scheme_text} -> Run: {override_cascade_scheme}"
+    if override_reference_config:
+        title_prefix = f"Params: {scheme_text} -> Run: {override_reference_config}"
         label = (
-            f"cross_{label_data_type}_to_{override_cascade_scheme}_{motion_type}_"
-            f"{params.adaptive_filter}_{_tw_f_run_label(params.TW_F)}_{scope.value}_start{_compact_float_label(aligned_fft_start_s)}s"
+            f"cross_{label_data_type}_to_{override_reference_config}_{motion_type}_"
+            f"{params.adaptive_filter}_{_prewarm_run_label(params.prewarm_s)}_{scope.value}_start{_compact_float_label(window_start_s)}s"
         )
     else:
-        title_prefix = scheme.value
+        title_prefix = scheme.reference_order_key
         label = (
             f"{motion_type}_{params.adaptive_filter}_{label_data_type}_"
-            f"{_tw_f_run_label(params.TW_F)}_{scope.value}_start{_compact_float_label(aligned_fft_start_s)}s"
+            f"{_prewarm_run_label(params.prewarm_s)}_{scope.value}_start{_compact_float_label(window_start_s)}s"
         )
 
-    variants = {
-        "full_cascade": _run_window_diagnostic_variant(
-            dataset=dataset,
-            scheme=scheme,
-            scope=scope,
-            params=_with_cascade_guard_policy(params, "none"),
-            output_dir=out_dir,
-            label=label,
-            variant_name="full_cascade",
-            output_mode="full_cascade",
-            motion_type=motion_type,
-            title_prefix=title_prefix,
-            aligned_fft_start_s=aligned_fft_start_s,
-        ),
-        "guarded": _run_window_diagnostic_variant(
-            dataset=dataset,
-            scheme=scheme,
-            scope=scope,
-            params=_apply_guard_overrides(
-                _with_cascade_guard_policy(params, "rms_guard"),
-                guard_ratio_min_override=guard_ratio_min_override,
-                guard_ratio_max_override=guard_ratio_max_override,
-                guard_flat_std_eps_override=guard_flat_std_eps_override,
-                guard_use_finite_zscore_override=guard_use_finite_zscore_override,
-            ),
-            output_dir=out_dir,
-            label=label,
-            variant_name="guarded",
-            output_mode="guarded",
-            motion_type=motion_type,
-            title_prefix=title_prefix,
-            aligned_fft_start_s=aligned_fft_start_s,
-        ),
-    }
-    guarded = variants["guarded"]
-    return {
-        "waveform_full_cascade": variants["full_cascade"]["waveform"],
-        "spectrum_full_cascade": variants["full_cascade"]["spectrum"],
-        "weights_full_cascade": variants["full_cascade"]["weights"],
-        "waveform_guarded": guarded["waveform"],
-        "spectrum_guarded": guarded["spectrum"],
-        "weights_guarded": guarded["weights"],
-        "variants": variants,
-        "waveform": guarded["waveform"],
-        "spectrum": guarded["spectrum"],
-        "weights": guarded["weights"],
-        "stages": guarded["stages"],
-        "window": guarded["window"],
-        "best_params": guarded["params"],
-        "best_record": best_row.to_dict(),
-        "spectrum_info": guarded["spectrum_info"],
-    }
+    diagnostic = _run_window_diagnostic_variant(
+        dataset=dataset, scheme=scheme, scope=scope, params=params,
+        output_dir=out_dir, label=label, variant_name="core_enhanced_v1",
+        motion_type=motion_type,
+        title_prefix=title_prefix, window_start_s=window_start_s,
+    )
+    return {**diagnostic, "best_params": params.to_dict(), "best_record": best_row.to_dict()}
 
 
 def _run_window_diagnostic_variant(
     *,
     dataset: ProtocolDataset,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     scope: TargetScope,
     params: ProtocolTrialParams,
     output_dir: Path,
     label: str,
     variant_name: str,
-    output_mode: str,
     motion_type: str,
     title_prefix: str,
-    aligned_fft_start_s: float,
+    window_start_s: float,
 ) -> dict[str, Any]:
     """Run one diagnostic replay variant and write waveform/spectrum/weights plots."""
 
@@ -4642,17 +4499,18 @@ def _run_window_diagnostic_variant(
     if frame.empty:
         raise RuntimeError(f"Window diagnostic replay produced no frame ({variant_name})")
 
-    row = _select_window_diagnostic_row(frame, aligned_fft_start_s)
+    dataset = apply_ppg_input_transform(dataset, params)
+    row = _select_window_diagnostic_row(frame, window_start_s)
     stages = _parse_window_stages(row)
-    raw_time, raw_ppg = _diagnostic_ppg_context(dataset, row, params)
-    filtered = _diagnostic_filtered_signal(stages, raw_ppg, output_mode=output_mode)
-    fft_start = float(row.get("fft_start_s", aligned_fft_start_s))
-    fft_end = float(row.get("fft_end_s", fft_start + float(params.TW)))
-    adaptive_start = float(row.get("adaptive_start_s", fft_start - float(params.TW_F)))
+    raw_time, algorithm_input_ppg = _diagnostic_ppg_context(dataset, row, params)
+    filtered = _diagnostic_filtered_signal(stages, algorithm_input_ppg)
+    fft_start = float(row.get("fft_start_s", window_start_s))
+    fft_end = float(row.get("fft_end_s", fft_start + float(params.hr_window_s)))
+    adaptive_start = float(row.get("adaptive_start_s", fft_start - float(params.prewarm_s)))
     penalty_ref_channel = str(row.get("penalty_ref_channel", "")) or _stage_penalty_ref_channel(stages)
-    penalty_ref_context = _diagnostic_channel_context(dataset, row, params, penalty_ref_channel, len(raw_ppg))
+    penalty_ref_context = _diagnostic_channel_context(dataset, row, params, penalty_ref_channel, len(algorithm_input_ppg))
     raw_fft = _diagnostic_fft_window(
-        raw_ppg,
+        algorithm_input_ppg,
         row,
         fs=int(dataset.fs),
         fft_start_s=fft_start,
@@ -4682,7 +4540,7 @@ def _run_window_diagnostic_variant(
     _plot_window_waveform_diagnostic(
         waveform_path,
         time_s=raw_time,
-        raw_ppg=raw_ppg,
+        algorithm_input_ppg=algorithm_input_ppg,
         filtered=filtered,
         stages=stages,
         adaptive_start_s=adaptive_start,
@@ -4690,24 +4548,24 @@ def _run_window_diagnostic_variant(
         fft_end_s=fft_end,
         title=(
             f"{motion_type} | {params.adaptive_filter} | {title_prefix} | "
-            f"{_tw_f_run_label(params.TW_F)} | {title_suffix}"
+            f"{_prewarm_run_label(params.prewarm_s)} | {title_suffix}"
         ),
     )
     spectrum_info = _plot_window_spectrum_diagnostic(
         spectrum_path,
-        raw_ppg=raw_fft,
+        algorithm_input_ppg=raw_fft,
         filtered=filtered_fft,
         penalty_ref=penalty_ref_fft,
         fs=int(dataset.fs),
         penalty_width_hz=float(getattr(params, "Spec_Penalty_Width", 0.2)),
         penalty_weight=float(getattr(params, "Spec_Penalty_Weight", 0.2)),
         penalty_ref_channel=penalty_ref_channel,
-        title=f"{motion_type} spectrum | {title_suffix} | start {aligned_fft_start_s:g}s",
+        title=f"{motion_type} spectrum | {title_suffix} | start {window_start_s:g}s",
     )
     _plot_window_weight_diagnostic(
         weights_path,
         stages=stages,
-        title=f"{motion_type} weights | {params.adaptive_filter} | {title_suffix} | start {aligned_fft_start_s:g}s",
+        title=f"{motion_type} weights | {params.adaptive_filter} | {title_suffix} | start {window_start_s:g}s",
     )
     rejected_stage_count = sum(1 for stage in stages if stage.get("accepted") is False)
     return {
@@ -4724,7 +4582,7 @@ def _run_window_diagnostic_variant(
     }
 
 
-def _select_window_diagnostic_row(frame: pd.DataFrame, aligned_fft_start_s: float) -> pd.Series:
+def _select_window_diagnostic_row(frame: pd.DataFrame, window_start_s: float) -> pd.Series:
     """Return the row whose FFT sub-window starts closest to the requested time."""
 
     if "fft_start_s" not in frame.columns:
@@ -4732,14 +4590,14 @@ def _select_window_diagnostic_row(frame: pd.DataFrame, aligned_fft_start_s: floa
     starts = pd.to_numeric(frame["fft_start_s"], errors="coerce").to_numpy(dtype=float)
     if starts.size == 0 or not np.isfinite(starts).any():
         raise ValueError("Diagnostic frame has no finite fft_start_s values")
-    idx = int(np.nanargmin(np.abs(starts - float(aligned_fft_start_s))))
+    idx = int(np.nanargmin(np.abs(starts - float(window_start_s))))
     return frame.iloc[idx]
 
 
 def _parse_window_stages(row: pd.Series) -> list[dict[str, Any]]:
     """Parse cascade stage metadata for one diagnostic window."""
 
-    column = "adaptive_stages_json" if "adaptive_stages_json" in row.index else "lms_stages_json"
+    column = "adaptive_stages_json"
     text = row.get(column, "")
     if text is None or (isinstance(text, float) and math.isnan(text)) or not str(text).strip():
         return []
@@ -4781,7 +4639,7 @@ def _diagnostic_ppg_context(
     start_idx, end_idx, adaptive_start = _diagnostic_context_indices(dataset, row, params)
     if end_idx <= start_idx:
         fs = int(dataset.fs)
-        end_idx = min(len(dataset.ppg_green), start_idx + max(1, int(round(float(params.TW) * fs))))
+        end_idx = min(len(dataset.ppg_green), start_idx + max(1, int(round(float(params.hr_window_s) * fs))))
     time_s = np.asarray(dataset.time_s[start_idx:end_idx], dtype=float)
     signal = np.asarray(dataset.ppg_green[start_idx:end_idx], dtype=float)
     if time_s.size == 0:
@@ -4795,12 +4653,12 @@ def _diagnostic_context_indices(
     row: pd.Series,
     params: ProtocolTrialParams,
 ) -> tuple[int, int, float]:
-    """Return source indices for the displayed TW_F + FFT diagnostic context."""
+    """Return source indices for the displayed prewarm_s + FFT diagnostic context."""
 
     fs = int(dataset.fs)
     fft_start = float(row.get("fft_start_s", 0.0))
-    fft_end = float(row.get("fft_end_s", fft_start + float(params.TW)))
-    adaptive_start = float(row.get("adaptive_start_s", fft_start - float(params.TW_F)))
+    fft_end = float(row.get("fft_end_s", fft_start + float(params.hr_window_s)))
+    adaptive_start = float(row.get("adaptive_start_s", fft_start - float(params.prewarm_s)))
     start_idx = max(0, int(round(adaptive_start * fs)))
     end_idx = min(len(dataset.time_s), int(round(fft_end * fs)))
     return start_idx, end_idx, adaptive_start
@@ -4839,24 +4697,18 @@ def _stage_penalty_ref_channel(stages: list[dict[str, Any]]) -> str:
 
 def _diagnostic_filtered_signal(
     stages: list[dict[str, Any]],
-    raw_ppg: np.ndarray,
-    *,
-    output_mode: str = "guarded",
+    algorithm_input_ppg: np.ndarray,
 ) -> np.ndarray:
-    """Return the final stage output if present, otherwise a raw-signal fallback."""
-
-    if output_mode == "full_cascade":
-        signal_keys = ("cascade_full_output_signal", "output_signal")
-    else:
-        signal_keys = ("cascade_guarded_output_signal", "output_signal")
+    """Return the retained stage output, or input when no adaptive stage ran."""
+    signal_keys = ("output_signal",)
     for stage in reversed(stages):
         for signal_key in signal_keys:
             if signal_key not in stage:
                 continue
             values = np.asarray(stage.get(signal_key), dtype=float)
             if values.size:
-                return _align_signal_to_context(values, len(raw_ppg))
-    return np.asarray(raw_ppg, dtype=float)
+                return _align_signal_to_context(values, len(algorithm_input_ppg))
+    return np.asarray(algorithm_input_ppg, dtype=float)
 
 
 def _align_signal_to_context(values: np.ndarray, target_len: int) -> np.ndarray:
@@ -4908,7 +4760,7 @@ def _plot_window_waveform_diagnostic(
     out_path: Path,
     *,
     time_s: np.ndarray,
-    raw_ppg: np.ndarray,
+    algorithm_input_ppg: np.ndarray,
     filtered: np.ndarray,
     stages: list[dict[str, Any]],
     adaptive_start_s: float,
@@ -4921,9 +4773,9 @@ def _plot_window_waveform_diagnostic(
     plt = _prepare_matplotlib(out_path)
     fig, ax_left = plt.subplots(figsize=(10, 4.8))
     ax_right = ax_left.twinx()
-    ax_left.axvspan(adaptive_start_s, fft_start_s, color="#b7b7b7", alpha=0.18, lw=0, label="TW_F context")
+    ax_left.axvspan(adaptive_start_s, fft_start_s, color="#b7b7b7", alpha=0.18, lw=0, label="prewarm_s context")
     ax_left.axvspan(fft_start_s, fft_end_s, color="#83c5be", alpha=0.20, lw=0, label="FFT window")
-    ax_left.plot(time_s, raw_ppg, color="#1f77b4", lw=1.2, label="PPG before adaptive")
+    ax_left.plot(time_s, algorithm_input_ppg, color="#1f77b4", lw=1.2, label="PPG before adaptive")
     stage_colors = ["#ff7f0e", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
     for idx, stage in enumerate(stages, start=1):
         if "output_signal" not in stage:
@@ -4952,8 +4804,8 @@ def _plot_window_waveform_diagnostic(
             ax_left.plot(time_s, guarded_values, color=color, lw=1.1, alpha=0.75, linestyle="-.", label=f"guard 后实际使用 {idx}")
     ax_right.plot(time_s, filtered, color="#2ca02c", lw=1.6, label="PPG after final adaptive")
     ax_left.set_title(title)
-    ax_left.set_xlabel("Aligned time (s)")
-    ax_left.set_ylabel("Raw/stage amplitude")
+    ax_left.set_xlabel("Sensor time (s)")
+    ax_left.set_ylabel("Algorithm input/stage amplitude")
     ax_right.set_ylabel("Final adaptive amplitude")
     ax_left.grid(True, alpha=0.25)
     ax_left.legend(loc="upper left", fontsize=8)
@@ -5006,7 +4858,7 @@ def _plot_window_weight_diagnostic(
 def _plot_window_spectrum_diagnostic(
     out_path: Path,
     *,
-    raw_ppg: np.ndarray,
+    algorithm_input_ppg: np.ndarray,
     filtered: np.ndarray,
     penalty_ref: np.ndarray,
     fs: int,
@@ -5018,23 +4870,22 @@ def _plot_window_spectrum_diagnostic(
     """Plot FFT-window spectra and annotate motion and penalized-spectrum HR peaks."""
 
     plt = _prepare_matplotlib(out_path)
-    raw_freq, raw_amp = compute_power_spectrum(raw_ppg, fs, apply_hamming=True, demean=True)
+    raw_freq, raw_amp = compute_power_spectrum(algorithm_input_ppg, fs, apply_hamming=True, demean=True)
     filt_freq, filt_amp = compute_power_spectrum(filtered, fs, apply_hamming=True, demean=True)
     ref_freq, ref_amp = compute_power_spectrum(penalty_ref, fs, apply_hamming=True, demean=True)
-    motion_frequency_hz = _dominant_frequency_from_spectrum(ref_freq, ref_amp, 0.2, 5.0)
-    penalized_amp = _apply_spectral_penalty(
-        filt_freq,
-        filt_amp,
-        motion_frequency_hz=motion_frequency_hz,
-        penalty_width_hz=penalty_width_hz,
-        penalty_weight=penalty_weight,
-    )
+    policy_params = resolve_core_config()
+    motion_peaks, motion_scores = spectrum_peaks((ref_freq, ref_amp), policy_params.candidate_peak_threshold_ratio, (0.2, 5.0))
+    evidence, _ = spectrum_peaks((filt_freq, filt_amp), policy_params.full_candidate_peak_threshold_ratio, (0.5, 4.0))
+    policy = PenaltyPolicy.build(motion_peaks, motion_scores, evidence,
+                                width_hz=penalty_width_hz, base_retention=penalty_weight)
+    motion_frequency_hz = policy.centers_hz[0] if policy.centers_hz else float("nan")
+    penalized_amp = filt_amp * policy.build_weights(filt_freq)
     penalized_hr_hz = _dominant_frequency_from_spectrum(filt_freq, penalized_amp, 0.5, 4.0)
     raw_amp = _normalise_fft_amplitude(raw_amp)
     filt_amp = _normalise_fft_amplitude(filt_amp)
     penalized_plot_amp = _normalise_fft_amplitude(penalized_amp)
     fig, ax = plt.subplots(figsize=(10, 4.8))
-    ax.plot(raw_freq, raw_amp, color="#1f77b4", lw=1.2, label="PPG raw FFT window")
+    ax.plot(raw_freq, raw_amp, color="#1f77b4", lw=1.2, label="PPG algorithm input FFT window")
     ax.plot(filt_freq, filt_amp, color="#2ca02c", lw=1.3, label="PPG after adaptive FFT window")
     ax.plot(
         filt_freq,
@@ -5102,29 +4953,6 @@ def _normalise_fft_amplitude(amp: np.ndarray) -> np.ndarray:
     return arr
 
 
-def _apply_spectral_penalty(
-    freq: np.ndarray,
-    amp: np.ndarray,
-    *,
-    motion_frequency_hz: float,
-    penalty_width_hz: float,
-    penalty_weight: float,
-) -> np.ndarray:
-    """Apply the same motion-frequency attenuation used by HR extraction."""
-
-    out = np.asarray(amp, dtype=float).copy()
-    if not np.isfinite(motion_frequency_hz) or motion_frequency_hz <= 0.0:
-        return out
-    freq_arr = np.asarray(freq, dtype=float)
-    width = max(0.0, float(penalty_width_hz))
-    weight = float(penalty_weight)
-    mask = (np.abs(freq_arr - float(motion_frequency_hz)) < width) | (
-        np.abs(freq_arr - 2.0 * float(motion_frequency_hz)) < width
-    )
-    out[mask] *= weight
-    return out
-
-
 def _dominant_frequency_from_spectrum(
     freq: np.ndarray,
     amp: np.ndarray,
@@ -5172,17 +5000,13 @@ def replay_best_record_hr_curves(
     target_scope: str = "motion_only",
     adaptive_filter: str = "lms",
     adaptive_data_type: str = "",
-    cascade_scheme: str | None = None,
-    override_cascade_scheme: str | None = None,
-    TW_F: float | None = None,
+    reference_config: str | None = None,
+    override_reference_config: str | None = None,
+    prewarm_s: float | None = None,
     results_root: str | Path,
     fs_origin: int = 100,
     ud_calculation_mode: str = "smoothed",
     ud_smoothing_window_s: float = 0.1,
-    guard_ratio_min_override: float | None = None,
-    guard_ratio_max_override: float | None = None,
-    guard_flat_std_eps_override: float | None = None,
-    guard_use_finite_zscore_override: bool | None = None,
     postprocess_method_override: str | None = None,
 ) -> dict[str, Path]:
     """Replay one sample from compact Stage-6 result records without retraining.
@@ -5204,19 +5028,19 @@ def replay_best_record_hr_curves(
         target_scope=TargetScope(target_scope).value,
         adaptive_filter=adaptive_filter,
         adaptive_data_type=adaptive_data_type,
-        cascade_scheme=cascade_scheme,
-        TW_F=TW_F,
+        reference_config=reference_config,
+        prewarm_s=prewarm_s,
     )
-    params = _params_from_stage6_record(best_row, adaptive_filter=adaptive_filter, TW_F=TW_F)
+    params = _params_from_stage6_record(best_row, adaptive_filter=adaptive_filter, prewarm_s=prewarm_s)
     if postprocess_method_override:
         params = replace(params, postprocess_method=str(postprocess_method_override))
-    scheme_text = _stage6_row_text(best_row, "cascade_scheme")
-    if cascade_scheme:
-        scheme_text = str(cascade_scheme)
+    scheme_text = _stage6_row_text(best_row, "reference_order_key")
+    if reference_config:
+        scheme_text = str(reference_config)
     elif not scheme_text:
         scheme_text = _stage6_row_text(best_row, "adaptive_data_type") or adaptive_data_type
-    scheme_to_run = override_cascade_scheme if override_cascade_scheme else scheme_text
-    scheme = CascadeScheme(scheme_to_run)
+    scheme_to_run = override_reference_config if override_reference_config else scheme_text
+    scheme = ReferenceConfig.from_key(scheme_to_run)
     scope = TargetScope(target_scope)
 
     dataset = load_and_preprocess_protocol(
@@ -5228,55 +5052,24 @@ def replay_best_record_hr_curves(
     )
     label_data_type = adaptive_data_type or scheme_text
 
-    if override_cascade_scheme:
-        title_prefix = f"Params: {scheme_text} -> Run: {override_cascade_scheme}"
-        label = f"cross_{label_data_type}_to_{override_cascade_scheme}_{motion_type}_{params.adaptive_filter}_{_tw_f_run_label(params.TW_F)}_{scope.value}"
+    if override_reference_config:
+        title_prefix = f"Params: {scheme_text} -> Run: {override_reference_config}"
+        label = f"cross_{label_data_type}_to_{override_reference_config}_{motion_type}_{params.adaptive_filter}_{_prewarm_run_label(params.prewarm_s)}_{scope.value}"
     else:
-        title_prefix = scheme.value
-        label = f"{motion_type}_{params.adaptive_filter}_{label_data_type}_{_tw_f_run_label(params.TW_F)}_{scope.value}"
+        title_prefix = scheme.reference_order_key
+        label = f"{motion_type}_{params.adaptive_filter}_{label_data_type}_{_prewarm_run_label(params.prewarm_s)}_{scope.value}"
 
-    full = _run_replay_variant(
-        dataset=dataset,
-        scheme=scheme,
-        scope=scope,
-        params=_with_cascade_guard_policy(params, "none"),
-        output_dir=out_dir,
-        label=label,
-        variant_name="full_cascade",
-        motion_type=motion_type,
-        title_prefix=f"{title_prefix} | full cascade",
+    return _run_replay_variant(
+        dataset=dataset, scheme=scheme, scope=scope, params=params,
+        output_dir=out_dir, label=label, variant_name="core_enhanced_v1",
+        motion_type=motion_type, title_prefix=title_prefix,
     )
-    guarded = _run_replay_variant(
-        dataset=dataset,
-        scheme=scheme,
-        scope=scope,
-        params=_apply_guard_overrides(
-            _with_cascade_guard_policy(params, "rms_guard"),
-            guard_ratio_min_override=guard_ratio_min_override,
-            guard_ratio_max_override=guard_ratio_max_override,
-            guard_flat_std_eps_override=guard_flat_std_eps_override,
-            guard_use_finite_zscore_override=guard_use_finite_zscore_override,
-        ),
-        output_dir=out_dir,
-        label=label,
-        variant_name="guarded",
-        motion_type=motion_type,
-        title_prefix=f"{title_prefix} | guarded",
-    )
-    return {
-        "plot_full_cascade": full["plot"],
-        "csv_full_cascade": full["csv"],
-        "plot_guarded": guarded["plot"],
-        "csv_guarded": guarded["csv"],
-        "plot": guarded["plot"],
-        "csv": guarded["csv"],
-    }
 
 
 def _run_replay_variant(
     *,
     dataset: ProtocolDataset,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     scope: TargetScope,
     params: ProtocolTrialParams,
     output_dir: Path,
@@ -5341,11 +5134,12 @@ def _read_stage6_record_tables(motion_dir: Path) -> dict[str, pd.DataFrame]:
         raise FileNotFoundError(f"Missing Stage-6 replay records: {', '.join(missing)}")
     # 中文说明：replay 主要依赖 best_params；其余文件在这里一起校验/读取，确保记录目录
     # 是完整的一次训练输出，后续诊断或表格汇总也能复用相同入口。
-    return {
-        "best_params": pd.read_csv(files["best_params"]),
-        "best_metrics": pd.read_csv(files["best_metrics"]),
-        "motion_frequency": pd.read_csv(files["motion_frequency"]),
-    }
+    report = json.loads(files["full_report"].read_text(encoding="utf-8"))
+    _require_result_schema(report, str(files["full_report"]))
+    tables = {name: pd.read_csv(path) for name, path in files.items() if name != "full_report"}
+    for name, table in tables.items():
+        _require_result_table_schema(table, str(files[name]))
+    return tables
 
 
 def _select_stage6_best_record(
@@ -5357,10 +5151,10 @@ def _select_stage6_best_record(
     target_scope: str,
     adaptive_filter: str,
     adaptive_data_type: str,
-    cascade_scheme: str | None,
-    TW_F: float | None,
+    reference_config: str | None,
+    prewarm_s: float | None,
 ) -> pd.Series:
-    """Pick the best-param row matching replay selectors, falling back gracefully."""
+    """Select a current record matching every replay selector."""
 
     if best_df.empty:
         raise ValueError("best_params_and_alignment.csv is empty")
@@ -5373,19 +5167,18 @@ def _select_stage6_best_record(
         ("adaptive_filter", adaptive_filter),
         ("adaptive_data_type", adaptive_data_type),
     ]
-    if cascade_scheme:
-        filters.append(("cascade_scheme", str(cascade_scheme)))
+    if reference_config:
+        filters.append(("reference_order_key", str(reference_config)))
     for column, expected in filters:
-        if not expected or column not in candidates.columns:
+        if not expected:
             continue
-        narrowed = candidates[candidates[column].astype(str) == str(expected)]
-        if not narrowed.empty:
-            candidates = narrowed
-    if TW_F is not None and "TW_F" in candidates.columns:
-        values = pd.to_numeric(candidates["TW_F"], errors="coerce")
-        narrowed = candidates[np.isclose(values.astype(float), float(TW_F), equal_nan=False)]
-        if not narrowed.empty:
-            candidates = narrowed
+        candidates = candidates[candidates[column].astype(str) == str(expected)]
+    if prewarm_s is not None:
+        values = pd.to_numeric(candidates["prewarm_s"], errors="coerce")
+        narrowed = candidates[np.isclose(values.astype(float), float(prewarm_s), equal_nan=False)]
+        candidates = narrowed
+    if candidates.empty:
+        raise ValueError("No replay record matches all selectors")
     return candidates.iloc[0]
 
 
@@ -5393,15 +5186,15 @@ def _params_from_stage6_record(
     row: pd.Series,
     *,
     adaptive_filter: str,
-    TW_F: float | None,
+    prewarm_s: float | None,
 ) -> ProtocolTrialParams:
     """Restore ProtocolTrialParams from a Stage-6 record using param columns first."""
 
     params = protocol_params_from_record(row)
     row_filter = _stage6_row_text(row, "adaptive_filter")
     fixed_filter = adaptive_filter or row_filter or params.adaptive_filter
-    fixed_tw_f = float(TW_F) if TW_F is not None else float(getattr(params, "TW_F", 0.0))
-    return replace(params, adaptive_filter=fixed_filter, TW_F=fixed_tw_f)
+    fixed_prewarm = float(prewarm_s) if prewarm_s is not None else float(getattr(params, "prewarm_s", 0.0))
+    return replace(params, adaptive_filter=fixed_filter, prewarm_s=fixed_prewarm)
 
 
 def _parse_stage6_params_json(raw: Any) -> dict[str, Any]:
@@ -5414,11 +5207,10 @@ def _parse_stage6_params_json(raw: Any) -> dict[str, Any]:
     text = str(raw).strip()
     if not text:
         return {}
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        parsed = ast.literal_eval(text)
-    return parsed if isinstance(parsed, dict) else {}
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("Parameters JSON must contain an object")
+    return parsed
 
 
 def _stage6_row_text(row: pd.Series, column: str) -> str:
@@ -5433,24 +5225,12 @@ def _stage6_row_text(row: pd.Series, column: str) -> str:
 def _build_replay_frame(frame: pd.DataFrame) -> pd.DataFrame:
     """Normalize solver window columns into a stable replay CSV schema."""
 
-    baseline = frame["baseline_hr_bpm"] if "baseline_hr_bpm" in frame else frame.get("baseline_ppg_hr_bpm")
-    if baseline is None:
-        baseline = np.full(len(frame), np.nan)
-    reference = frame["ref_hr_bpm"] if "ref_hr_bpm" in frame else frame.get("reference_hr_bpm")
-    if reference is None:
-        reference = np.full(len(frame), np.nan)
-    columns: dict[str, Any] = {
-        "time_s": frame.get("time_s", np.arange(len(frame), dtype=float)),
-        "reference_hr_bpm": reference,
-        "baseline_hr_bpm": baseline,
-        "adaptive_hr_bpm": frame.get("adaptive_hr_bpm", np.full(len(frame), np.nan)),
-        "final_hr_bpm": frame.get("final_hr_bpm", np.full(len(frame), np.nan)),
-        "final_source": frame.get("final_source", np.full(len(frame), "", dtype=object)),
-        "segment_label": frame.get("segment_label", np.full(len(frame), "", dtype=object)),
-    }
+    required = ["time_s", "ref_hr_bpm", "baseline_hr_bpm", "adaptive_hr_bpm", "final_hr_bpm", "final_source", "segment_label"]
+    out = frame.loc[:, required].rename(columns={"ref_hr_bpm": "reference_hr_bpm"}).copy()
+    out.insert(0, "result_schema_version", RESULT_SCHEMA_VERSION)
     if "fusion_reason" in frame:
-        columns["fusion_reason"] = frame["fusion_reason"]
-    return pd.DataFrame(columns)
+        out["fusion_reason"] = frame["fusion_reason"]
+    return out
 
 
 def _plot_replay_hr_curves(
@@ -5460,7 +5240,7 @@ def _plot_replay_hr_curves(
     frame: pd.DataFrame,
     motion_type: str,
     scope: TargetScope,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     params: ProtocolTrialParams,
     title_prefix: str = "",
 ) -> None:
@@ -5475,11 +5255,11 @@ def _plot_replay_hr_curves(
     ax.plot(time_s, frame["adaptive_hr_bpm"], color="#ff7f0e", lw=1.1, marker="o", ms=3, label="adaptive")
     ax.plot(time_s, frame["final_hr_bpm"], color="#2ca02c", lw=1.6, marker="o", ms=3, label="final")
     _shade_replay_segments(ax, frame)
-    prefix = title_prefix if title_prefix else scheme.value
+    prefix = title_prefix if title_prefix else scheme.reference_order_key
     metrics_title = _replay_final_metrics_title(frame)
     ax.set_title(
         f"{motion_type} | {params.adaptive_filter} | {prefix} | {scope.value} | "
-        f"{_tw_f_run_label(params.TW_F)} | {metrics_title}"
+        f"{_prewarm_run_label(params.prewarm_s)} | {metrics_title}"
     )
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("HR (bpm)")

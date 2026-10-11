@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+from ppg_hr.params import RESULT_SCHEMA_VERSION
 
 import pandas as pd
 
@@ -13,16 +16,17 @@ def _write_motion_records(root: Path, motion_type: str, final_aae: float) -> Non
     pd.DataFrame(
         [
             {
+                "result_schema_version": RESULT_SCHEMA_VERSION,
                 "motion_type": motion_type,
                 "split": "test",
                 "mode": "all_train",
                 "target_scope": "motion_only",
                 "objective_mode": "aae",
-                "cascade_scheme": "ACC",
+                "reference_order_key": "ACC",
                 "adaptive_filter": "lms",
                 "adaptive_data_type": "ACC",
-                "TW": 8.0,
-                "TW_F": 0.0,
+                "hr_window_s": 8.0,
+                "prewarm_s": 0.0,
                 "best_tdelay_s": 1.0,
                 "time_bias_after_s": -1.0,
             }
@@ -31,14 +35,15 @@ def _write_motion_records(root: Path, motion_type: str, final_aae: float) -> Non
     pd.DataFrame(
         [
             {
+                "result_schema_version": RESULT_SCHEMA_VERSION,
                 "motion_type": motion_type,
                 "split": "test",
                 "mode": "all_train",
                 "target_scope": "motion_only",
                 "filter_type": "lms",
                 "adaptive_data_type": "ACC",
-                "TW": 8.0,
-                "TW_F": 0.0,
+                "hr_window_s": 8.0,
+                "prewarm_s": 0.0,
                 "baseline_aae_bpm": 3.0,
                 "adaptive_aae_bpm": 2.0,
                 "final_aae_bpm": final_aae,
@@ -53,21 +58,22 @@ def _write_motion_records(root: Path, motion_type: str, final_aae: float) -> Non
     pd.DataFrame(
         [
             {
+                "result_schema_version": RESULT_SCHEMA_VERSION,
                 "motion_type": motion_type,
                 "split": "test",
                 "mode": "all_train",
                 "motion_frequency_hz": 1.5,
                 "penalty_ref_channel": "accx",
-                "cascade_scheme": "ACC",
+                "reference_order_key": "ACC",
                 "adaptive_filter": "lms",
                 "adaptive_data_type": "ACC",
-                "TW": 8.0,
-                "TW_F": 0.0,
+                "hr_window_s": 8.0,
+                "prewarm_s": 0.0,
             }
         ]
     ).to_csv(motion_dir / "motion_frequency_and_params.csv", index=False)
     (motion_dir / "full_report.json").write_text(
-        '{"fusion_source_distribution": {"adaptive_lms": 3, "baseline_fft": 1}}',
+        json.dumps({"result_schema_version": RESULT_SCHEMA_VERSION, "fusion_source_distribution": {"adaptive_lms": 3, "baseline_fft": 1}}),
         encoding="utf-8",
     )
 
@@ -82,13 +88,13 @@ def test_cross_motion_summary_reads_stage6_records_without_training(tmp_path: Pa
         results_root=results_root,
         adaptive_filter="lms",
         adaptive_data_type="ACC",
-        cascade_scheme="ACC",
+        reference_config="ACC",
         target_scope="motion_only",
-        TW_F=0.0,
+        prewarm_s=0.0,
     )
 
     assert out_path.exists()
-    assert out_path.name == "summary_lms_ACC_TW_F0s.csv"
+    assert out_path.name == "summary_lms_ACC_prewarm_s0s.csv"
     summary = pd.read_csv(out_path)
     assert summary["motion_type"].tolist() == ["write", "run"]
     assert {

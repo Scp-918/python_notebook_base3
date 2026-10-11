@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from ppg_hr.experimental.preprocess_protocol import SourceImu
+
 import json
 from types import SimpleNamespace
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
-from ppg_hr.experimental.alignment import AlignedDataset, AlignmentInfo
+from ppg_hr.experimental.alignment import SensorWindowPlan, AlignmentInfo
 from ppg_hr.experimental.cascade_solver import (
     _TrialBase,
     _cascade_filter_window,
@@ -27,7 +30,7 @@ from ppg_hr.experimental.preprocess_protocol import ProtocolDataset
 from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams
 from ppg_hr.experimental.run_batch_protocol import _ModeOptimisation, _aggregate_logo_fold_results
 from ppg_hr.experimental.segmentation import SegmentInfo
-from ppg_hr.params import CascadeScheme, TargetScope
+from ppg_hr.params import ReferenceConfig, TargetScope
 
 
 def _mode_result(fold_id: int, heldout: str, aae: float, params: ProtocolTrialParams) -> _ModeOptimisation:
@@ -42,7 +45,7 @@ def _mode_result(fold_id: int, heldout: str, aae: float, params: ProtocolTrialPa
     return _ModeOptimisation(
         motion_type="walk",
         target_scope=TargetScope.MOTION_ONLY,
-        cascade_scheme=CascadeScheme.ACC3,
+        reference_config=ReferenceConfig(('ACC',)),
         adaptive_filter="lms",
         objective_mode="aae",
         data_split_mode="leave_one_group_out",
@@ -69,13 +72,13 @@ def _mode_result(fold_id: int, heldout: str, aae: float, params: ProtocolTrialPa
 
 
 def test_logo_aggregate_result_semantics_are_explicit() -> None:
-    fold0 = _mode_result(0, "g0", 2.0, ProtocolTrialParams(TW=6))
-    fold1 = _mode_result(1, "g1", 1.0, ProtocolTrialParams(TW=10))
+    fold0 = _mode_result(0, "g0", 2.0, ProtocolTrialParams(hr_window_s=8))
+    fold1 = _mode_result(1, "g1", 1.0, ProtocolTrialParams(hr_window_s=8))
 
     aggregate = _aggregate_logo_fold_results(
         motion_type="walk",
         scope=TargetScope.MOTION_ONLY,
-        scheme=CascadeScheme.ACC3,
+        scheme=ReferenceConfig(('ACC',)),
         adaptive_filter="lms",
         objective_mode="aae",
         data_split_mode="leave_one_group_out",
@@ -95,16 +98,16 @@ def test_logo_aggregate_result_semantics_are_explicit() -> None:
 
 def test_layered_cache_clear_preserves_global_tdelay_until_full_clear() -> None:
     marker = object()
-    dataset = SimpleNamespace(_trial_base_cache={"heavy": object()}, _global_tdelay_cache={"global": marker})
+    dataset = SimpleNamespace(_trial_base_cache={"heavy": object()}, _sensor_base_cache={"global": marker})
 
     clear_trial_heavy_caches(dataset)  # type: ignore[arg-type]
     assert getattr(dataset, "_trial_base_cache") == {}
-    assert getattr(dataset, "_global_tdelay_cache") == {"global": marker}
+    assert getattr(dataset, "_sensor_base_cache") == {"global": marker}
 
     setattr(dataset, "_trial_base_cache", {"heavy": object()})
     clear_all_caches(dataset)  # type: ignore[arg-type]
     assert getattr(dataset, "_trial_base_cache") == {}
-    assert getattr(dataset, "_global_tdelay_cache") == {}
+    assert getattr(dataset, "_sensor_base_cache") == {}
 
 
 def test_best_delay_numba_matches_python_reference() -> None:
@@ -129,7 +132,7 @@ def test_best_delay_numba_matches_python_reference() -> None:
             pytest.skip("numba is not installed")
 
 
-def _stage_dataset(fs: int = 20) -> tuple[ProtocolDataset, AlignedDataset]:
+def _stage_dataset(fs: int = 20) -> tuple[ProtocolDataset, SensorWindowPlan]:
     n = fs * 8
     t = np.arange(n, dtype=float) / fs
     ppg = np.sin(2 * np.pi * 1.2 * t)
@@ -156,6 +159,11 @@ def _stage_dataset(fs: int = 20) -> tuple[ProtocolDataset, AlignedDataset]:
         gyroz=zeros,
         ref_time_s=ref_time,
         ref_hr_bpm=ref_hr,
+        source_imu=SourceImu(fs,t,acc,0.5 * acc,0.25 * acc,zeros,zeros,zeros),
+
+        ppg_clean_green=ppg,
+        ppg_clean_red=ppg,
+        ppg_clean_ir=ppg,
     )
     segment = SegmentInfo(
         status="ok",
@@ -168,25 +176,25 @@ def _stage_dataset(fs: int = 20) -> tuple[ProtocolDataset, AlignedDataset]:
         window_std=np.asarray([], dtype=float),
         motion_flags=np.asarray([], dtype=bool),
         labels=np.asarray(["motion", "motion"], dtype=object),
+        motion_runs=((0.0,8.0),),
     )
     info = AlignmentInfo(
         best_tdelay_s=0.0,
         std_by_delay={0.0: 0.0},
         ref_shift_s=1.0,
         num_windows=2,
-        alignment_tw_s=2.0,
-        train_tw_s=2.0,
+        evaluation_window_s=2.0,
+        hr_window_s=8,
         best_score=0.0,
         n_valid_score_windows=2,
     )
-    aligned = AlignedDataset(
+    aligned = SensorWindowPlan(
         dataset=dataset,
         segment_info=segment,
         alignment_info=info,
         window_starts_s=np.asarray([0.0, 1.0]),
         window_centers_s=np.asarray([1.0, 2.0]),
         segment_labels=np.asarray(["motion", "motion"], dtype=object),
-        ref_hr_bpm=np.asarray([72.0, 72.0]),
         rest_indices=np.asarray([], dtype=int),
         motion_indices=np.asarray([0, 1], dtype=int),
         recovery_indices=np.asarray([], dtype=int),
@@ -203,11 +211,11 @@ def test_stage_json_defaults_to_empty_but_can_be_enabled() -> None:
         aligned=aligned,
         motion_frequency=1.2,
     )
-    params = ProtocolTrialParams(Fs_Target=20, TW=2, max_order=4, M_base=1, K_max=2)
+    params = ProtocolTrialParams(Fs_Target=20, hr_window_s=8, memory_ms=4, M_base=1, K_max=2)
 
     no_stages = _run_windows(
         base,
-        CascadeScheme.ACC3,
+        ReferenceConfig(('ACC',)),
         TargetScope.MOTION_ONLY,
         params,
         1.2,
@@ -221,7 +229,7 @@ def test_stage_json_defaults_to_empty_but_can_be_enabled() -> None:
     base.spectral_cache.clear()
     with_stages = _run_windows(
         base,
-        CascadeScheme.ACC3,
+        ReferenceConfig(('ACC',)),
         TargetScope.MOTION_ONLY,
         params,
         1.2,
@@ -252,7 +260,7 @@ def test_cascade_filter_window_records_klms_stage_parameters() -> None:
         klms_distance_mode="normalized",
         klms_normalized_update=True,
         klms_nlms_eps=1e-6,
-        max_order=4,
+        memory_ms=4,
         M_base=1,
         C_scale=1.0,
         K_max=2,
@@ -267,7 +275,7 @@ def test_cascade_filter_window_records_klms_stage_parameters() -> None:
     )
     cache = {
         (0, round(float(params.Kstop), 8), round(1.2, 8), params.delay_estimation_mode): DelayEstimate(
-            by_channel={"accx": delay},
+            by_channel={name: replace(delay, channel=name) for name in ("accx", "accy", "accz")},
             order_by_type={"ACC": ["accx"]},
             primary_by_type={"ACC": "accx"},
         )
@@ -275,7 +283,7 @@ def test_cascade_filter_window_records_klms_stage_parameters() -> None:
 
     filtered, penalty_ref, stages, penalty_ref_channel = _cascade_filter_window(
         window,
-        CascadeScheme.ACC3,
+        ReferenceConfig(('ACC',)),
         params,
         fmove=1.2,
         fs=fs,

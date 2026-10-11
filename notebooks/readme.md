@@ -1,106 +1,53 @@
-# change6 批处理 Notebook
+# core_enhanced_v1 Notebook 操作说明
 
-主入口为 `run_batch_adaptive_protocol.ipynb`。它只接受一个受试者目录，不再兼容
-`multi_*` 数据。目录内文件必须严格成对：
+入口为 `run_batch_adaptive_protocol.ipynb`，由 `scripts/update_change6_notebook.py` 生成；修改注释和配置后重新生成，两者一并提交。核心定义与参数详见根README和params.py。
 
-```text
-{subject}_{motion}_{index}_sensor.csv
-{subject}_{motion}_{index}_HRdata.csv
-motion = write | gripper | run | rope
-```
+## 1. 环境、输入与配置
 
-受试者名可以包含下划线；motion 和 index 从文件名右侧解析。标定始终读取
-`SUBJECT_DIR.parent / "ck.mat"`。
+使用PPG_sensor_env，在仓库根目录或notebooks目录打开Notebook。设置PPG_SUBJECT_DIR指向一个受试者目录，或使用仓库相对路径；不写本机绝对路径。只支持严格Pydisplay sensor CSV、标准HRdata CSV，文件为subject_motion_index_sensor/HRdata.csv，motion为write/gripper/run/rope；父目录必须有ck.mat。缺少配对只报告原因，不进入训练；序号修复、missing/spike repair、UD分母QC和坏窗回退仍保留。
 
-## 默认实验配置
+第0节分四个配置单元：路径/实验轴、预处理/评价、冻结preset/固定验收、输出/执行开关。参数集中于params.py；Notebook不复制可编辑的rescue或tracker参数。未知字段、旧字段及冻结机制覆盖明确报错。
 
-- 数据拆分：`all_train`，同一 motion 的所有 index 共同构成一次 objective。
-- 范围与目标：`motion_post10`、对齐后的 `posthoc_aae`。
-- PPG 输入：`log_absorbance`。
-- 初始自适应滤波配置只启用 LMS；第 7 节之后的附加训练单元切换为 Volterra，并受 `RUN_ALL_TRAIN` 控制。只运行所需的训练单元；RFF-LMS、KLMS 仍可显式选择。第 16 节当前选择 Volterra，回放时应与实际最优记录的滤波器配置匹配。
-- 搜索预算：每个 motion/scope/scheme/filter 模式 200 trials、1 repeat。
-- scheme：`ACC`、`HF2`、`UD2`、`ACC+HF2`、`HF2+CF2`、`ACC+UD2`。
-- motion 顺序：`write`、`gripper`、`run`、`rope`。
+- 固定验收默认Fs_Target=100Hz、memory_ms=160ms、LMS_Mu_Base=.01；HR observation固定8秒/1秒。
+- memory_ms派生history_tap_limit=max(1,round(memory_ms*Fs_Target/1000))，只控制正时延历史上限；实际M/K按延迟估计，M_base=2、C_scale=1.2、K_max=12冻结。日志中的实际history/forward跨度用于核查，不宣称K的物理时长统一。
+- prewarm_s=0是adaptive前置上下文，独立于observation与评价对齐8/1。
+- 实验轴为filter、FFT/SSR、reference groups、single_bout/multi_bout、scope和raw_bandpass/log_absorbance。固定配置及实验轴由resolve_core_config解析。
+- BO仅Fs_Target[25,50]、memory_ms[40,80,120,160,200]、滤波器步长、Spec_Penalty_Width[.1,.2,.3]Hz；RFF解码为LMS_Mu_Base，KLMS为klms_step_size。Weight=.2为保留比例，冻结，越小抑制越强。
 
-UD1/UD2 支持两种固定公式输入模式：`raw` 直接使用原始 `Uh2/Uc2`、`Uh3/Uc3`；
-默认 `smoothed` 先对这四路原始电压分别执行中心移动中位数，再代入标定公式。
-Notebook 第一个代码单元通过 `UD_CALCULATION_MODE` 和
-`UD_SMOOTHING_WINDOW_S` 配置，当前实验窗口为 `0.05 s`（后端默认仍为 `0.1 s`）。两种模式都保留近零分母
-QC/插值，并且计算后的 UD1/UD2 都不经过 0.1–5 Hz 带通；仅在 `UD2`、
-`ACC+UD2` 级联中按 `normalization_mode` 对每个 `TW_F+TW` 窗口直接归一化。
-HF2、CF2 等通道的既有带通处理保持不变。
+## 2. 预览与固定验收
 
-Notebook 首个代码单元提供 `legacy/enhanced` 总开关和六项独立开关：方向性追踪、
-动态惩罚、连续性保护、低锁定恢复、高锁定恢复、运动后动态保护。默认使用
-`enhanced` 且全部开启。这些字段会进入参数 JSON/CSV、cache key、模式 checkpoint
-指纹和 replay 参数恢复。
+先执行第1节严格配对与标定。按需打开RUN_STATIC_QC，只做只读筛查。打开RUN_PREPROCESS_PREVIEW，在第2节指定PREVIEW_MOTION_TYPE/INDEX，检查source_metadata、QC和分段。
 
-增强模式按来源和阶段使用参考方向参数：普通 raw/baseline 路径保持独立的静息
-追踪；adaptive 在运动段使用 `35/15 bpm` 搜索范围，在恢复段使用 `20/25 bpm`；
-运动结束后 reset-FFT 会清空自身历史并独立启动。恢复期最初继续输出 adaptive，随后
-依次检查 `stable_crossover`、`gap_rescue` 和 `adaptive_rising_rescue`。切换到
-reset-FFT 后不再回跳；若没有足够证据，则保持 adaptive 到记录结束。
+source IMU固定原始约100Hz，独立于adaptive和Fs_Target：六轴四阶零相位带通ACC .5–5Hz、Gyro .5–10Hz，分别magnitude，8/1秒STD(ddof=1)。前30秒baseline，阈值max(2.5*baseline_std,.05*max_window_score)，任一路严格超过即motion；先桥≤3窗false gap，再删<5窗true run。detector返回全部runs，独立policy默认选最长（等长最早）；multi_bout保留全部。metadata分别记录detected和selected结果。
 
-`motion_post10` 只表示默认 objective 评价运动结束后 10 秒内的窗口，不作为运动后保护的固定退出时间。
-`POST_MOTION_GUARD_SECONDS=None` 是新默认；只有显式填写数值时才恢复旧的 timeout
-兼容行为。PPG 完整候选峰门限为 `0.15`，运动惩罚参考峰门限为 `0.30`。
+打开RUN_FIXED_CORE执行第2节后的固定参数单元，不启动Optuna；输出fixed_core/windows.csv和preset.json。核查时间轴、phase、episode、恢复经过时间、候选来源和handoff。窗口统一start/center/end，状态以center判断，motion为首true center到下一false center半开区间。reference覆盖不足只使评价NaN，不裁剪预测。
 
-## 输出与断点目录
+四层pipeline：FFT/SSR spectrum → shared soft penalty与candidate tracker → source selection/handoff → phase-aware Final dynamics。tracker第一层slew保护候选连续性；Final第二层slew保护phase/source拼接，跨phase延续状态。rest up1.5/1.5、down3/1.5；motion up5.5/3.5、down2/1.5；recovery up1.5/1.5、down3.5/3（limit/step bpm）。low/high-lock、rise-lineage、gap/rising rescue、complex shadow及interface-quality在线介入全部显式关闭。
 
-Notebook 和 Python 后端统一使用以下确定性目录：
+motion_only恢复立即reset-FFT；motion_post10控制真实adaptive范围，最迟10秒范围结束切换。一般handoff等待5秒，差值≤6bpm连续2有效窗切换，最迟20秒切到有效reset-FFT；每次motion结束重置tracker/handoff，episode内锁存。无效候选按QC有效源回退，不调用rescue，也不将范围外baseline冒充adaptive。
 
-```text
-SUBJECT_DIR.parent/
-└── outputs/
-    └── {subject}__{run_signature}/
-        ├── motion_types/              # 四类运动的 Stage-6 记录和模式级断点
-        ├── qc/
-        ├── signal_figures/
-        ├── final_summary/
-        ├── replay/
-        ├── window_diagnostics/
-        ├── summary_tables/
-        ├── cross_replay/
-        ├── cross_window_diagnostics/
-        ├── batch_reference_compare/
-        └── batch_target_hr_curves/   # 单 scheme、全 motion/index 的目标段 HR 图与 manifest
-```
+先看整体/rest/motion/recovery AAE、P95误差、最大单窗jump和起止/recovery曲线。性能异常先检查时间、reference顺序、M/K、state和penalty，勿通过重开rescue补指标。
 
-`run_signature` 包含 scope、scheme、filter、objective、split、`TW_F` 和 HR 后处理方式。
-重复使用相同配置时路径保持不变，因此可以恢复模式级 checkpoint。默认
-`CLEAN_OUTPUTS=False`；不要在需要续跑时打开清理开关。
+## 3. Batch 与 resume
 
-正式训练通过 Notebook 的精简回调在每个“motion × scope × scheme × filter”完成后
-打印一次结果，包括 final 的 post-hoc AAE/±5 bpm 准确率、同一套最优参数改用 ACC
-信号源后的对照指标，以及该模式优化与最终复算耗时。恢复断点时会明确标记为断点恢复，
-不会伪装成本次重新训练。
+第7节只使用第0节的配置，不再隐式重置filter或重复跑Volterra。RUN_ALL_TRAIN=True启动按运动、scope、reference、filter划分的模式级搜索；各运动类型全部index共同形成objective。RUN_CONNECTIVITY_CHECK在第8节运行少量trial，仍会处理选中所有记录。先完成固定验收，再决定是否搜索。
 
-## Notebook 章节
+输出为SUBJECT_DIR.parent/outputs/{subject}__{run_signature}；下含motion_types、模式checkpoint、history及Stage-6紧凑CSV/JSON。再次执行同一batch配置时自动读取模式断点；保持相同输入与完整有效配置继续断点；fingerprint包含schema、preset、所有配置与输入签名。改变配置不得误用旧checkpoint。CLEAN_OUTPUTS保持False，历史输出不自动迁移或修改。
 
-- 第 0 节：四层配置，包括核心路径、预处理/对齐、滤波/追踪和执行/输出。
-- 第 1–2 节：严格配对、`ck.mat`、静态 QC、单样本预处理、分段和对齐预览。
-- 第 3–4、6 节：Tdelay、全段 PPG-HR 和原始 PPG 双轴诊断图。
-- 第 5 节：统一训练包装器。
-- 第 7 节：正式 `all_train` 优化。
-- 第 8 节：按当前组合动态计算模式数的连通性检查。
-- 第 9 节：Stage-6、history 和 checkpoint 完整性检查。
-- 第 10–12 节：单样本 replay、窗口诊断和跨运动汇总。
-- 第 13–15 节：跨 scheme replay/窗口诊断和批量参考通道对比。
-- 第 16 节：读取既有 Stage-6 最优参数，批量重绘当前受试者全部 motion/index 的
-  post-hoc 对齐真实 HR—final HR 目标段曲线；输出目录会追加 scope、scheme、filter、
-  split 和 `TW_F` 模式签名，不会启动 Optuna。
+reference唯一真源为ordered tuples：单组("ACC",)或("UD",)，双组("ACC","HF")展开accx/accy/accz/hf1/hf2，反向("HF","ACC")展开hf1/hf2/accx/accy/accz。通道不按延迟相关性再重排。canonical key ACC+HF/HF+ACC关联run/mode/path、CSV/JSON、cache、legend、summary和回放。物理采集字段UD2不是reference模式名。
 
-replay 和诊断通过 `motion_type + motion_index` 从当前 `SUBJECT_DIR` 的配对结果选择
-样本，不再填写独立的传感器或 HR CSV 路径。
+## 4. 输出、回放、汇总与绘图
 
-## 推荐运行顺序
+第9节RUN_OUTPUT_CHECK核查目录和记录，不启动训练。第10节设置RESULTS_ROOT、REPLAY_MOTION_TYPE/INDEX、filter、reference canonical key、scope及prewarm，打开RUN_STAGE7_REPLAY；恢复已保存配置，只返回当前core的plot和csv。第11节RUN_WINDOW_DIAGNOSTICS指定传感器时间域window_start_s，查看前置上下文、实际algorithm input、频谱/penalty权重、tracker和来源状态；参考HR只在完成预测后用于对照。
 
-1. 设置环境变量 `PPG_SUBJECT_DIR`，或在首个单元修改 `SUBJECT_DIR`。
-2. 运行“只读发现、严格配对与标定检查”。
-3. 运行单对静态预处理，检查 CF2/HF2/HF2comp/UD2、序号 QC 与标定元数据。
-4. 如需训练，先核对 `RUN_OUTPUT_DIR`，再把 `RUN_ALL_TRAIN` 改为 `True`。
-5. 训练完成后，按需打开第 9–16 节各自的 `RUN_*` 开关。
+第12节RUN_CROSS_MOTION_SUMMARY只读已有记录，输出write/gripper/run/rope汇总。第13–15节可批量回放、诊断和reference比较；第16节可重画已有目标段。第3–6节独立开关生成静息评价对齐、完整曲线、原始信号图。写图均显式开启，结果进入outputs；检查实际estimator而非只看请求值（SSR无有效候选时记录FFT fallback）。
 
-默认所有训练、写图、回放和诊断开关均为 `False`，因此顺序执行 Notebook 不会创建
-Optuna study 或输出目录。训练仍只按模式保存 history、manifest 和 checkpoint，
-不增加滤波权重级存档。
+新结果含result_schema_version、preset_name/version、feature_flags、完整核心参数、参考实现SHA及config fingerprint。检查Stage-6 best_params.json/CSV、manifest和固定preset.json中的一致性；不要只看文件夹名字。旧schema、旧枚举、缺字段旧记录明确拒绝，没有兼容fallback。保留历史目录，使用新输出身份重新运行再回放。
+
+## 5. PPG / UD 血缘及提交前检查
+
+ppg_acquired_raw保留source采集网格，序号缺口NaN、毛刺原值；ppg_clean承担missing/spike repair；ppg_algorithm_input从clean做bandpass/log_absorbance及目标域resampling。改变Fs不改变原始source。
+
+raw Uh/Uc加标定产生UD calculation，adaptive reference使用独立预处理副本；InterfaceQualityInput只含raw PPG、Uh/Uc、UD calculation、source时间和QC，不接受adaptive output或reference HR。quality暂未实现，无循环依赖或反向修改reference。参考HR仅评价，不参与在线求解；算法含零相位、全记录阈值和前视，不声称严格因果。
+
+运行 `PYTHONPATH=src` 下的全量pytest与可用Ruff。提交前清空Notebook执行输出和计数，移除绝对路径，RUN_*全部恢复False；注释应描述实际冻结实现，不保留旧兼容/rescue说明。新旧指标比较必须注明检测边界、评价对齐和预测覆盖改变。

@@ -4,14 +4,14 @@ import json
 
 from ppg_hr.experimental import run_batch_protocol as rbp
 from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams
-from ppg_hr.params import CascadeScheme, TargetScope
+from ppg_hr.params import ReferenceConfig, TargetScope
 
 
-def _result(*, scheme: CascadeScheme = CascadeScheme.HF2) -> rbp._ModeOptimisation:
+def _result(*, scheme: ReferenceConfig = ReferenceConfig(('HF',))) -> rbp._ModeOptimisation:
     return rbp._ModeOptimisation(
         motion_type="write",
         target_scope=TargetScope.MOTION_POST10,
-        cascade_scheme=scheme,
+        reference_config=scheme,
         adaptive_filter="lms",
         objective_mode="posthoc_aae",
         data_split_mode="all_train",
@@ -36,7 +36,7 @@ def _result(*, scheme: CascadeScheme = CascadeScheme.HF2) -> rbp._ModeOptimisati
 
 
 def test_acc_compare_exposes_posthoc_metrics_without_changing_legacy_fields() -> None:
-    fields = rbp._acc3_compare_fields(
+    fields = rbp._acc_compare_fields(
         {
             "final_aae_bpm": 6.0,
             "final_acc_pct": 70.0,
@@ -48,15 +48,15 @@ def test_acc_compare_exposes_posthoc_metrics_without_changing_legacy_fields() ->
         reason="",
     )
 
-    assert fields["acc3_compare_aae_bpm"] == 6.0
-    assert fields["acc3_compare_accuracy_pct"] == 70.0
+    assert fields["acc_compare_aae_bpm"] == 6.0
+    assert fields["acc_compare_accuracy_pct"] == 70.0
     assert fields["acc_compare_posthoc_aae_bpm"] == 3.5
     assert fields["acc_compare_posthoc_accuracy_pct"] == 88.0
 
 
 def test_completed_mode_progress_event_contains_final_and_acc_comparison() -> None:
     result = _result()
-    result.acc3_compare_metrics = rbp._acc3_compare_fields(
+    result.acc_compare_metrics = rbp._acc_compare_fields(
         {
             "final_aae_bpm": 7.0,
             "final_acc_pct": 65.0,
@@ -78,8 +78,7 @@ def test_completed_mode_progress_event_contains_final_and_acc_comparison() -> No
         "motion_type": "write",
         "target_scope": "MOTION_POST10",
         "target_scope_value": "motion_post10",
-        "cascade_scheme": "HF2",
-        "cascade_scheme_display": "HF2",
+        "reference_order_key": "HF",
         "adaptive_filter": "lms",
         "success": True,
         "reason": "",
@@ -95,17 +94,17 @@ def test_completed_mode_progress_event_contains_final_and_acc_comparison() -> No
 
 
 def test_acc_mode_uses_original_posthoc_metrics_for_comparison() -> None:
-    result = _result(scheme=CascadeScheme.ACC3)
-    metrics = rbp._acc3_compare_metrics_for(result)
+    result = _result(scheme=ReferenceConfig(('ACC',)))
+    metrics = rbp._acc_compare_metrics_for(result)
 
-    assert metrics["acc3_compare_status"] == "same_as_original"
+    assert metrics["acc_compare_status"] == "same_as_original"
     assert metrics["acc_compare_posthoc_aae_bpm"] == 2.25
     assert metrics["acc_compare_posthoc_accuracy_pct"] == 91.5
 
 
 def test_mode_duration_and_posthoc_acc_metrics_roundtrip_manifest() -> None:
     result = _result()
-    result.acc3_compare_metrics = rbp._acc3_compare_fields(
+    result.acc_compare_metrics = rbp._acc_compare_fields(
         {"posthoc_final_aae_bpm": 4.0, "posthoc_final_acc_pct": 82.0},
         status="ok",
         reason="",
@@ -115,5 +114,4 @@ def test_mode_duration_and_posthoc_acc_metrics_roundtrip_manifest() -> None:
     restored = rbp._mode_result_from_manifest_payload(payload)
 
     assert restored.training_elapsed_s == 12.5
-    assert restored.acc3_compare_metrics["acc_compare_posthoc_aae_bpm"] == 4.0
-
+    assert restored.acc_compare_metrics["acc_compare_posthoc_aae_bpm"] == 4.0

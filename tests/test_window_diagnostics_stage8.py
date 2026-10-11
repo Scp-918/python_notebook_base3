@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from ppg_hr.experimental.preprocess_protocol import SourceImu
+
 import json
 from pathlib import Path
+
+from ppg_hr.params import RESULT_SCHEMA_VERSION
 
 import numpy as np
 import pandas as pd
@@ -9,7 +13,7 @@ import pandas as pd
 from ppg_hr.experimental import run_batch_protocol as rbp
 from ppg_hr.experimental.preprocess_protocol import ProtocolDataset
 from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams
-from ppg_hr.params import CascadeScheme, TargetScope
+from ppg_hr.params import ReferenceConfig, TargetScope
 
 
 class _FakeLine:
@@ -102,34 +106,36 @@ def test_window_diagnostics_from_records_plots_selected_fft_window_and_stages(
 ) -> None:
     motion_dir = tmp_path / "results" / "motion_types" / "tiaosheng"
     motion_dir.mkdir(parents=True)
-    params = ProtocolTrialParams(TW=2, TW_F=1.0, Fs_Target=1, adaptive_filter="lms")
+    params = ProtocolTrialParams(hr_window_s=8, prewarm_s=0.0, Fs_Target=1, adaptive_filter="lms")
     pd.DataFrame(
         [
             {
+                "result_schema_version": RESULT_SCHEMA_VERSION,
                 "motion_type": "tiaosheng",
                 "split": "test",
                 "mode": "all_train",
                 "target_scope": "motion_only",
-                "cascade_scheme": "ACC3",
+                "reference_order_key": "ACC",
                 "adaptive_filter": "lms",
-                "adaptive_data_type": "ACC3",
-                "TW": 2.0,
-                "TW_F": 1.0,
+                "adaptive_data_type": "ACC",
+                "hr_window_s": 2.0,
+                "prewarm_s": 0.0,
                 "best_params_json": json.dumps(params.to_dict()),
             }
         ]
     ).to_csv(motion_dir / "best_params_and_alignment.csv", index=False)
-    pd.DataFrame([{"motion_type": "tiaosheng"}]).to_csv(motion_dir / "best_metrics.csv", index=False)
+    pd.DataFrame([{"result_schema_version": RESULT_SCHEMA_VERSION, "motion_type": "tiaosheng"}]).to_csv(motion_dir / "best_metrics.csv", index=False)
     pd.DataFrame(
         [
             {
+                "result_schema_version": RESULT_SCHEMA_VERSION,
                 "motion_type": "tiaosheng",
                 "motion_frequency_hz": 1.0,
                 "penalty_ref_channel": "accx",
             }
         ]
     ).to_csv(motion_dir / "motion_frequency_and_params.csv", index=False)
-    (motion_dir / "full_report.json").write_text("{}", encoding="utf-8")
+    (motion_dir / "full_report.json").write_text(json.dumps({"result_schema_version": RESULT_SCHEMA_VERSION}), encoding="utf-8")
 
     time_s = np.arange(6, dtype=float)
     ppg = np.array([0.0, 0.5, 1.0, 0.2, -0.2, 0.0])
@@ -153,6 +159,11 @@ def test_window_diagnostics_from_records_plots_selected_fft_window_and_stages(
         gyroz=zeros,
         ref_time_s=time_s,
         ref_hr_bpm=70.0 + time_s,
+        source_imu=SourceImu(1,time_s,np.array([0.0, 1.0, 0.0, -1.0, 0.0, 1.0]),zeros,zeros,zeros,zeros,zeros),
+
+        ppg_clean_green=ppg,
+        ppg_clean_red=ppg,
+        ppg_clean_ir=ppg,
     )
     stages = [
         {
@@ -182,13 +193,13 @@ def test_window_diagnostics_from_records_plots_selected_fft_window_and_stages(
             "fft_end_s": [4.0],
             "adaptive_start_s": [1.0],
             "adaptive_source_start_s": [1.0],
-            "TW_F": [1.0],
+            "prewarm_s": [1.0],
             "fft_offset_samples": [1],
             "fft_input_samples": [2],
             "adaptive_input_samples": [3],
             "segment_label": ["motion"],
             "ref_hr_bpm": [72.0],
-            "baseline_ppg_hr_bpm": [70.0],
+            "baseline_hr_bpm": [70.0],
             "adaptive_hr_bpm": [73.0],
             "final_hr_bpm": [73.0],
             "final_source": ["adaptive_lms"],
@@ -200,7 +211,7 @@ def test_window_diagnostics_from_records_plots_selected_fft_window_and_stages(
         success=True,
         reason="",
         target_scope=TargetScope.MOTION_ONLY,
-        cascade_scheme=CascadeScheme.ACC3,
+        reference_config=ReferenceConfig(('ACC',)),
         adaptive_filter="lms",
         params=params,
         objective_aae_bpm=1.0,
@@ -235,188 +246,29 @@ def test_window_diagnostics_from_records_plots_selected_fft_window_and_stages(
         mode="all_train",
         target_scope="motion_only",
         adaptive_filter="lms",
-        adaptive_data_type="ACC3",
-        cascade_scheme="ACC3",
-        TW_F=1.0,
-        aligned_fft_start_s=2.0,
+        adaptive_data_type="ACC",
+        reference_config="ACC",
+        prewarm_s=0.0,
+        window_start_s=2.0,
         results_root=tmp_path / "results",
     )
 
-    assert len(calls) == 2
-    assert [call["params"].cascade_guard_policy for call in calls] == ["none", "rms_guard"]
+    assert len(calls) == 1
+    assert [call["params"].cascade_guard_policy for call in calls] == ["none"]
     assert all(call["collect_stages"] is True for call in calls)
     assert all(call["collect_frame"] is True for call in calls)
-    assert paths["waveform_full_cascade"].exists()
-    assert paths["spectrum_full_cascade"].exists()
-    assert paths["weights_full_cascade"].exists()
-    assert paths["waveform_guarded"].exists()
-    assert paths["spectrum_guarded"].exists()
-    assert paths["weights_guarded"].exists()
     assert paths["waveform"].exists()
     assert paths["spectrum"].exists()
     assert paths["weights"].exists()
-    assert paths["waveform"] == paths["waveform_guarded"]
-    assert paths["spectrum"] == paths["spectrum_guarded"]
-    assert paths["weights"] == paths["weights_guarded"]
-    assert paths["waveform_full_cascade"].name.endswith("_full_cascade.png")
-    assert paths["waveform_guarded"].name.endswith("_guarded.png")
-    assert set(paths["variants"]) == {"full_cascade", "guarded"}
-    assert paths["variants"]["full_cascade"]["params"]["cascade_guard_policy"] == "none"
-    assert paths["variants"]["guarded"]["params"]["cascade_guard_policy"] == "rms_guard"
+    assert paths["waveform"].name.endswith("_core_enhanced_v1.png")
     assert len(paths["stages"]) == 1
     assert paths["stages"][0]["guard_policy"] == "rms_guard"
     assert paths["stages"][0]["accepted"] is False
-    assert paths["variants"]["guarded"]["rejected_stage_count"] == 1
     assert paths["stages"][0]["reference_channel_ranking"]["ACC"][0] == "accx"
-    assert paths["best_params"]["TW_F"] == 1.0
-    assert paths["best_record"]["cascade_scheme"] == "ACC3"
+    assert paths["best_params"]["prewarm_s"] == 0.0
+    assert paths["best_record"]["reference_order_key"] == "ACC"
     assert "spectrum_info" in paths
-    assert "tiaosheng_lms_ACC3_TW_F1s_motion_only_start2s" in paths["waveform_guarded"].name
-
-
-def test_window_diagnostics_guarded_variant_applies_explicit_guard_overrides(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    motion_dir = tmp_path / "results" / "motion_types" / "tiaosheng"
-    motion_dir.mkdir(parents=True)
-    params = ProtocolTrialParams(
-        TW=2,
-        TW_F=1.0,
-        Fs_Target=1,
-        adaptive_filter="lms",
-        cascade_guard_ratio_min=0.2,
-        cascade_guard_ratio_max=2.5,
-        cascade_guard_flat_std_eps=1e-6,
-        cascade_guard_use_finite_zscore=True,
-    )
-    pd.DataFrame(
-        [
-            {
-                "motion_type": "tiaosheng",
-                "split": "test",
-                "mode": "all_train",
-                "target_scope": "motion_only",
-                "cascade_scheme": "ACC3",
-                "adaptive_filter": "lms",
-                "adaptive_data_type": "ACC3",
-                "TW": 2.0,
-                "TW_F": 1.0,
-                "best_params_json": json.dumps(params.to_dict()),
-            }
-        ]
-    ).to_csv(motion_dir / "best_params_and_alignment.csv", index=False)
-    pd.DataFrame([{"motion_type": "tiaosheng"}]).to_csv(motion_dir / "best_metrics.csv", index=False)
-    pd.DataFrame([{"motion_type": "tiaosheng", "motion_frequency_hz": 1.0}]).to_csv(
-        motion_dir / "motion_frequency_and_params.csv",
-        index=False,
-    )
-    (motion_dir / "full_report.json").write_text("{}", encoding="utf-8")
-
-    time_s = np.arange(6, dtype=float)
-    ppg = np.array([0.0, 0.5, 1.0, 0.2, -0.2, 0.0])
-    zeros = np.zeros_like(time_s)
-    dataset = ProtocolDataset(
-        sample_stem="multi_tiaosheng1",
-        fs=1,
-        time_s=time_s,
-        ppg_green=ppg,
-        ppg_red=ppg,
-        ppg_ir=ppg,
-        hf1=zeros,
-        hf2=zeros,
-        cf1=zeros,
-        cf2=zeros,
-        accx=zeros,
-        accy=zeros,
-        accz=zeros,
-        gyrox=zeros,
-        gyroy=zeros,
-        gyroz=zeros,
-        ref_time_s=time_s,
-        ref_hr_bpm=70.0 + time_s,
-    )
-    frame = pd.DataFrame(
-        {
-            "time_s": [3.0],
-            "fft_start_s": [2.0],
-            "fft_end_s": [4.0],
-            "adaptive_start_s": [1.0],
-            "adaptive_source_start_s": [1.0],
-            "TW_F": [1.0],
-            "fft_offset_samples": [1],
-            "fft_input_samples": [2],
-            "adaptive_input_samples": [3],
-            "segment_label": ["motion"],
-            "ref_hr_bpm": [72.0],
-            "baseline_ppg_hr_bpm": [70.0],
-            "adaptive_hr_bpm": [73.0],
-            "final_hr_bpm": [73.0],
-            "final_source": ["adaptive_lms"],
-            "penalty_ref_channel": ["accx"],
-            "adaptive_stages_json": [json.dumps([])],
-        }
-    )
-    run = rbp.ProtocolRunResult(
-        success=True,
-        reason="",
-        target_scope=TargetScope.MOTION_ONLY,
-        cascade_scheme=CascadeScheme.ACC3,
-        adaptive_filter="lms",
-        params=params,
-        objective_aae_bpm=1.0,
-        baseline_aae_bpm=1.0,
-        adaptive_aae_bpm=1.0,
-        final_aae_bpm=1.0,
-        baseline_acc_pct=100.0,
-        adaptive_acc_pct=100.0,
-        final_acc_pct=100.0,
-        frame=frame,
-        segment_info=None,
-        alignment_info=None,
-        motion_frequency=1.0,
-        metric_arrays={},
-    )
-    calls: list[ProtocolTrialParams] = []
-
-    def fake_run_protocol_trial(_dataset, _scheme, _scope, trial_params, **kwargs):
-        calls.append(trial_params)
-        return run
-
-    monkeypatch.setattr(rbp, "load_and_preprocess_protocol", lambda *args, **kwargs: dataset)
-    monkeypatch.setattr(rbp, "run_protocol_trial", fake_run_protocol_trial)
-    monkeypatch.setattr(rbp, "_prepare_matplotlib", lambda out_path: _FakePyplot())
-
-    paths = rbp.plot_window_diagnostics_from_records(
-        signal_csv=tmp_path / "multi_tiaosheng1.csv",
-        ref_csv=tmp_path / "multi_tiaosheng1_ref.csv",
-        output_dir=tmp_path / "diag",
-        motion_type="tiaosheng",
-        split="test",
-        mode="all_train",
-        target_scope="motion_only",
-        adaptive_filter="lms",
-        adaptive_data_type="ACC3",
-        cascade_scheme="ACC3",
-        TW_F=1.0,
-        aligned_fft_start_s=2.0,
-        results_root=tmp_path / "results",
-        guard_ratio_min_override=0.33,
-        guard_ratio_max_override=3.3,
-        guard_flat_std_eps_override=1e-4,
-        guard_use_finite_zscore_override=False,
-    )
-
-    assert calls[0].cascade_guard_policy == "none"
-    assert calls[0].cascade_guard_ratio_min == 0.2
-    assert calls[0].cascade_guard_ratio_max == 2.5
-    assert calls[1].cascade_guard_policy == "rms_guard"
-    assert calls[1].cascade_guard_ratio_min == 0.33
-    assert calls[1].cascade_guard_ratio_max == 3.3
-    assert calls[1].cascade_guard_flat_std_eps == 1e-4
-    assert calls[1].cascade_guard_use_finite_zscore is False
-    assert paths["variants"]["guarded"]["params"]["cascade_guard_ratio_min"] == 0.33
-    assert paths["variants"]["guarded"]["params"]["cascade_guard_ratio_max"] == 3.3
+    assert "tiaosheng_lms_ACC_prewarm_s0s_motion_only_start2s" in paths["waveform"].name
 
 
 def test_window_waveform_diagnostic_uses_dual_y_axes(tmp_path: Path, monkeypatch) -> None:
@@ -431,7 +283,7 @@ def test_window_waveform_diagnostic_uses_dual_y_axes(tmp_path: Path, monkeypatch
     rbp._plot_window_waveform_diagnostic(
         out_path,
         time_s=np.arange(4, dtype=float),
-        raw_ppg=np.array([0.0, 1.0, 0.0, -1.0]),
+        algorithm_input_ppg=np.array([0.0, 1.0, 0.0, -1.0]),
         filtered=np.array([0.2, 0.1, 0.0, -0.1]),
         stages=stages,
         adaptive_start_s=0.0,
@@ -444,7 +296,7 @@ def test_window_waveform_diagnostic_uses_dual_y_axes(tmp_path: Path, monkeypatch
     assert fig is not None
     assert out_path.exists()
     assert len(fig.axes) == 2
-    assert fig.axes[0].get_ylabel() == "Raw/stage amplitude"
+    assert fig.axes[0].get_ylabel() == "Algorithm input/stage amplitude"
     assert fig.axes[1].get_ylabel() == "Final adaptive amplitude"
     assert any(line.get_label().startswith("stage 1") for line in fig.axes[0].lines)
     assert any(line.get_label() == "PPG after final adaptive" for line in fig.axes[1].lines)
@@ -467,7 +319,7 @@ def test_window_spectrum_diagnostic_plots_normalized_fft_amplitudes(tmp_path: Pa
 
     rbp._plot_window_spectrum_diagnostic(
         out_path,
-        raw_ppg=np.array([0.0, 1.0, 0.0]),
+        algorithm_input_ppg=np.array([0.0, 1.0, 0.0]),
         filtered=np.array([0.0, 0.5, 0.0]),
         penalty_ref=np.array([0.0, 1.0, 0.0]),
         fs=4,
@@ -510,30 +362,31 @@ def test_align_signal_to_context_does_not_create_flat_left_prefix() -> None:
 def test_window_diagnostics_resamples_context_to_stage_sample_rate(tmp_path: Path, monkeypatch) -> None:
     motion_dir = tmp_path / "results" / "motion_types" / "tiaosheng"
     motion_dir.mkdir(parents=True)
-    params = ProtocolTrialParams(TW=10, TW_F=15.0, Fs_Target=50, adaptive_filter="lms")
+    params = ProtocolTrialParams(hr_window_s=8, prewarm_s=0.0, Fs_Target=50, adaptive_filter="lms")
     pd.DataFrame(
         [
             {
+                "result_schema_version": RESULT_SCHEMA_VERSION,
                 "motion_type": "tiaosheng",
                 "split": "test",
                 "mode": "all_train",
                 "target_scope": "motion_only",
-                "cascade_scheme": "ACC3",
+                "reference_order_key": "ACC",
                 "adaptive_filter": "lms",
-                "adaptive_data_type": "ACC3",
-                "TW": 10.0,
-                "TW_F": 15.0,
+                "adaptive_data_type": "ACC",
+                "hr_window_s": 10.0,
+                "prewarm_s": 0.0,
                 "Fs_Target": 50,
                 "best_params_json": json.dumps(params.to_dict()),
             }
         ]
     ).to_csv(motion_dir / "best_params_and_alignment.csv", index=False)
-    pd.DataFrame([{"motion_type": "tiaosheng"}]).to_csv(motion_dir / "best_metrics.csv", index=False)
-    pd.DataFrame([{"motion_type": "tiaosheng", "motion_frequency_hz": 1.0}]).to_csv(
+    pd.DataFrame([{"result_schema_version": RESULT_SCHEMA_VERSION, "motion_type": "tiaosheng"}]).to_csv(motion_dir / "best_metrics.csv", index=False)
+    pd.DataFrame([{"result_schema_version": RESULT_SCHEMA_VERSION, "motion_type": "tiaosheng", "motion_frequency_hz": 1.0}]).to_csv(
         motion_dir / "motion_frequency_and_params.csv",
         index=False,
     )
-    (motion_dir / "full_report.json").write_text("{}", encoding="utf-8")
+    (motion_dir / "full_report.json").write_text(json.dumps({"result_schema_version": RESULT_SCHEMA_VERSION}), encoding="utf-8")
 
     original_time = np.arange(10000, dtype=float) / 100.0
     resampled_time = np.arange(5000, dtype=float) / 50.0
@@ -556,6 +409,11 @@ def test_window_diagnostics_resamples_context_to_stage_sample_rate(tmp_path: Pat
         gyroz=np.zeros_like(original_time),
         ref_time_s=original_time,
         ref_hr_bpm=np.full_like(original_time, 72.0),
+        source_imu=SourceImu(100,original_time,np.sin(2 * np.pi * 1.0 * original_time),np.zeros_like(original_time),np.zeros_like(original_time),np.zeros_like(original_time),np.zeros_like(original_time),np.zeros_like(original_time)),
+
+        ppg_clean_green=np.sin(2 * np.pi * 1.2 * original_time),
+        ppg_clean_red=np.zeros_like(original_time),
+        ppg_clean_ir=np.zeros_like(original_time),
     )
     resampled = ProtocolDataset(
         sample_stem="multi_tiaosheng1",
@@ -576,6 +434,11 @@ def test_window_diagnostics_resamples_context_to_stage_sample_rate(tmp_path: Pat
         gyroz=np.zeros_like(resampled_time),
         ref_time_s=resampled_time,
         ref_hr_bpm=np.full_like(resampled_time, 72.0),
+        source_imu=SourceImu(50,resampled_time,np.sin(2 * np.pi * 1.0 * resampled_time),np.zeros_like(resampled_time),np.zeros_like(resampled_time),np.zeros_like(resampled_time),np.zeros_like(resampled_time),np.zeros_like(resampled_time)),
+
+        ppg_clean_green=np.sin(2 * np.pi * 1.2 * resampled_time),
+        ppg_clean_red=np.zeros_like(resampled_time),
+        ppg_clean_ir=np.zeros_like(resampled_time),
     )
     stage_signal_full = np.sin(2 * np.pi * 1.3 * np.arange(1250, dtype=float) / 50.0)
     stage_signal_guarded = np.sin(2 * np.pi * 1.7 * np.arange(1250, dtype=float) / 50.0)
@@ -603,13 +466,13 @@ def test_window_diagnostics_resamples_context_to_stage_sample_rate(tmp_path: Pat
             "fft_end_s": [90.0],
             "adaptive_start_s": [65.0],
             "adaptive_source_start_s": [65.0],
-            "TW_F": [15.0],
+            "prewarm_s": [15.0],
             "fft_offset_samples": [750],
             "fft_input_samples": [500],
             "adaptive_input_samples": [1250],
             "segment_label": ["motion"],
             "ref_hr_bpm": [72.0],
-            "baseline_ppg_hr_bpm": [72.0],
+            "baseline_hr_bpm": [72.0],
             "adaptive_hr_bpm": [78.0],
             "final_hr_bpm": [78.0],
             "penalty_ref_channel": ["accx"],
@@ -620,7 +483,7 @@ def test_window_diagnostics_resamples_context_to_stage_sample_rate(tmp_path: Pat
         success=True,
         reason="",
         target_scope=TargetScope.MOTION_ONLY,
-        cascade_scheme=CascadeScheme.ACC3,
+        reference_config=ReferenceConfig(('ACC',)),
         adaptive_filter="lms",
         params=params,
         objective_aae_bpm=1.0,
@@ -639,9 +502,9 @@ def test_window_diagnostics_resamples_context_to_stage_sample_rate(tmp_path: Pat
     captured: dict[str, dict[str, np.ndarray]] = {}
 
     def fake_spectrum_plot(out_path, **kwargs):
-        variant = "full_cascade" if str(out_path).endswith("_full_cascade.png") else "guarded"
+        variant = "full_cascade" if str(out_path).endswith("_core_enhanced_v1.png") else "guarded"
         captured[variant] = {
-            "raw_ppg": np.asarray(kwargs["raw_ppg"], dtype=float),
+            "algorithm_input_ppg": np.asarray(kwargs["algorithm_input_ppg"], dtype=float),
             "filtered": np.asarray(kwargs["filtered"], dtype=float),
         }
         Path(out_path).write_bytes(b"fake-png")
@@ -662,18 +525,15 @@ def test_window_diagnostics_resamples_context_to_stage_sample_rate(tmp_path: Pat
         mode="all_train",
         target_scope="motion_only",
         adaptive_filter="lms",
-        adaptive_data_type="ACC3",
-        cascade_scheme="ACC3",
-        TW_F=15.0,
-        aligned_fft_start_s=80.0,
+        adaptive_data_type="ACC",
+        reference_config="ACC",
+        prewarm_s=0.0,
+        window_start_s=80.0,
         results_root=tmp_path / "results",
     )
 
-    assert set(captured) == {"full_cascade", "guarded"}
-    assert captured["full_cascade"]["raw_ppg"].size == 500
+    assert set(captured) == {"full_cascade"}
+    assert captured["full_cascade"]["algorithm_input_ppg"].size == 500
     assert captured["full_cascade"]["filtered"].size == 500
-    assert captured["guarded"]["filtered"].size == 500
     assert np.isfinite(captured["full_cascade"]["filtered"]).all()
-    assert np.isfinite(captured["guarded"]["filtered"]).all()
-    assert np.allclose(captured["full_cascade"]["filtered"], stage_signal_full[750:1250])
-    assert np.allclose(captured["guarded"]["filtered"], stage_signal_guarded[750:1250])
+    assert np.allclose(captured["full_cascade"]["filtered"], stage_signal_guarded[750:1250])

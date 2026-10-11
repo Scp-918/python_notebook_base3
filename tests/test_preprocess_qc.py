@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ppg_hr.experimental.preprocess_protocol import SourceImu
+
 from pathlib import Path
 
 import numpy as np
@@ -9,89 +11,18 @@ from scipy.io import savemat
 from ppg_hr.preprocess.data_loader import (
     PYDISPLAY_SENSOR_COLUMNS,
     QC_COLUMNS,
-    SENSOR_COLUMNS,
-    load_dataset,
 )
-from ppg_hr.experimental.alignment import AlignedDataset, AlignmentInfo
+from ppg_hr.experimental.alignment import SensorWindowPlan, AlignmentInfo
 from ppg_hr.experimental.cascade_solver import _TrialBase, _run_windows
 from ppg_hr.experimental.preprocess_protocol import (
     ProtocolDataset,
     apply_ppg_input_transform,
     load_and_preprocess_protocol,
+    resample_protocol_dataset,
 )
 from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams
 from ppg_hr.experimental.segmentation import SegmentInfo
-from ppg_hr.params import CascadeScheme, TargetScope
-
-
-def _sensor_frame(n: int = 180, *, include_time_qc: bool = True) -> pd.DataFrame:
-    t = np.arange(n, dtype=float) / 100.0
-    frame = pd.DataFrame(
-        {
-            "Uc1(mV)": 800.0 + np.sin(t),
-            "Uc2(mV)": 810.0 + np.cos(t),
-            "Ut1(mV)": 1600.0 + np.sin(2 * t),
-            "Ut2(mV)": 1610.0 + np.cos(2 * t),
-            "AccX(g)": 0.02 * np.sin(2 * np.pi * t),
-            "AccY(g)": 0.01 * np.cos(2 * np.pi * t),
-            "AccZ(g)": 1.0 + 0.01 * np.sin(2 * np.pi * t),
-            "GyroX(dps)": 0.1 * np.sin(t),
-            "GyroY(dps)": 0.1 * np.cos(t),
-            "GyroZ(dps)": 0.1 * np.sin(2 * t),
-            "PPG_Green": 6000.0 + 100.0 * np.sin(2 * np.pi * 1.2 * t),
-            "PPG_Red": 6500.0 + 80.0 * np.sin(2 * np.pi * 1.1 * t),
-            "PPG_IR": 7000.0 + 60.0 * np.sin(2 * np.pi * 1.0 * t),
-        }
-    )
-    if include_time_qc:
-        frame.insert(0, "MissingBefore", np.where(np.arange(n) == 20, 3, 0))
-        frame.insert(0, "GapLen", np.where(np.arange(n) == 20, 3, 0))
-        frame.insert(0, "InterpFlag", np.where(np.arange(n) % 11 == 0, 1, 0))
-        frame.insert(0, "ValidFlag", np.where(np.arange(n) < 5, 0, 1))
-        frame.insert(0, "Seq", 1000 + np.arange(n))
-        frame.insert(0, "SampleIndex", np.arange(n))
-        frame.insert(0, "Time(s)", 12.5 + t)
-    return frame
-
-
-def _ref_csv(path: Path) -> Path:
-    path.write_text("a,b,c\nx,y,z\n1,2,3\n0,0,72\n1,1,73\n2,2,74\n", encoding="utf-8")
-    return path
-
-
-def _protocol_ref_csv(path: Path) -> Path:
-    pd.DataFrame({"time_s": [0.0, 1.0, 2.0], "hr_bpm": [72.0, 73.0, 74.0]}).to_csv(path, index=False)
-    return path
-
-
-def test_load_dataset_preserves_new_time_and_qc_columns(tmp_path: Path) -> None:
-    sensor_csv = tmp_path / "new_layout.csv"
-    ref_csv = _ref_csv(tmp_path / "ref.csv")
-    frame = _sensor_frame(include_time_qc=True)
-    shuffled = frame[["PPG_IR", "Time(s)", "SampleIndex", *[SENSOR_COLUMNS[k] for k in SENSOR_COLUMNS if k != "PPG_IR"], "Seq", "ValidFlag", "InterpFlag", "GapLen", "MissingBefore"]]
-    shuffled.to_csv(sensor_csv, index=False)
-
-    dataset = load_dataset(sensor_csv, ref_csv)
-
-    assert np.isclose(dataset.data["Time_s"].iloc[0], 12.5)
-    for column in QC_COLUMNS:
-        assert column in dataset.data.columns
-    assert dataset.data["SampleIndex"].iloc[3] == 3
-    assert dataset.data["ValidFlag"].iloc[0] == 0
-
-
-def test_load_dataset_fills_default_qc_for_old_layout(tmp_path: Path) -> None:
-    sensor_csv = tmp_path / "old_layout.csv"
-    ref_csv = _ref_csv(tmp_path / "ref.csv")
-    _sensor_frame(include_time_qc=False).to_csv(sensor_csv, index=False)
-
-    dataset = load_dataset(sensor_csv, ref_csv)
-
-    assert np.allclose(dataset.data["Time_s"].iloc[:3], [0.0, 0.01, 0.02])
-    assert dataset.data["ValidFlag"].eq(1).all()
-    assert dataset.data["InterpFlag"].eq(0).all()
-    assert dataset.data["GapLen"].eq(0).all()
-    assert dataset.data["SampleIndex"].iloc[-1] == len(dataset.data) - 1
+from ppg_hr.params import ReferenceConfig, TargetScope
 
 
 def test_protocol_loader_carries_qc_metadata_into_frame(tmp_path: Path) -> None:
@@ -116,6 +47,7 @@ def test_protocol_loader_carries_qc_metadata_into_frame(tmp_path: Path) -> None:
     sensor["Uh4"] = 2.0
     sensor["Uc2"] = 0.5
     sensor["Uc3"] = 1.0
+    sensor.loc[40, "PPG_G"] = 1e6
     sensor.to_csv(sensor_csv, index=False)
     pd.DataFrame(
         {"elapsed_seconds": [0.0, 1.0, 2.0], "hr_bpm": [72.0, 73.0, 74.0]}
@@ -141,6 +73,22 @@ def test_protocol_loader_carries_qc_metadata_into_frame(tmp_path: Path) -> None:
     assert np.isclose(frame["time_s"].iloc[0], 0.0)
     assert frame["ValidFlag"].iloc[20] == 0
     assert frame["InterpFlag"].iloc[20] == 1
+    acquired = dataset.ppg_acquired_raw
+    assert acquired.green[41] == 1e6
+    assert np.isnan(acquired.green[20])
+    assert dataset.ppg_clean_green[41] != 1e6
+    assert np.isfinite(dataset.ppg_clean_green).all()
+    quality = dataset.interface_quality_input
+    assert quality.ppg_acquired_raw is acquired
+    assert np.isnan(quality.ud_calculation[20]).all()
+    original_quality_ud = quality.ud_calculation.copy()
+    dataset.ud1[0] = 99.0
+    np.testing.assert_allclose(quality.ud_calculation, original_quality_ud, equal_nan=True)
+    resampled = resample_protocol_dataset(dataset, 25)
+    assert resampled.fs == 25
+    assert resampled.ppg_acquired_raw is acquired
+    assert resampled.interface_quality_input is quality
+    assert acquired.fs == 100 and len(acquired.green) == n + 1
 
 
 def test_log_absorbance_transform_outputs_finite_ppg_with_original_length() -> None:
@@ -167,9 +115,10 @@ def test_log_absorbance_transform_outputs_finite_ppg_with_original_length() -> N
         gyroz=zeros,
         ref_time_s=np.asarray([0.0, 1.0]),
         ref_hr_bpm=np.asarray([72.0, 73.0]),
-        raw_ppg_green=raw,
-        raw_ppg_red=raw + 10.0,
-        raw_ppg_ir=raw + 20.0,
+        ppg_clean_green=raw,
+        ppg_clean_red=raw + 10.0,
+        ppg_clean_ir=raw + 20.0,
+        source_imu=SourceImu(fs,t,zeros,zeros,zeros,zeros,zeros,zeros),
     )
 
     transformed = apply_ppg_input_transform(
@@ -207,9 +156,10 @@ def test_log_absorbance_transform_handles_zero_and_negative_ppg() -> None:
         gyroz=zeros,
         ref_time_s=np.asarray([0.0, 1.0]),
         ref_hr_bpm=np.asarray([72.0, 73.0]),
-        raw_ppg_green=raw,
-        raw_ppg_red=raw,
-        raw_ppg_ir=raw,
+        ppg_clean_green=raw,
+        ppg_clean_red=raw,
+        ppg_clean_ir=raw,
+        source_imu=SourceImu(fs,t,zeros,zeros,zeros,zeros,zeros,zeros),
     )
 
     transformed = apply_ppg_input_transform(
@@ -223,7 +173,7 @@ def test_log_absorbance_transform_handles_zero_and_negative_ppg() -> None:
 
 def test_window_qc_stats_default_to_fallback_baseline() -> None:
     fs = 20
-    n = fs * 4
+    n = fs * 12
     t = np.arange(n, dtype=float) / fs
     ppg = np.sin(2 * np.pi * 1.2 * t)
     zeros = np.zeros_like(t)
@@ -231,12 +181,13 @@ def test_window_qc_stats_default_to_fallback_baseline() -> None:
         {
             "SampleIndex": np.arange(n),
             "Seq": np.arange(n),
-            "ValidFlag": np.r_[np.zeros(fs * 2), np.ones(fs * 2)],
-            "InterpFlag": np.r_[np.ones(fs * 2), np.zeros(fs * 2)],
-            "GapLen": np.r_[np.full(fs * 2, 5), np.zeros(fs * 2)],
-            "MissingBefore": np.r_[np.full(fs * 2, 1), np.zeros(fs * 2)],
-            "raw_missing_any": np.r_[np.ones(fs * 2), np.zeros(fs * 2)],
-            "raw_missing_count": np.r_[np.ones(fs * 2), np.zeros(fs * 2)],
+            "ValidFlag": np.r_[np.zeros(fs * 3), np.ones(fs * 9)],
+            "InterpFlag": np.r_[np.ones(fs * 3), np.zeros(fs * 9)],
+            "GapLen": np.r_[np.full(fs * 3, 5), np.zeros(fs * 9)],
+            "MissingBefore": np.r_[np.full(fs * 3, 1), np.zeros(fs * 9)],
+            "raw_missing_any": np.r_[np.ones(fs * 3), np.zeros(fs * 9)],
+            "raw_missing_count": np.r_[np.ones(fs * 3), np.zeros(fs * 9)],
+            "ud_denominator_near_zero": np.zeros(n),
         }
     )
     dataset = ProtocolDataset(
@@ -259,27 +210,32 @@ def test_window_qc_stats_default_to_fallback_baseline() -> None:
         ref_time_s=np.asarray([0.0, 1.0, 2.0, 3.0]),
         ref_hr_bpm=np.full(4, 72.0),
         qc=qc,
+        source_imu=SourceImu(fs,t,ppg,zeros,zeros,zeros,zeros,zeros),
+
+        ppg_clean_green=ppg,
+        ppg_clean_red=ppg,
+        ppg_clean_ir=ppg,
     )
     segment = SegmentInfo(
         status="ok",
         reason="",
         motion_start_s=0.0,
-        motion_end_s=4.0,
+        motion_end_s=12.0,
         motion_threshold=0.0,
-        window_starts_s=np.asarray([0.0, 2.0]),
-        window_centers_s=np.asarray([1.0, 3.0]),
+        window_starts_s=np.asarray([0.0, 4.0]),
+        window_centers_s=np.asarray([4.0, 8.0]),
         window_std=np.asarray([], dtype=float),
         motion_flags=np.asarray([], dtype=bool),
         labels=np.asarray(["motion", "motion"], dtype=object),
+        motion_runs=((0.0,12.0),),
     )
-    aligned = AlignedDataset(
+    aligned = SensorWindowPlan(
         dataset=dataset,
         segment_info=segment,
-        alignment_info=AlignmentInfo(0.0, {0.0: 0.0}, 1.0, 2, train_tw_s=2.0),
-        window_starts_s=np.asarray([0.0, 2.0]),
-        window_centers_s=np.asarray([1.0, 3.0]),
+        alignment_info=AlignmentInfo(0.0, {0.0: 0.0}, 1.0, 2, hr_window_s=8),
+        window_starts_s=np.asarray([0.0, 4.0]),
+        window_centers_s=np.asarray([4.0, 8.0]),
         segment_labels=np.asarray(["motion", "motion"], dtype=object),
-        ref_hr_bpm=np.asarray([72.0, 72.0]),
         rest_indices=np.asarray([], dtype=int),
         motion_indices=np.asarray([0, 1], dtype=int),
         recovery_indices=np.asarray([], dtype=int),
@@ -288,9 +244,9 @@ def test_window_qc_stats_default_to_fallback_baseline() -> None:
 
     frame = _run_windows(
         base,
-        CascadeScheme.ACC3,
+        ReferenceConfig(('ACC',)),
         TargetScope.MOTION_ONLY,
-        ProtocolTrialParams(Fs_Target=fs, TW=2, max_order=4, K_max=2),
+        ProtocolTrialParams(Fs_Target=fs, hr_window_s=8, memory_ms=4, K_max=2),
         1.2,
         collect_frame=True,
         collect_stages=True,

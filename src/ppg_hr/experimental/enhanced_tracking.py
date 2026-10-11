@@ -8,10 +8,11 @@ from typing import Any
 import numpy as np
 from scipy.signal import find_peaks
 
+from .penalty_policy import PenaltyPolicy
+
 __all__ = ["SpectrumTrackingState", "SpectrumTrackingTrace", "track_spectrum_candidates"]
 
 _EDGE_GUARD_BPM = 1.0
-_MIN_EFFECTIVE_PENALTY_CONFIDENCE = 0.9
 _CHALLENGER_MIN_AMP_RATIO = 0.45
 
 
@@ -96,6 +97,7 @@ def track_spectrum_candidates(
     penalty_peaks_hz: np.ndarray | None = None,
     penalty_peak_amplitudes: np.ndarray | None = None,
     adaptive_filter: str = "lms",
+    penalty_evidence_peaks_hz: np.ndarray | None = None,
 ) -> tuple[float, SpectrumTrackingTrace]:
     """Select and track one HR candidate without using reference HR."""
 
@@ -115,46 +117,35 @@ def track_spectrum_candidates(
     penalty_enabled = bool(enable_penalty and getattr(params, "enable_dynamic_penalty", True))
     penalty_centers: tuple[float, ...] = ()
     confidence = 1.0
-    effective_weight = float(getattr(params, "Spec_Penalty_Weight", 0.4))
     if penalty_enabled and penalty_peaks_hz is not None and np.asarray(penalty_peaks_hz).size:
         penalty_freq = np.asarray(penalty_peaks_hz, dtype=float)
         penalty_amp = np.asarray(
             penalty_peak_amplitudes if penalty_peak_amplitudes is not None else np.ones(penalty_freq.size),
             dtype=float,
         )
-        order = np.argsort(-penalty_amp, kind="stable")
-        main_bpm = float(penalty_freq[order[0]]) * 60.0
-        confidence = _penalty_confidence(penalty_amp)
-        effective_weight = _effective_penalty_weight(effective_weight, confidence)
-        centers = [main_bpm]
-        harmonic = 2.0 * main_bpm
-        width_bpm = float(getattr(params, "Spec_Penalty_Width", 0.2)) * 60.0
-        if _has_peak_near(freq[peak_idx] * 60.0, harmonic, width_bpm):
-            centers.append(harmonic)
-        penalty_centers = tuple(centers)
+        policy = PenaltyPolicy.build(
+            penalty_freq, penalty_amp,
+            freq[peak_idx] if penalty_evidence_peaks_hz is None else penalty_evidence_peaks_hz,
+            width_hz=float(params.Spec_Penalty_Width), base_retention=float(params.Spec_Penalty_Weight),
+        )
+        penalty_centers = tuple(center * 60 for center in policy.centers_hz)
+        confidence = policy.confidence
     else:
+        policy = PenaltyPolicy((), 1.0, float(params.Spec_Penalty_Width), 1.0)
         penalty_enabled = False
 
-    width_bpm = float(getattr(params, "Spec_Penalty_Width", 0.2)) * 60.0
+    width_bpm = policy.width_hz * 60.0
     freq_bpm = freq * 60.0
-    weights, protected, nominal = _penalty_weights(
-        freq_bpm,
-        penalty_centers,
-        width_bpm,
-        effective_weight,
-        previous if bool(getattr(params, "enable_continuity_protection", True)) and window_kind == "motion" else None,
-        min(
-            directional.range_up_bpm,
-            directional.range_down_bpm,
-            max(directional.step_up_bpm, directional.step_down_bpm),
-        ),
-    )
+    weights = policy.build_weights(freq)
+    nominal = weights < 1.0
+    protected = np.zeros(weights.shape, dtype=bool)
+    protection_width = min(directional.range_up_bpm, directional.range_down_bpm,
+                           max(directional.step_up_bpm, directional.step_down_bpm))
+    if previous is not None and params.enable_continuity_protection and window_kind == "motion":
+        protected = np.abs(freq_bpm - previous) <= protection_width
+        weights[protected] = 1.0
     scores = amps * weights
     selectable = raw_order
-    if penalty_enabled and window_kind == "motion":
-        blocked = nominal & ~protected
-        preferred = raw_order[~blocked[raw_order]]
-        selectable = preferred
     scored_order = selectable[np.argsort(-scores[selectable], kind="stable")]
     all_order = raw_order[np.argsort(-scores[raw_order], kind="stable")]
 
@@ -321,58 +312,7 @@ def _directional_tracking_params(params: object, *, path: str, window_kind: str)
             step_down_bpm=float(getattr(params, f"{prefix}_tracking_slew_step_down_bpm", defaults[5])),
         )
 
-    shared_names = (
-        "tracking_range_up_bpm",
-        "tracking_range_down_bpm",
-        "tracking_slew_limit_up_bpm",
-        "tracking_slew_step_up_bpm",
-        "tracking_slew_limit_down_bpm",
-        "tracking_slew_step_down_bpm",
-    )
-    resolved = list(values.__dict__.values())
-    for idx, name in enumerate(shared_names):
-        override = getattr(params, name, None)
-        if override is not None:
-            resolved[idx] = float(override)
-    return _DirectionalTrackingParams(*resolved)
-
-
-def _penalty_confidence(values: np.ndarray) -> float:
-    amps = np.asarray(values, dtype=float)
-    amps = np.sort(amps[np.isfinite(amps) & (amps > 0)])[::-1]
-    if not amps.size:
-        return 0.0
-    if amps.size == 1:
-        return 1.0
-    return float(np.clip((amps[0] - amps[1]) / amps[0], 0.0, 1.0))
-
-
-def _effective_penalty_weight(base: float, confidence: float) -> float:
-    floor = float(np.clip(base, 0.0, 1.0))
-    effective = max(float(np.clip(confidence, 0.0, 1.0)), _MIN_EFFECTIVE_PENALTY_CONFIDENCE)
-    return 1.0 - effective * (1.0 - floor)
-
-
-def _has_peak_near(peaks_bpm: np.ndarray, target: float, width: float) -> bool:
-    return bool(np.any(np.abs(np.asarray(peaks_bpm) - target) <= max(width, _EDGE_GUARD_BPM)))
-
-
-def _penalty_weights(freq_bpm, centers, width, weight, previous, protection_width):
-    weights = np.ones(np.asarray(freq_bpm).shape)
-    protected = np.zeros(weights.shape, dtype=bool)
-    nominal = np.zeros(weights.shape, dtype=bool)
-    if previous is not None and protection_width > 0:
-        protected = np.abs(freq_bpm - previous) <= protection_width
-    if width > 0:
-        for center in centers:
-            distance = np.abs(freq_bpm - center)
-            inside = distance < width
-            nominal |= inside
-            weights[inside] = np.minimum(
-                weights[inside], weight + (1.0 - weight) * distance[inside] / width
-            )
-    weights[protected] = 1.0
-    return weights, protected, nominal
+    return values
 
 
 def _first_in_range(freq_bpm, order, low, high):

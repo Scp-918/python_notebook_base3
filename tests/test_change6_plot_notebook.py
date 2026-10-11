@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ppg_hr.experimental.preprocess_protocol import SourceImu
+
 from pathlib import Path
 
 import nbformat
@@ -9,7 +11,7 @@ from ppg_hr.experimental.preprocess_protocol import ProtocolDataset
 from ppg_hr.experimental.protocol_outputs import _plot_groups, _plot_motion_bandpass
 from ppg_hr.experimental.run_batch_protocol import _scan_stage6_motion_dirs
 from ppg_hr.experimental.segmentation import SegmentInfo
-from ppg_hr.params import CascadeScheme, MotionType
+from ppg_hr.params import MotionType, DEFAULT_REFERENCE_CONFIGS
 
 
 def _dataset() -> ProtocolDataset:
@@ -39,6 +41,11 @@ def _dataset() -> ProtocolDataset:
         gyroz=zeros,
         ref_time_s=np.asarray([0.0, 1.0, 2.0]),
         ref_hr_bpm=np.asarray([72.0, 72.0, 72.0]),
+        source_imu=SourceImu(100,t,zeros,zeros,zeros,zeros,zeros,zeros),
+
+        ppg_clean_green=wave,
+        ppg_clean_red=wave,
+        ppg_clean_ir=wave,
     )
 
 
@@ -49,7 +56,7 @@ def test_new_signal_groups_and_motion_plot_smoke(tmp_path: Path) -> None:
     import matplotlib.pyplot as plt
 
     groups = _plot_groups()
-    assert [item[0] for item in groups[:4]] == ["HF2", "HF2comp", "CF2", "UD2"]
+    assert [item[0] for item in groups[:4]] == ["HF", "HFcomp", "CF2", "UD"]
     assert groups[0][2] == ["hf1", "hf2"]
     assert groups[1][2] == ["hfcomp1", "hfcomp2"]
     assert groups[3][2] == ["ud1", "ud2"]
@@ -65,13 +72,14 @@ def test_new_signal_groups_and_motion_plot_smoke(tmp_path: Path) -> None:
         window_std=np.asarray([1.0]),
         motion_flags=np.asarray([True]),
         labels=np.asarray(["motion"], dtype=object),
+        motion_runs=((0.5,2.5),),
     )
 
     _plot_motion_bandpass(plt, _dataset(), segment, path, "subject_name_write_1", "write")
 
     assert path.exists() and path.stat().st_size > 0
-    assert [scheme.display_name for scheme in CascadeScheme] == [
-        "ACC", "HF2", "UD2", "ACC+HF2", "HF2+CF2", "ACC+UD2"
+    assert [scheme.reference_order_key for scheme in DEFAULT_REFERENCE_CONFIGS] == [
+        "ACC", "HF", "UD", "ACC+HF", "HF+CF", "ACC+UD"
     ]
 
 
@@ -95,18 +103,10 @@ def test_notebook_has_single_subject_and_tracker_switches_and_all_code_compiles(
 
     assert "SUBJECT_DIR" in first
     assert "INPUT_DIR" not in first and "TESTDATA_DIR" not in first
-    assert "TRACKER_MODE = \"enhanced\"" in first
-    for name in (
-        "ENABLE_DIRECTIONAL_TRACKING",
-        "ENABLE_DYNAMIC_PENALTY",
-        "ENABLE_CONTINUITY_PROTECTION",
-        "ENABLE_LOW_LOCK_RECOVERY",
-        "ENABLE_HIGH_LOCK_RECOVERY",
-        "ENABLE_POST_MOTION_PROTECTION",
-    ):
-        assert f"{name} = True" in first
+    assert "CORE_PARAMS = resolve_core_config()" in first
+    assert "ENABLE_LOW_LOCK_RECOVERY = True" not in first
     assert all(motion.value in first for motion in MotionType)
-    assert "multi_" not in "\n".join(str(cell.source) for cell in code_cells)
+    assert "multi_tiaosheng" not in "\n".join(str(cell.source) for cell in code_cells)
     assert "D:\\" not in "\n".join(str(cell.source) for cell in code_cells)
     for index, cell in enumerate(code_cells):
         compile(str(cell.source), f"{path.name}:cell-{index}", "exec")

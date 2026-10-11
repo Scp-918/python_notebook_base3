@@ -16,7 +16,7 @@ __all__ = ["CalibrationCoefficients", "load_subject_calibration"]
 
 @dataclass(frozen=True)
 class CalibrationCoefficients:
-    """Validated coefficients used to derive HF2 and UD2."""
+    """Validated coefficients used to derive HF and UD."""
 
     source_path: Path
     source_sha256: str

@@ -1,7 +1,7 @@
-"""Optuna optimiser compatibility helpers for protocol modes.
+"""Single-record Optuna optimisation helpers for protocol modes.
 
 中文说明：新主流程按 motion_type 分组训练，主要逻辑在 ``run_batch_protocol``。
-本模块保留旧的单样本优化 API，便于历史脚本继续调用，同时支持
+本模块提供单样本优化工具，组级 batch 流程使用 run_batch_protocol；支持
 ``lms``、``volterra`` 和 ``rff_lms`` 三种滤波器。
 """
 
@@ -22,7 +22,7 @@ except ModuleNotFoundError:  # pragma: no cover - only used in lean environments
     optuna = None
     TPESampler = None
 
-from ..params import CascadeScheme, ProtocolParams, TargetScope
+from ..params import DEFAULT_REFERENCE_CONFIGS, ReferenceConfig, ProtocolParams, TargetScope
 from .cascade_solver import ProtocolRunResult, run_protocol_trial
 from .preprocess_protocol import ProtocolDataset
 from .protocol_search_space import (
@@ -47,7 +47,7 @@ class ProtocolModeResult:
     """Optimisation result for one target-scope/cascade/filter mode."""
 
     target_scope: TargetScope
-    cascade_scheme: CascadeScheme
+    reference_config: ReferenceConfig
     best_params: ProtocolTrialParams
     best_aae_bpm: float
     baseline_aae_bpm: float
@@ -71,7 +71,7 @@ class ProtocolModeResult:
     def mode_key(self) -> str:
         """Stable key used in JSON reports."""
 
-        return f"{self.target_scope.value}__{self.cascade_scheme.value}__{self.adaptive_filter}"
+        return f"{self.target_scope.value}__{self.reference_config.reference_order_key}__{self.adaptive_filter}"
 
 
 def optimise_all_protocol_modes(
@@ -80,7 +80,7 @@ def optimise_all_protocol_modes(
     config: ProtocolParams | None = None,
     space: ProtocolSearchSpace | None = None,
     target_scopes: list[TargetScope] | None = None,
-    cascade_schemes: list[CascadeScheme] | None = None,
+    reference_group_orders: list[ReferenceConfig] | None = None,
     adaptive_filters: list[str] | None = None,
     objective_mode: str = "aae",
     on_progress: Any | None = None,
@@ -90,14 +90,14 @@ def optimise_all_protocol_modes(
     config = config or ProtocolParams()
     space = space or default_protocol_search_space()
     target_scopes = target_scopes or [TargetScope.MOTION_ONLY, TargetScope.MOTION_AND_RECOVERY]
-    cascade_schemes = cascade_schemes or list(CascadeScheme)
+    reference_group_orders = reference_group_orders or list(DEFAULT_REFERENCE_CONFIGS)
     adaptive_filters = adaptive_filters or ["lms"]
 
     results: list[ProtocolModeResult] = []
-    total = len(target_scopes) * len(cascade_schemes) * len(adaptive_filters)
+    total = len(target_scopes) * len(reference_group_orders) * len(adaptive_filters)
     idx = 0
     for scope in target_scopes:
-        for scheme in cascade_schemes:
+        for scheme in reference_group_orders:
             for adaptive_filter in adaptive_filters:
                 idx += 1
                 payload = {
@@ -107,7 +107,7 @@ def optimise_all_protocol_modes(
                     "mode_total": total,
                     "target_scope": scope.name,
                     "target_scope_value": scope.value,
-                    "cascade_scheme": scheme.value,
+                    "reference_order_key": scheme.reference_order_key,
                     "adaptive_filter": adaptive_filter,
                 }
                 if on_progress is not None:
@@ -115,7 +115,7 @@ def optimise_all_protocol_modes(
                 results.append(
                     optimise_protocol_mode(
                         dataset,
-                        cascade_scheme=scheme,
+                        reference_config=scheme,
                         target_scope=scope,
                         adaptive_filter=adaptive_filter,
                         objective_mode=objective_mode,
@@ -131,7 +131,7 @@ def optimise_all_protocol_modes(
 def optimise_protocol_mode(
     dataset: ProtocolDataset,
     *,
-    cascade_scheme: CascadeScheme | str,
+    reference_config: ReferenceConfig | tuple[str, ...],
     target_scope: TargetScope | str,
     adaptive_filter: str = "lms",
     objective_mode: str = "aae",
@@ -148,7 +148,7 @@ def optimise_protocol_mode(
 
     cfg = config or ProtocolParams()
     space = space or default_protocol_search_space()
-    scheme = CascadeScheme(cascade_scheme)
+    scheme = ReferenceConfig(reference_config)
     scope = TargetScope(target_scope)
     adaptive_filter = str(adaptive_filter)
     objective_mode = str(objective_mode)
@@ -172,7 +172,7 @@ def optimise_protocol_mode(
                 nonlocal best_value, best_params, best_repeat_idx, best_seen
 
                 idx_map = {
-                    name: trial.suggest_int(name, 0, len(space.options(name)) - 1)
+                    name: trial.suggest_int(name, 0, len(space.options(name, adaptive_filter=adaptive_filter)) - 1)
                     for name in space.names_for_filter(adaptive_filter)
                 }
                 params = _decode_with_seed(
@@ -180,7 +180,7 @@ def optimise_protocol_mode(
                     idx_map,
                     adaptive_filter=adaptive_filter,
                     objective_mode=objective_mode,
-                    mode_key=f"{scope.value}__{scheme.value}__{adaptive_filter}",
+                    mode_key=f"{scope.value}__{scheme.reference_order_key}__{adaptive_filter}",
                     repeat_idx=repeat_idx,
                     random_state=cfg.random_state,
                 )
@@ -200,7 +200,7 @@ def optimise_protocol_mode(
             rng = np.random.default_rng(int(cfg.random_state) + repeat_idx)
             for trial_idx in range(int(cfg.max_iterations)):
                 idx_map = {
-                    name: int(rng.integers(0, len(space.options(name))))
+                    name: int(rng.integers(0, len(space.options(name, adaptive_filter=adaptive_filter))))
                     for name in space.names_for_filter(adaptive_filter)
                 }
                 params = _decode_with_seed(
@@ -208,7 +208,7 @@ def optimise_protocol_mode(
                     idx_map,
                     adaptive_filter=adaptive_filter,
                     objective_mode=objective_mode,
-                    mode_key=f"{scope.value}__{scheme.value}__{adaptive_filter}",
+                    mode_key=f"{scope.value}__{scheme.reference_order_key}__{adaptive_filter}",
                     repeat_idx=repeat_idx,
                     random_state=cfg.random_state,
                 )
@@ -226,7 +226,7 @@ def optimise_protocol_mode(
     final_value = _objective_value(best_run, objective_mode, cfg.penalty_value)
     return ProtocolModeResult(
         target_scope=scope,
-        cascade_scheme=scheme,
+        reference_config=scheme,
         best_params=best_params,
         best_aae_bpm=float(best_run.final_aae_bpm) if best_run.success else float(final_value),
         baseline_aae_bpm=float(best_run.baseline_aae_bpm),
@@ -244,7 +244,7 @@ def optimise_protocol_mode(
         debug_mode=bool(cfg.debug_mode),
         adaptive_filter=adaptive_filter,
         objective_mode=objective_mode,
-        search_space={name: space.options(name) for name in space.names_for_filter(adaptive_filter)},
+        search_space={name: space.options(name, adaptive_filter=adaptive_filter) for name in space.names_for_filter(adaptive_filter)},
     )
 
 
@@ -255,11 +255,8 @@ def _default_trial_params(
 ) -> ProtocolTrialParams:
     values: dict[str, Any] = {}
     for name in space.names_for_filter(adaptive_filter):
-        value = space.options(name)[0]
-        if name == "RFF_LMS_Mu_Base":
-            values["LMS_Mu_Base"] = value
-        else:
-            values[name] = value
+        value = space.options(name, adaptive_filter=adaptive_filter)[0]
+        values[name] = value
     values["adaptive_filter"] = adaptive_filter
     values["objective_mode"] = objective_mode
     return ProtocolTrialParams(**values)
@@ -295,7 +292,7 @@ def _decode_with_seed(
 
 def _cached_run(
     dataset: ProtocolDataset,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     scope: TargetScope,
     params: ProtocolTrialParams,
     cache: dict[tuple[tuple[str, Any], ...], ProtocolRunResult],

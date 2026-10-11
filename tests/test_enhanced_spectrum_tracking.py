@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from ppg_hr.experimental.cascade_solver import _extract_fft_hr
+from ppg_hr.experimental.cascade_solver import _track_candidate_spectrum
 from ppg_hr.experimental.enhanced_tracking import SpectrumTrackingState, track_spectrum_candidates
 from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams
 
@@ -17,15 +17,29 @@ def _spectrum(peaks: dict[float, float]) -> tuple[np.ndarray, np.ndarray]:
     return freq, amp
 
 
+def test_soft_penalty_keeps_a_strong_penalized_candidate_selectable() -> None:
+    freq, amp = _spectrum({110: 10.0, 120: 1.6})
+    hr, trace = track_spectrum_candidates(
+        freq, amp, previous_hr_bpm=105.0,
+        params=ProtocolTrialParams(enable_continuity_protection=False),
+        state=SpectrumTrackingState(), window_kind="motion", path="adaptive",
+        enable_penalty=True, penalty_peaks_hz=np.array([110 / 60]),
+        penalty_peak_amplitudes=np.array([1.0]),
+    )
+    assert trace.penalty_applied
+    assert trace.tracked_hr_bpm == pytest.approx(110.0)
+    assert hr == pytest.approx(110.0)
+
+
 def test_directional_tracking_uses_asymmetric_range_and_slew() -> None:
     freq, amp = _spectrum({84: 0.8, 120: 1.0})
     params = ProtocolTrialParams(
-        tracking_range_up_bpm=12.0,
-        tracking_range_down_bpm=30.0,
-        tracking_slew_limit_up_bpm=6.0,
-        tracking_slew_step_up_bpm=3.0,
-        tracking_slew_limit_down_bpm=30.0,
-        tracking_slew_step_down_bpm=20.0,
+        motion_tracking_range_up_bpm=12.0,
+        motion_tracking_range_down_bpm=30.0,
+        motion_tracking_slew_limit_up_bpm=6.0,
+        motion_tracking_slew_step_up_bpm=3.0,
+        motion_tracking_slew_limit_down_bpm=30.0,
+        motion_tracking_slew_step_down_bpm=20.0,
     )
 
     hr, trace = track_spectrum_candidates(
@@ -43,10 +57,10 @@ def test_directional_tracking_uses_asymmetric_range_and_slew() -> None:
     assert trace.search_max_bpm == pytest.approx(102.0)
     freq2, amp2 = _spectrum({120: 1.0})
     slew_params = ProtocolTrialParams(
-        tracking_range_up_bpm=40.0,
-        tracking_range_down_bpm=40.0,
-        tracking_slew_limit_up_bpm=6.0,
-        tracking_slew_step_up_bpm=3.0,
+        motion_tracking_range_up_bpm=40.0,
+        motion_tracking_range_down_bpm=40.0,
+        motion_tracking_slew_limit_up_bpm=6.0,
+        motion_tracking_slew_step_up_bpm=3.0,
     )
     hr2, _ = track_spectrum_candidates(
         freq2,
@@ -136,28 +150,6 @@ def test_post_motion_reset_uses_reference_specific_recovery_slew() -> None:
     assert reset_hr == pytest.approx(97.0)
 
 
-def test_deprecated_shared_directional_fields_explicitly_override_all_stages() -> None:
-    freq, amp = _spectrum({120: 1.0})
-    params = ProtocolTrialParams(
-        tracking_range_up_bpm=40.0,
-        tracking_slew_limit_up_bpm=6.0,
-        tracking_slew_step_up_bpm=3.0,
-    )
-
-    for window_kind, path in (("rest", "baseline"), ("motion", "adaptive"), ("recovery", "adaptive")):
-        hr, trace = track_spectrum_candidates(
-            freq,
-            amp,
-            previous_hr_bpm=90.0,
-            params=params,
-            state=SpectrumTrackingState(),
-            window_kind=window_kind,
-            path=path,
-        )
-        assert trace.search_max_bpm == pytest.approx(130.0)
-        assert hr == pytest.approx(93.0)
-
-
 def test_dynamic_penalty_uses_confidence_and_only_existing_harmonic() -> None:
     freq, amp = _spectrum({60: 1.0, 120: 0.8, 150: 0.7})
     _, trace = track_spectrum_candidates(
@@ -205,7 +197,7 @@ def test_reference_candidate_thresholds_keep_full_ppg_but_filter_motion_peaks() 
         full_candidate_peak_threshold_ratio=0.15,
     )
 
-    _, trace = _extract_fft_hr(
+    _, trace = _track_candidate_spectrum(
         np.ones(t.size),
         fs,
         None,
@@ -253,9 +245,9 @@ def test_continuity_protection_can_yield_to_strong_non_penalty_challenger() -> N
         amp,
         previous_hr_bpm=137.0,
         params=ProtocolTrialParams(
-            tracking_range_up_bpm=25.0,
-            tracking_range_down_bpm=25.0,
-            tracking_slew_limit_down_bpm=30.0,
+            motion_tracking_range_up_bpm=25.0,
+            motion_tracking_range_down_bpm=25.0,
+            motion_tracking_slew_limit_down_bpm=30.0,
         ),
         state=SpectrumTrackingState(),
         window_kind="motion",
@@ -274,7 +266,7 @@ def test_continuity_protection_can_yield_to_strong_non_penalty_challenger() -> N
 def test_low_lock_recovery_confirms_then_moves_toward_stable_challenger() -> None:
     freq, amp = _spectrum({65: 0.8, 110: 1.0})
     state = SpectrumTrackingState(low_lock_count=4)
-    params = ProtocolTrialParams(low_lock_confirm_windows=3, low_lock_step_bpm=30.0)
+    params = ProtocolTrialParams(enable_low_lock_recovery=True,low_lock_confirm_windows=3, low_lock_step_bpm=30.0)
     outputs = []
     traces = []
     previous = 65.0
@@ -313,7 +305,7 @@ def test_low_lock_recovery_confirms_then_moves_toward_stable_challenger() -> Non
 def test_high_lock_recovery_records_risk_confirmation_and_cooldown() -> None:
     freq, amp = _spectrum({100: 0.8, 145: 1.0})
     state = SpectrumTrackingState()
-    params = ProtocolTrialParams(high_lock_confirm_windows=2, high_lock_cooldown_windows=3)
+    params = ProtocolTrialParams(enable_high_lock_recovery=True,high_lock_confirm_windows=2, high_lock_cooldown_windows=3)
     previous = 145.0
     traces = []
     for _ in range(2):
@@ -347,23 +339,9 @@ def test_high_lock_recovery_records_risk_confirmation_and_cooldown() -> None:
     assert trace.high_lock_cooldown >= 0
 
 
-def test_legacy_equals_enhanced_with_all_six_features_disabled() -> None:
-    freq, amp = _spectrum({72: 0.8, 126: 1.0})
-    legacy = ProtocolTrialParams(tracker_mode="legacy")
-    disabled = ProtocolTrialParams(
-        tracker_mode="enhanced",
-        enable_directional_tracking=False,
-        enable_dynamic_penalty=False,
-        enable_continuity_protection=False,
-        enable_low_lock_recovery=False,
-        enable_high_lock_recovery=False,
-        enable_post_motion_protection=False,
-    )
-
-    legacy_hr = _extract_fft_hr(
-        np.ones(10), 100, 120.0, legacy, enable_penalty=False, penalty_ref=None, precomputed_spectrum=(freq, amp)
-    )
-    disabled_hr = _extract_fft_hr(
-        np.ones(10), 100, 120.0, disabled, enable_penalty=False, penalty_ref=None, precomputed_spectrum=(freq, amp)
-    )
-    assert disabled_hr == pytest.approx(legacy_hr)
+def test_core_rejects_legacy_tracker_and_rescue_overrides() -> None:
+    from ppg_hr.params import resolve_core_config
+    for override in ({"tracker_mode": "legacy"}, {"enable_low_lock_recovery": True},
+                     {"enable_high_lock_recovery": True}, {"post_motion_guard_gap_rescue_enable": True}):
+        with pytest.raises(ValueError, match="Frozen"):
+            resolve_core_config(override)

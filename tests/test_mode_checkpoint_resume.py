@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+
+from ppg_hr.params import RESULT_SCHEMA_VERSION
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,14 +12,15 @@ import pytest
 
 from ppg_hr.experimental import run_batch_protocol as rbp
 from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams
-from ppg_hr.params import CascadeScheme, TargetScope
+from ppg_hr.params import ReferenceConfig, TargetScope
 
 
 def _history_row() -> dict[str, object]:
     return {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
         "motion_type": "tiaosheng",
         "target_scope": "motion_only",
-        "cascade_scheme": "acc3",
+        "reference_order_key": "acc",
         "adaptive_filter": "lms",
         "repeat_idx": 0,
         "trial_idx": 0,
@@ -30,16 +33,16 @@ def _history_row() -> dict[str, object]:
         "success": True,
         "reason": "",
         "params": "{}",
-        "param_TW": 8,
+        "param_hr_window_s": 8,
     }
 
 
 def _single_split_result() -> rbp._ModeOptimisation:
-    params = ProtocolTrialParams(TW=8, TW_F=1.5, Fs_Target=50, adaptive_filter="lms")
+    params = ProtocolTrialParams(hr_window_s=8, prewarm_s=0.0, Fs_Target=50, adaptive_filter="lms")
     return rbp._ModeOptimisation(
         motion_type="tiaosheng",
         target_scope=TargetScope.MOTION_ONLY,
-        cascade_scheme=CascadeScheme.ACC3,
+        reference_config=ReferenceConfig(('ACC',)),
         adaptive_filter="lms",
         objective_mode="accuracy",
         data_split_mode="split",
@@ -68,7 +71,7 @@ def _single_split_result() -> rbp._ModeOptimisation:
             "time_bias_after_s": 1.0,
             "num_windows": 12,
         },
-        per_group_rows=[{"motion_type": "tiaosheng", "group_id": "g1", "split": "test"}],
+        per_group_rows=[{"result_schema_version": RESULT_SCHEMA_VERSION, "motion_type": "tiaosheng", "group_id": "g1", "split": "test"}],
         history=[_history_row()],
         success=True,
         reason="",
@@ -78,7 +81,7 @@ def _single_split_result() -> rbp._ModeOptimisation:
 
 
 def _logo_fold_result(fold_id: int, heldout: str, aae: float) -> rbp._ModeOptimisation:
-    params = ProtocolTrialParams(TW=6 + fold_id, TW_F=1.5, Fs_Target=50, adaptive_filter="lms")
+    params = ProtocolTrialParams(hr_window_s=8, memory_ms=80 + 40 * fold_id, prewarm_s=0.0, Fs_Target=50, adaptive_filter="lms")
     arrays = {
         "ref_hr_bpm": np.asarray([70.0, 72.0]),
         "baseline_hr_bpm": np.asarray([71.0, 73.0]),
@@ -90,7 +93,7 @@ def _logo_fold_result(fold_id: int, heldout: str, aae: float) -> rbp._ModeOptimi
     return rbp._ModeOptimisation(
         motion_type="tiaosheng",
         target_scope=TargetScope.MOTION_ONLY,
-        cascade_scheme=CascadeScheme.ACC3,
+        reference_config=ReferenceConfig(('ACC',)),
         adaptive_filter="lms",
         objective_mode="aae",
         data_split_mode="leave_one_group_out",
@@ -108,7 +111,7 @@ def _logo_fold_result(fold_id: int, heldout: str, aae: float) -> rbp._ModeOptimi
             "final_aae_bpm": aae,
             "final_acc_pct": 100.0,
         },
-        per_group_rows=[{"motion_type": "tiaosheng", "group_id": heldout, "split": "test"}],
+        per_group_rows=[{"result_schema_version": RESULT_SCHEMA_VERSION, "motion_type": "tiaosheng", "group_id": heldout, "split": "test"}],
         history=[{**_history_row(), "fold_id": fold_id, "heldout_group_id": heldout}],
         success=True,
         reason="",
@@ -150,6 +153,7 @@ def test_load_completed_mode_results_ignores_modes_without_done_checkpoint(tmp_p
     checkpoint_path.write_text(
         json.dumps(
             {
+                "result_schema_version": RESULT_SCHEMA_VERSION,
                 "motion_type": "tiaosheng",
                 "modes": {
                     result.mode_key: {
@@ -210,7 +214,7 @@ def test_finalize_completed_logo_mode_writes_fold_files_and_clears_fold_heavy_fi
     result = rbp._aggregate_logo_fold_results(
         motion_type="tiaosheng",
         scope=TargetScope.MOTION_ONLY,
-        scheme=CascadeScheme.ACC3,
+        scheme=ReferenceConfig(('ACC',)),
         adaptive_filter="lms",
         objective_mode="aae",
         data_split_mode="leave_one_group_out",
@@ -244,24 +248,24 @@ def test_finalize_completed_logo_mode_writes_fold_files_and_clears_fold_heavy_fi
     assert result.per_group_rows == []
 
 
-def test_aggregate_logo_fold_results_keeps_non_acc3_compare_metrics() -> None:
+def test_aggregate_logo_fold_results_keeps_non_acc_compare_metrics() -> None:
     fold0 = _logo_fold_result(0, "g0", 2.0)
     fold1 = _logo_fold_result(1, "g1", 1.0)
     for fold in (fold0, fold1):
-        fold.cascade_scheme = CascadeScheme.HF2
-        fold.acc3_compare_metrics = {
-            "acc3_compare_aae_bpm": 1.0,
-            "acc3_compare_accuracy_pct": 100.0,
-            "acc3_compare_num_windows": 2,
-            "acc3_compare_status": "ok",
-            "acc3_compare_reason": "",
+        fold.reference_config = ReferenceConfig(('HF',))
+        fold.acc_compare_metrics = {
+            "acc_compare_aae_bpm": 1.0,
+            "acc_compare_accuracy_pct": 100.0,
+            "acc_compare_num_windows": 2,
+            "acc_compare_status": "ok",
+            "acc_compare_reason": "",
         }
-        fold.acc3_compare_arrays = fold.metric_arrays_by_split["test"]
+        fold.acc_compare_arrays = fold.metric_arrays_by_split["test"]
 
     result = rbp._aggregate_logo_fold_results(
         motion_type="tiaosheng",
         scope=TargetScope.MOTION_ONLY,
-        scheme=CascadeScheme.HF2,
+        scheme=ReferenceConfig(('HF',)),
         adaptive_filter="lms",
         objective_mode="aae",
         data_split_mode="leave_one_group_out",
@@ -270,8 +274,8 @@ def test_aggregate_logo_fold_results_keeps_non_acc3_compare_metrics() -> None:
         n_repeats=1,
     )
 
-    assert result.acc3_compare_metrics["acc3_compare_status"] == "ok"
-    assert result.acc3_compare_metrics["acc3_compare_num_windows"] == 4
+    assert result.acc_compare_metrics["acc_compare_status"] == "ok"
+    assert result.acc_compare_metrics["acc_compare_num_windows"] == 4
 
 
 def test_plot_bayes_curves_uses_saved_history_after_history_is_cleared(
@@ -362,7 +366,7 @@ def test_failed_mode_optimisation_returns_checkpointable_result() -> None:
     result = rbp._failed_mode_optimisation(
         motion_type="tiaosheng",
         scope=TargetScope.MOTION_ONLY,
-        scheme=CascadeScheme.HF2,
+        scheme=ReferenceConfig(('HF',)),
         adaptive_filter="lms",
         objective_mode="aae",
         data_split_mode="leave_one_group_out",
@@ -375,8 +379,8 @@ def test_failed_mode_optimisation_returns_checkpointable_result() -> None:
 
     assert isinstance(result, rbp._ModeOptimisation)
     assert result.success is False
-    assert result.acc3_compare_metrics["acc3_compare_status"] == "failed"
-    assert result.acc3_compare_metrics["acc3_compare_reason"] == "not enough groups"
+    assert result.acc_compare_metrics["acc_compare_status"] == "failed"
+    assert result.acc_compare_metrics["acc_compare_reason"] == "not enough groups"
 
 
 def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
@@ -394,7 +398,7 @@ def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
         motion_id="subject_name_write_1",
         stem="subject_name_write_1",
     )
-    dataset = SimpleNamespace(_trial_base_cache={}, _global_tdelay_cache={})
+    dataset = SimpleNamespace(_trial_base_cache={}, _sensor_base_cache={})
     calls: list[str] = []
 
     monkeypatch.setattr(
@@ -410,7 +414,7 @@ def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
     monkeypatch.setattr(rbp, "quality_filter_sample", lambda *args, **kwargs: SimpleNamespace(is_good=True))
     monkeypatch.setattr(rbp, "write_qc_tables", lambda *args, **kwargs: {})
     monkeypatch.setattr(rbp, "load_and_preprocess_protocol", lambda *args, **kwargs: dataset)
-    monkeypatch.setattr(rbp, "detect_activity_segments", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(rbp, "detect_source_imu_segments", lambda *args, **kwargs: SimpleNamespace())
     monkeypatch.setattr(rbp, "plot_signal_figures", lambda *args, **kwargs: {})
     monkeypatch.setattr(
         rbp,
@@ -445,7 +449,7 @@ def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
         subject_dir=subject_dir,
         output_root=output_root,
         target_scopes=[TargetScope.MOTION_ONLY],
-        cascade_schemes=[CascadeScheme.ACC3],
+        reference_group_orders=[ReferenceConfig(('ACC',))],
         adaptive_filters=["lms"],
         data_split_mode="split",
         verbose=False,
@@ -454,7 +458,7 @@ def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
         subject_dir=subject_dir,
         output_root=output_root,
         target_scopes=[TargetScope.MOTION_ONLY],
-        cascade_schemes=[CascadeScheme.ACC3],
+        reference_group_orders=[ReferenceConfig(('ACC',))],
         adaptive_filters=["lms"],
         data_split_mode="split",
         verbose=False,
@@ -463,7 +467,7 @@ def test_run_batch_adaptive_protocol_skips_done_modes_on_restart(
         subject_dir=subject_dir,
         output_root=output_root,
         target_scopes=[TargetScope.MOTION_ONLY],
-        cascade_schemes=[CascadeScheme.ACC3],
+        reference_group_orders=[ReferenceConfig(('ACC',))],
         adaptive_filters=["lms"],
         data_split_mode="split",
         max_iterations=201,

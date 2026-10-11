@@ -15,187 +15,77 @@ CONFIG_LINE_RE = re.compile(
     r'^\s*(?:[A-Z][A-Z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?\s*=|"[A-Za-z_][A-Za-z0-9_]*"\s*:)'
 )
 
-CONFIG_COMMENTS = {
-    # Sampling, preprocessing, alignment, post-hoc alignment and recovery.
-    "FS_ORIGIN": "原始采样率(Hz)；change6/Pydisplay 数据固定按 100 Hz 与序号校验。",
-    "UD_CALCULATION_MODE": "UD 公式输入模式；raw 直接使用原始 Uh/Uc，smoothed 先分别平滑四路电压再计算。",
-    "UD_SMOOTHING_WINDOW_S": "模式 smoothed 的中心移动中位数窗口(秒)；100 Hz 下 0.1 秒约为 10 点。",
-    "FS_TARGET": "预览绘图目标采样率(Hz)；训练候选由 SEARCH_SPACE.Fs_Target 单独控制。",
-    "TW": "预览分段窗口长度(秒)；训练窗口候选由 SEARCH_SPACE.TW 控制。",
-    "TW_F": "自适应滤波前置收敛上下文(秒)；0 表示不额外增加前置上下文。",
-    "NORMALIZATION_MODE": "参考通道归一化方式；minmax 为当前默认和推荐配置。",
-    "QC_POLICY": "坏窗口策略；fallback_baseline 表示保留计算并回退 baseline HR。",
-    "DELAY_ESTIMATION_MODE": "参考通道时延估计方式；envelope 为默认，direct 保留直接相关模式。",
-    "ALIGNMENT_TW": "静息段全局 Tdelay 提取 HR 的窗口长度(秒)，不等同训练 TW。",
-    "ALIGNMENT_STEP_S": "静息对齐窗口步长(秒)；越小时间分辨率越高、计算越慢。",
-    "REST_HR_BAND_BPM": "静息 HR 合法范围(bpm)；用于对齐阶段的频带限制。",
-    "REST_HR_BAND_HZ": "由 REST_HR_BAND_BPM 换算的 Hz 频带，供频谱接口使用。",
-    "REST_HR_TRACK_BAND_BPM": "静息 HR 相邻窗口搜索带宽(bpm)；训练候选由搜索空间控制。",
-    "REST_HR_SLEW_LIMIT_BPM": "静息 HR 允许直接接受的相邻变化阈值(bpm)。",
-    "REST_HR_SLEW_STEP_BPM": "超过静息变化阈值时每窗口最大修正步长(bpm)。",
-    "REST_HR_SMOOTH_METHOD": "静息 HR 平滑方法；median 对孤立异常峰更稳健。",
-    "REST_HR_SMOOTH_WIN": "静息 HR 平滑窗口数；应使用正奇数以保持中心对齐。",
-    "REST_HR_PEAK_PERCENT": "候选频谱峰相对主峰的最低幅值比例。",
-    "REST_HR_SPEC_PENALTY_ENABLE": "是否在静息 HR 提取时启用运动频率惩罚。",
-    "REST_HR_SPEC_PENALTY_WEIGHT": "静息运动频率惩罚权重；越大越抑制运动相关峰。",
-    "REST_HR_SPEC_PENALTY_WIDTH_HZ": "静息运动峰惩罚半宽(Hz)；决定受抑制频带范围。",
-    "REST_ALIGNMENT_SCORE_MODE": "Tdelay 评分指标；aae 为当前默认，std 用于兼容旧实验。",
-    "ENABLE_TIME_BIAS_AFTER": "是否计算滤波后 post-hoc 时间偏移诊断。",
-    "TIME_BIAS_AFTER_RANGE_S": "post-hoc 时间偏移搜索区间(秒)，按(最小,最大)设置。",
-    "TIME_BIAS_AFTER_STEP_S": "post-hoc 时间偏移搜索步长(秒)。",
-    "TIME_BIAS_AFTER_MODE": "post-hoc 对齐语义；oracle 只用于诊断指标，不参与部署选择。",
-    "RECOVERY_GRACE_S": "运动结束后的恢复宽限时间(秒)。",
-    "RECOVERY_DIFF_BPM": "恢复阶段候选与连续轨迹允许的最大差值(bpm)。",
-    "RECOVERY_CROSS_DIFF_BPM": "恢复阶段跨来源切换允许的差值阈值(bpm)。",
-    "PPG_INPUT_TRANSFORM": "PPG 输入变换；默认 log_absorbance，也可选择后端支持的既有变换。",
-    "LOG_ABSORBANCE_BASELINE_MODE": "log-absorbance 基线估计方法；rolling_median 抑制慢漂移。",
-    "LOG_ABSORBANCE_BASELINE_WINDOW_S": "滚动基线窗口长度(秒)；越大越保留低频趋势。",
-    "LOG_ABSORBANCE_EPS": "log 比值的数值稳定下限，防止零值导致无穷大。",
-    "LOG_ABSORBANCE_RATIO_CLIP": "进入 log 前的比值裁剪范围，防止极端异常值。",
-    "GLOBAL_OBJECTIVE_STRATEGY": "全局目标组合策略；current_global_adaptive 沿用当前融合语义。",
-    "REST_HR_KWARGS": "汇总静息 HR 绘图参数；键值直接传给第 3/4/6 节绘图接口。",
-    # HR postprocessing and fixed adaptive-filter controls.
-    "TRAIN_HR_POSTPROCESS_METHOD": "训练 HR 后处理方法；fft 为默认，ssr 启用稀疏频谱重建。",
-    "SSR_NUM_ATOMS": "SSR 稀疏表示使用的原子数；越大表达力和计算量越高。",
-    "SSR_LAMBDA": "SSR 稀疏正则权重；越大产生越稀疏的频谱解。",
-    "SSR_HARMONIC_TOL_BPM": "SSR 谐波匹配容差(bpm)。",
-    "SSR_FALLBACK_TO_FFT": "SSR 失败时是否回退既有 FFT 跟踪器。",
-    "SSR_GRID_RESOLUTION_BPM": "SSR 心率搜索网格分辨率(bpm)；越小越精细但更慢。",
-    "LMS_MU_MIN": "LMS/Volterra/RFF-LMS 更新步长下限，避免步长退化为零。",
-    "TRACKING_SMOOTH_WIN_LEN": "最终 HR 轨迹平滑窗口数；使用正奇数。",
-    "SPEC_PENALTY_WEIGHT": "通用运动频谱惩罚权重；越大越排斥参考通道峰。",
-    "RFF_SIGMA": "旧记录缺少 sigma_scale 时使用的固定 RBF sigma 兼容值。",
-    "RFF_UPDATE_MODE": "RFF 权重更新方式；nlms 按特征能量归一化，稳定性更好。",
-    "RFF_NLMS_EPS": "RFF-NLMS 分母稳定项，防止特征能量接近零。",
-    "RFF_LEAKAGE": "RFF 权重泄漏系数；0 表示不衰减历史权重。",
-    "RFF_ERR_CLIP": "RFF 更新误差裁剪阈值；None 表示不额外裁剪。",
-    "RFF_THETA_NORM_GUARD": "RFF 权重范数保护阈值；None 表示关闭该保护。",
-    "KLMS_MAX_DICTIONARY_SIZE": "KLMS 字典中心上限；越大拟合能力和内存占用越高。",
-    "KLMS_CENTER_PRUNE_POLICY": "KLMS 达到字典上限后的策略；freeze_new_centers 停止加中心。",
-    "KLMS_DISTANCE_MODE": "KLMS 新颖度距离语义；normalized 可减弱 tap 维数影响。",
-    "KLMS_NORMALIZED_UPDATE": "是否按核特征能量归一化 KLMS 更新。",
-    "KLMS_NLMS_EPS": "KLMS 归一化更新的分母稳定项。",
-    # Cascade guard and enhanced tracking.
-    "CASCADE_GUARD_POLICY": "级联保护策略；none 关闭，rms_guard 按级输出 RMS 决定回退。",
-    "CASCADE_GUARD_RATIO_MIN": "当前级/上一级 RMS 比值下限，低于时判定异常。",
-    "CASCADE_GUARD_RATIO_MAX": "当前级/上一级 RMS 比值上限，高于时判定异常。",
-    "CASCADE_GUARD_FLAT_STD_EPS": "近似平坦输出的标准差阈值。",
-    "CASCADE_GUARD_USE_FINITE_ZSCORE": "是否把有限 z-score 检查纳入级联保护。",
-    "TRACKER_MODE": "频谱追踪总模式；legacy 保留旧算法，enhanced 启用六项增强开关。",
-    "ENABLE_DIRECTIONAL_TRACKING": "是否启用上行/下行不同搜索范围和 slew 限制。",
-    "ENABLE_DYNAMIC_PENALTY": "是否按置信度和谐波存在性动态调整频谱惩罚。",
-    "ENABLE_CONTINUITY_PROTECTION": "是否用连续性与挑战峰确认保护当前锁定。",
-    "ENABLE_LOW_LOCK_RECOVERY": "是否启用低锁定确认和恢复；实际仅对 LMS 生效。",
-    "ENABLE_HIGH_LOCK_RECOVERY": "是否启用高锁定风险确认、恢复和冷却。",
-    "ENABLE_POST_MOTION_PROTECTION": "是否启用运动结束后 reset-FFT、交叉和 gap rescue 保护。",
-    "TRACKING_RANGE_UP_BPM": "旧共享向上搜索范围兼容覆盖；None 表示使用分阶段参考参数。",
-    "TRACKING_RANGE_DOWN_BPM": "旧共享向下搜索范围兼容覆盖；None 表示使用分阶段参考参数。",
-    "TRACKING_SLEW_LIMIT_UP_BPM": "旧共享上行 limit 兼容覆盖；None 表示使用分阶段参考参数。",
-    "TRACKING_SLEW_STEP_UP_BPM": "旧共享上行 step 兼容覆盖；None 表示使用分阶段参考参数。",
-    "TRACKING_SLEW_LIMIT_DOWN_BPM": "旧共享下行 limit 兼容覆盖；None 表示使用分阶段参考参数。",
-    "TRACKING_SLEW_STEP_DOWN_BPM": "旧共享下行 step 兼容覆盖；None 表示使用分阶段参考参数。",
-    "MOTION_TRACKING_RANGE_UP_BPM": "adaptive 运动段向上候选搜索范围(bpm)。",
-    "MOTION_TRACKING_RANGE_DOWN_BPM": "adaptive 运动段向下候选搜索范围(bpm)。",
-    "MOTION_TRACKING_SLEW_LIMIT_UP_BPM": "adaptive 运动段上行可直接接受阈值(bpm)。",
-    "MOTION_TRACKING_SLEW_STEP_UP_BPM": "adaptive 运动段上行超限时单窗口推进步长(bpm)。",
-    "MOTION_TRACKING_SLEW_LIMIT_DOWN_BPM": "adaptive 运动段下行可直接接受阈值(bpm)。",
-    "MOTION_TRACKING_SLEW_STEP_DOWN_BPM": "adaptive 运动段下行超限时单窗口推进步长(bpm)。",
-    "RECOVERY_TRACKING_RANGE_UP_BPM": "adaptive 恢复段向上候选搜索范围(bpm)。",
-    "RECOVERY_TRACKING_RANGE_DOWN_BPM": "adaptive 恢复段向下候选搜索范围(bpm)。",
-    "RECOVERY_TRACKING_SLEW_LIMIT_UP_BPM": "adaptive 恢复段上行可直接接受阈值(bpm)。",
-    "RECOVERY_TRACKING_SLEW_STEP_UP_BPM": "adaptive 恢复段上行超限时单窗口推进步长(bpm)。",
-    "RECOVERY_TRACKING_SLEW_LIMIT_DOWN_BPM": "adaptive 恢复段下行可直接接受阈值(bpm)。",
-    "RECOVERY_TRACKING_SLEW_STEP_DOWN_BPM": "adaptive 恢复段下行超限时单窗口推进步长(bpm)。",
-    "CANDIDATE_PEAK_THRESHOLD_RATIO": "运动惩罚参考峰相对主峰门限；参考默认 0.30。",
-    "FULL_CANDIDATE_PEAK_THRESHOLD_RATIO": "PPG 完整候选相对主峰门限；参考默认 0.15。",
-    "LOW_LOCK_MIN_BPM": "低锁定判定区间下限(bpm)。",
-    "LOW_LOCK_MAX_BPM": "低锁定判定区间上限(bpm)。",
-    "LOW_LOCK_MIN_WINDOWS": "进入低锁定风险前要求连续命中的窗口数。",
-    "LOW_LOCK_TARGET_MIN_BPM": "低锁定恢复候选的最低目标心率(bpm)。",
-    "LOW_LOCK_MIN_JUMP_BPM": "恢复候选相对低锁定轨迹的最小上跳幅度(bpm)。",
-    "LOW_LOCK_MIN_AMP_RATIO": "低锁定恢复候选相对主峰的最低幅值比例。",
-    "LOW_LOCK_CANDIDATE_STABLE_BPM": "低锁定恢复候选跨窗口稳定容差(bpm)。",
-    "LOW_LOCK_CONFIRM_WINDOWS": "接受低锁定恢复候选前的确认窗口数。",
-    "LOW_LOCK_STEP_BPM": "低锁定恢复时单窗口允许的最大上调步长(bpm)。",
-    "HIGH_LOCK_CONFIRM_WINDOWS": "确认高锁定风险所需的连续窗口数。",
-    "HIGH_LOCK_COOLDOWN_WINDOWS": "高锁定恢复后的冷却窗口数，防止立即反复触发。",
-    "HIGH_LOCK_MIN_GAP_BPM": "高锁定轨迹与较低挑战峰之间的最小间隔(bpm)。",
-    "HIGH_LOCK_MIN_AMP_RATIO": "高锁定恢复挑战峰相对主峰的最低幅值比例。",
-    "HIGH_LOCK_CANDIDATE_MIN_BPM": "高锁定恢复候选允许的最低心率(bpm)。",
-    "HIGH_LOCK_CANDIDATE_STABLE_BPM": "高锁定恢复候选跨窗口稳定容差(bpm)。",
-    "HIGH_LOCK_PENALTY_EXCLUSION_BPM": "挑战峰附近免受运动惩罚影响的频带宽度(bpm)。",
-    "HIGH_LOCK_DOWN_STEP_BPM": "高锁定恢复时单窗口最大下降步长(bpm)。",
-    "HIGH_LOCK_UP_STEP_BPM": "高锁定冷却期内单窗口最大反向上升步长(bpm)。",
-    "POST_MOTION_GUARD_SECONDS": "旧固定 timeout 兼容值；None 表示动态保护不按时间硬退出。",
-    "POST_MOTION_GUARD_MIN_ELAPSED_S": "运动后允许稳定交叉前的最短等待时间(秒)。",
-    "POST_MOTION_GUARD_STABLE_WINDOWS": "运动后候选稳定交叉所需的连续窗口数。",
-    "POST_MOTION_GUARD_CROSSOVER_GAP_BPM": "稳定交叉时两来源允许的最大差值(bpm)。",
-    "POST_MOTION_GUARD_UPWARD_GAP_BPM": "运动后向上切换要求的最小优势差值(bpm)。",
-    "POST_MOTION_GUARD_FFT_FLOOR_BPM": "reset-FFT 候选允许的最低心率(bpm)。",
-    "POST_MOTION_GUARD_RECOVERY_STEP_UP_BPM": "运动后保护期每窗口最大上调步长(bpm)。",
-    "POST_MOTION_GUARD_RECOVERY_STEP_DOWN_BPM": "运动后保护期每窗口最大下调步长(bpm)。",
-    "POST_MOTION_GUARD_RISING_WINDOWS": "rising rescue 检查的连续 adaptive 窗口数。",
-    "POST_MOTION_GUARD_RISING_SLOPE_BPM_PER_WINDOW": "rising rescue 要求的每窗口最低上升幅度(bpm)。",
-    "POST_MOTION_GUARD_RESCUE_GAP_BPM": "触发大间隔 rescue 的来源差值阈值(bpm)。",
-    "POST_MOTION_GUARD_GAP_RESCUE_ENABLE": "是否启用运动后大间隔多数命中救援。",
-    "POST_MOTION_GUARD_GAP_RESCUE_WINDOWS": "gap rescue 统计使用的最近窗口数。",
-    "POST_MOTION_GUARD_GAP_RESCUE_MIN_HITS": "gap rescue 在统计窗口内要求的最少命中数。",
-    "POST_MOTION_GUARD_FFT_STABLE_WINDOWS": "reset-FFT 被视为稳定前要求的连续窗口数。",
-    "POST_MOTION_GUARD_FFT_STABLE_BPM": "reset-FFT 跨窗口稳定容差(bpm)。",
-    # Search-space rows.
-    "SEARCH_SPACE": "Optuna 离散候选集合；下方逐项列表可直接增删候选值。",
-    "SEARCH_SPACE.Fs_Target": "训练重采样率候选(Hz)；较低值更快，较高值时间分辨率更高。",
-    "SEARCH_SPACE.TW": "训练窗口长度候选(秒)；影响频率分辨率、窗口数和响应速度。",
-    "SEARCH_SPACE.Kstop": "级联停止阈值候选；控制继续增加参考级的条件。",
-    "SEARCH_SPACE.max_order": "每级最大 tap 阶数候选；越大建模能力和计算量越高。",
-    "SEARCH_SPACE.M_base": "级联基础 tap 数候选。",
-    "SEARCH_SPACE.C_scale": "级联阶数增长比例候选。",
-    "SEARCH_SPACE.K_max": "级联 tap/阶数上限候选。",
-    "SEARCH_SPACE.Spec_Penalty_Width": "运动频谱惩罚带宽候选(Hz)。",
-    "SEARCH_SPACE.hr_range_hz": "相邻 HR 搜索范围候选(Hz)，列表由 bpm 换算。",
-    "SEARCH_SPACE.slew_limit_bpm": "HR 轨迹直接接受变化阈值候选(bpm)。",
-    "SEARCH_SPACE.slew_step_bpm": "超限时 HR 每窗口最大修正步长候选(bpm)。",
-    "SEARCH_SPACE.Rest_HR_Track_Band_BPM": "静息 HR 搜索带宽候选(bpm)。",
-    "SEARCH_SPACE.Rest_HR_Slew_Limit_BPM": "静息 HR 直接接受变化阈值候选(bpm)。",
-    "SEARCH_SPACE.Rest_HR_Slew_Step_BPM": "静息 HR 超限修正步长候选(bpm)。",
-    "SEARCH_SPACE.LMS_Mu_Base": "LMS/Volterra 基础步长候选。",
-    "SEARCH_SPACE.RFF_LMS_Mu_Base": "RFF-LMS 特征空间更新步长候选。",
-    "SEARCH_SPACE.alpha_u": "Volterra 非线性项混合系数候选。",
-    "SEARCH_SPACE.M2": "Volterra 二阶记忆长度候选。",
-    "SEARCH_SPACE.rff_D": "RFF 随机特征维数候选；越大越慢且占用更多内存。",
-    "SEARCH_SPACE.rff_sigma_scale": "基于 tap robust 距离的 RFF sigma 缩放候选。",
-    "SEARCH_SPACE.klms_step_size": "KLMS 核权重更新步长候选。",
-    "SEARCH_SPACE.klms_sigma": "KLMS RBF 核宽度候选。",
-    "SEARCH_SPACE.klms_epsilon": "KLMS 新中心新颖度阈值候选。",
-    # Execution, cache, split and safety switches.
-    "NUM_SEED_POINTS": "TPE 启动前的随机探索 trial 数；不得超过总 trial 预算。",
-    "N_JOBS": "并行 worker 数；1 最稳定，增大时注意内存和可复现性。",
-    "PARALLEL_REPEATS": "重复实验并行数；当前实际并行度由 n_jobs 优先控制。",
-    "TRIAL_CACHE_MAX_ENTRIES": "trial 结果内存缓存上限；越大越占内存。",
-    "SAVE_STAGE_JSON": "是否保存详细 stage JSON；调试有用但会增加磁盘文件。",
-    "DEBUG_MODE": "调试模式；会保留更多中间记录并隐式启用 stage JSON。",
-    "CLEAN_OUTPUTS": "是否清空当前运行目录；续跑 checkpoint 时必须保持 False。",
-    "VAL_GROUPS_PER_TYPE": "split 模式每个运动类型的验证组数；all_train 下不使用。",
-    "TEST_GROUPS_PER_TYPE": "split 模式每个运动类型的测试组数；all_train 下不使用。",
-    "CASCADE_TRAIN_BUDGETS": "按 scheme 覆盖 trial/repeat 预算；None 使用全局预算。",
-    "TRIAL_PARAM_OVERRIDES": "固定 trial 参数映射；覆盖默认值并进入元数据、缓存键和断点指纹。",
-    "RUN_STATIC_QC": "是否在第 1 节读取各文件前 10 秒并显示静态 QC。",
-    "RUN_PREPROCESS_PREVIEW": "是否在第 2 节完整预处理一个所选样本。",
-    "RUN_ALIGNMENT_DIAGNOSTICS": "是否运行第 3 节并写静息 Tdelay 对齐图。",
-    "RUN_FULLFIELD_PLOT": "是否运行第 4 节并写全段未对齐 PPG-HR 图。",
-    "RUN_RAW_PPG_PLOT": "是否运行第 6 节并写原始 PPG 双轴图。",
-    "RUN_ALL_TRAIN": "是否运行第 7 节正式 200-trial 模式级优化。",
-    "RUN_CONNECTIVITY_CHECK": "是否运行第 8 节小预算模式连通性检查。",
-    "RUN_OUTPUT_CHECK": "是否运行第 9 节只读检查 Stage-6 和断点文件。",
-    "RUN_STAGE7_REPLAY": "是否运行第 10 节单样本 best-params 回放。",
-    "RUN_WINDOW_DIAGNOSTICS": "是否运行第 11 节窗口波形/频谱诊断。",
-    "RUN_CROSS_MOTION_SUMMARY": "是否运行第 12 节跨运动汇总。",
-    "RUN_CROSS_STAGE7_REPLAY": "是否运行第 13 节跨 scheme 回放。",
-    "RUN_CROSS_WINDOW_DIAGNOSTICS": "是否运行第 14 节跨 scheme 窗口诊断。",
-    "RUN_BATCH_REFERENCE_COMPARE": "是否运行第 15 节批量参考 scheme 对比。",
-    "RUN_BATCH_TARGET_HR_REDRAW": "是否运行第 16 节并批量重绘当前受试者全部目标段 HR 图。",
-    "CONNECTIVITY_MAX_ITERATIONS": "连通性检查每模式 trial 数；默认 1，避免误跑正式预算。",
-}
+CONFIG_COMMENTS = {'FS_ORIGIN': '原始采样率(Hz)；change6/Pydisplay 数据固定按 100 Hz 与序号校验。',
+ 'UD_CALCULATION_MODE': 'UD 公式输入模式；raw 直接使用原始 Uh/Uc，smoothed 先分别平滑四路电压再计算。',
+ 'UD_SMOOTHING_WINDOW_S': '模式 smoothed 的中心移动中位数窗口(秒)；100 Hz 下 0.1 秒约为 10 点。',
+ 'FS_TARGET': '预览绘图目标采样率(Hz)；训练候选由 SEARCH_SPACE.Fs_Target 单独控制。',
+ 'hr_window_s': '预览分段窗口长度(秒)；HR observation固定8秒，step固定1秒，状态以center判断。',
+ 'prewarm_s': '自适应滤波前置收敛上下文(秒)；0 表示不额外增加前置上下文。',
+ 'NORMALIZATION_MODE': '参考通道归一化方式；minmax 为当前默认和推荐配置。',
+ 'QC_POLICY': '坏窗口策略；fallback_baseline 表示保留计算并回退 baseline HR。',
+ 'DELAY_ESTIMATION_MODE': '参考通道时延估计方式；envelope 为默认，direct 保留直接相关模式。',
+ 'EVALUATION_WINDOW_S': '评价诊断窗8秒，冻结；不控制预测网格。',
+ 'EVALUATION_STEP_S': '评价诊断步长1秒，冻结。',
+ 'REST_HR_BAND_BPM': '静息 HR 合法范围(bpm)；用于对齐阶段的频带限制。',
+ 'REST_HR_BAND_HZ': '由 REST_HR_BAND_BPM 换算的 Hz 频带，供频谱接口使用。',
+ 'REST_HR_TRACK_BAND_BPM': '只读冻结的诊断追踪带宽(bpm)，不参与BO。',
+ 'REST_HR_SLEW_LIMIT_BPM': '静息 HR 允许直接接受的相邻变化阈值(bpm)。',
+ 'REST_HR_SLEW_STEP_BPM': '超过静息变化阈值时每窗口最大修正步长(bpm)。',
+ 'REST_HR_SMOOTH_METHOD': '静息 HR 平滑方法；median 对孤立异常峰更稳健。',
+ 'REST_HR_SMOOTH_WIN': '静息 HR 平滑窗口数；应使用正奇数以保持中心对齐。',
+ 'REST_HR_PEAK_PERCENT': '候选频谱峰相对主峰的最低幅值比例。',
+ 'REST_HR_SPEC_PENALTY_ENABLE': '是否在静息 HR 提取时启用运动频率惩罚。',
+ 'REST_HR_SPEC_PENALTY_WEIGHT': '保留比例；越小抑制越强，核心固定0.2。',
+ 'REST_HR_SPEC_PENALTY_WIDTH_HZ': '静息运动峰惩罚半宽(Hz)；决定受抑制频带范围。',
+ 'REST_ALIGNMENT_SCORE_MODE': 'Tdelay 评分指标；aae 为当前默认，std 用于兼容旧实验。',
+ 'ENABLE_TIME_BIAS_AFTER': '是否计算滤波后 post-hoc 时间偏移诊断。',
+ 'TIME_BIAS_AFTER_RANGE_S': 'post-hoc 时间偏移搜索区间(秒)，按(最小,最大)设置。',
+ 'TIME_BIAS_AFTER_STEP_S': 'post-hoc 时间偏移搜索步长(秒)。',
+ 'TIME_BIAS_AFTER_MODE': 'post-hoc 对齐语义；oracle 只用于诊断指标，不参与部署选择。',
+ 'PPG_INPUT_TRANSFORM': 'PPG 输入变换；默认 log_absorbance，也可选择后端支持的既有变换。',
+ 'LOG_ABSORBANCE_BASELINE_MODE': 'log-absorbance 基线估计方法；rolling_median 抑制慢漂移。',
+ 'LOG_ABSORBANCE_BASELINE_WINDOW_S': '滚动基线窗口长度(秒)；越大越保留低频趋势。',
+ 'LOG_ABSORBANCE_EPS': 'log 比值的数值稳定下限，防止零值导致无穷大。',
+ 'LOG_ABSORBANCE_RATIO_CLIP': '进入 log 前的比值裁剪范围，防止极端异常值。',
+ 'REST_HR_KWARGS': '汇总静息 HR 绘图参数；键值直接传给第 3/4/6 节绘图接口。',
+ 'TRAIN_HR_POSTPROCESS_METHOD': '训练 HR 后处理方法；fft 为默认，ssr 启用稀疏频谱重建。',
+ 'SPEC_PENALTY_WEIGHT': '通用运动频谱惩罚权重；越大越排斥参考通道峰。',
+ 'TRACKING_RANGE_UP_BPM': '旧共享向上搜索范围兼容覆盖；None 表示使用分阶段参考参数。',
+ 'TRACKING_RANGE_DOWN_BPM': '旧共享向下搜索范围兼容覆盖；None 表示使用分阶段参考参数。',
+ 'TRACKING_SLEW_LIMIT_UP_BPM': '旧共享上行 limit 兼容覆盖；None 表示使用分阶段参考参数。',
+ 'TRACKING_SLEW_STEP_UP_BPM': '旧共享上行 step 兼容覆盖；None 表示使用分阶段参考参数。',
+ 'TRACKING_SLEW_LIMIT_DOWN_BPM': '旧共享下行 limit 兼容覆盖；None 表示使用分阶段参考参数。',
+ 'TRACKING_SLEW_STEP_DOWN_BPM': '旧共享下行 step 兼容覆盖；None 表示使用分阶段参考参数。',
+ 'CANDIDATE_PEAK_THRESHOLD_RATIO': '运动惩罚参考峰相对主峰门限；参考默认 0.30。',
+ 'SEARCH_SPACE': 'Optuna 离散候选集合；下方逐项列表可直接增删候选值。',
+ 'SEARCH_SPACE.Fs_Target': '训练重采样率候选(Hz)；较低值更快，较高值时间分辨率更高。',
+ 'NUM_SEED_POINTS': 'TPE 启动前的随机探索 trial 数；不得超过总 trial 预算。',
+ 'N_JOBS': '并行 worker 数；1 最稳定，增大时注意内存和可复现性。',
+ 'PARALLEL_REPEATS': '重复实验并行数；当前实际并行度由 n_jobs 优先控制。',
+ 'TRIAL_CACHE_MAX_ENTRIES': 'trial 结果内存缓存上限；越大越占内存。',
+ 'SAVE_STAGE_JSON': '是否保存详细 stage JSON；调试有用但会增加磁盘文件。',
+ 'DEBUG_MODE': '调试模式；会保留更多中间记录并隐式启用 stage JSON。',
+ 'CLEAN_OUTPUTS': '是否清空当前运行目录；续跑 checkpoint 时必须保持 False。',
+ 'VAL_GROUPS_PER_TYPE': 'split 模式每个运动类型的验证组数；all_train 下不使用。',
+ 'TEST_GROUPS_PER_TYPE': 'split 模式每个运动类型的测试组数；all_train 下不使用。',
+ 'CASCADE_TRAIN_BUDGETS': '按 scheme 覆盖 trial/repeat 预算；None 使用全局预算。',
+ 'TRIAL_PARAM_OVERRIDES': '固定 trial 参数映射；覆盖默认值并进入元数据、缓存键和断点指纹。',
+ 'RUN_STATIC_QC': '是否在第 1 节读取各文件前 10 秒并显示静态 QC。',
+ 'RUN_PREPROCESS_PREVIEW': '是否在第 2 节完整预处理一个所选样本。',
+ 'RUN_ALIGNMENT_DIAGNOSTICS': '是否运行第 3 节并写静息 Tdelay 对齐图。',
+ 'RUN_FULLFIELD_PLOT': '是否运行第 4 节并写全段未对齐 PPG-HR 图。',
+ 'RUN_RAW_PPG_PLOT': '是否运行第 6 节并写原始 PPG 双轴图。',
+ 'RUN_ALL_TRAIN': '是否运行第 7 节正式 200-trial 模式级优化。',
+ 'RUN_CONNECTIVITY_CHECK': '是否运行第 8 节小预算模式连通性检查。',
+ 'RUN_OUTPUT_CHECK': '是否运行第 9 节只读检查 Stage-6 和断点文件。',
+ 'RUN_STAGE7_REPLAY': '是否运行第 10 节单样本 best-params 回放。',
+ 'RUN_WINDOW_DIAGNOSTICS': '是否运行第 11 节窗口波形/频谱诊断。',
+ 'RUN_CROSS_MOTION_SUMMARY': '是否运行第 12 节跨运动汇总。',
+ 'RUN_CROSS_STAGE7_REPLAY': '是否运行第 13 节跨 scheme 回放。',
+ 'RUN_CROSS_WINDOW_DIAGNOSTICS': '是否运行第 14 节跨 scheme 窗口诊断。',
+ 'RUN_BATCH_REFERENCE_COMPARE': '是否运行第 15 节批量参考 scheme 对比。',
+ 'RUN_BATCH_TARGET_HR_REDRAW': '是否运行第 16 节并批量重绘当前受试者全部目标段 HR 图。',
+ 'CONNECTIVITY_MAX_ITERATIONS': '连通性检查每模式 trial 数；默认 1，避免误跑正式预算。'}
 
 
 def code(source: str) -> nbformat.NotebookNode:
@@ -259,7 +149,46 @@ def build_notebook() -> nbformat.NotebookNode:
 ## 0. 初始化、分层配置与安全开关
 
 本节分成四个配置代码单元：核心路径与实验组合、预处理与对齐、滤波与增强追踪、
-执行与输出。首个代码单元保留 tracker 总开关和六项独立开关。
+执行与输出。所有机制开关由冻结preset显式保存；Notebook不提供rescue覆盖入口。
+
+
+冻结配置通过 `resolve_core_config()` 解析，preset_name=core_enhanced_v1、preset_version=1。
+未知字段、旧字段及冻结机制覆盖会报错。metadata记录完整有效参数、显式feature flags和参考SHA；
+batch fingerprint同时包含schema与输入签名，配置变化不得复用旧checkpoint。
+
+| 配置 | 单位 / 默认值 | 角色与约束 |
+|---|---|---|
+| hr_window_s / hr_step_s | 秒 / 8 / 1 | 固定observation，全部状态使用center；不参与BO |
+| Fs_Target | Hz / 固定验收100；BO25或50 | 只改变算法采样域，不改变source IMU和原始PPG |
+| memory_ms | ms / 160；BO40/80/120/160/200 | 派生正时延history_tap_limit=round(memory_ms*Fs/1000)；实际M/K仍按延迟估计，K_max=12不代表统一物理时长 |
+| prewarm_s | 秒 / 0 | 独立前置上下文，冻结；不承担HR窗长角色 |
+| LMS_Mu_Base / klms_step_size | 无量纲 / .01 / .05 | 搜索滤波器步长；RFF用LMS字段，KLMS只搜索自己的step |
+| Spec_Penalty_Width / Weight | Hz半宽 / .2；保留比例 / .2 | 只搜索width；weight越小抑制越强，confidence共用，区域外权重1 |
+| M_base / C_scale / K_max / Kstop | 2 / 1.2 / 12 / .3 | 滤波器内部映射冻结，不为对齐参考项目而强行重解释 |
+| motion_policy | single_bout | detector保留所有runs；policy最长段（等长最早）或multi_bout全部保留 |
+| reference_groups_order | ordered tuple | 唯一外部真源；ACC+HF和HF+ACC不同实验，组内固定顺序 |
+| target_scope | motion_post10 | 控制实际adaptive范围；motion_only恢复立即reset-FFT，post10最迟范围结束切换 |
+
+实验轴为filter、FFT/SSR、reference groups、protocol、scope及PPG transform。
+`('ACC',)`→accx/accy/accz；`('ACC','HF')`→accx/accy/accz/hf1/hf2；
+`('HF','ACC')`→hf1/hf2/accx/accy/accz。canonical key由registry产生，关联输出目录、缓存、记录与回放。
+
+四层职责：未惩罚candidate spectrum（FFT/SSR）→共享soft penalty与candidate tracker→
+简单adaptive→reset-FFT source handoff→phase-aware Final dynamics。tracker第一次slew保护峰连续性；
+Final第二次slew保护跨phase/source拼接，上一Final跨phase延续。rest up1.5/1.5、down3/1.5；
+motion up5.5/3.5、down2/1.5；recovery up1.5/1.5、down3.5/3（limit/step，bpm）。
+恢复等待5秒，差值≤6bpm连续2有效窗切换，最迟20秒有效reset-FFT切换；episode内锁存，下一motion重置。
+low/high-lock、rise-lineage、gap/rising rescue、complex shadow和interface-quality在线介入显式关闭。
+
+raw-source detector：100Hz六轴四阶零相位带通，ACC .5–5Hz、Gyro .5–10Hz，分别magnitude；
+8/1秒STD(ddof=1)，前30秒baseline，阈值max(2.5*baseline_std,.05*max_window_score)，任一路严格超过即motion。
+先桥接≤3窗内部false gap，再删除<5窗true run。记录raw和selected两套结果；run为首true center到下一false center半开区间。
+每窗记录episode和恢复时间；首段前rest，每段后直到下一motion或结束均recovery。
+
+信号血缘：ppg_acquired_raw（source网格、缺口NaN、毛刺原值）→ppg_clean（missing/spike repair）→
+ppg_algorithm_input（bandpass/log_absorbance及目标域resample）。原始PPG与raw Uh/Uc、标定UD calculation、时间和QC
+组成独立InterfaceQualityInput；adaptive UD使用另一个预处理副本。quality暂未实现，不接收adaptive output或参考HR。
+零相位、全记录阈值及前视滤波使本实验不声称严格实时因果。
 """
         ),
         code(
@@ -283,7 +212,8 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from ppg_hr.params import CascadeScheme, MotionType, TargetScope
+from ppg_hr.params import (ReferenceConfig, MotionType, TargetScope, resolve_core_config, core_preset_metadata)
+from ppg_hr.experimental.cascade_solver import run_protocol_trial
 from ppg_hr.experimental.batch_pairing import discover_sample_pairs_with_unpaired
 from ppg_hr.experimental.preprocess_protocol import load_and_preprocess_protocol
 from ppg_hr.experimental.protocol_outputs import (
@@ -302,7 +232,7 @@ from ppg_hr.experimental.run_batch_protocol import (
     run_batch_adaptive_protocol,
     run_batch_reference_compare,
 )
-from ppg_hr.experimental.segmentation import detect_activity_segments
+from ppg_hr.experimental.segmentation import apply_motion_protocol, detect_source_imu_segments
 from ppg_hr.preprocess.calibration import load_subject_calibration
 
 # 唯一数据输入。不要把本机绝对路径提交到仓库。
@@ -313,13 +243,13 @@ MOTION_TYPES = tuple(item.value for item in MotionType)
 assert MOTION_TYPES == ("write", "gripper", "run", "rope")
 
 TARGET_SCOPES = [TargetScope.MOTION_POST10.value]
-CASCADE_SCHEMES = [
-    CascadeScheme.ACC.value,
-    CascadeScheme.HF2.value,
-    CascadeScheme.UD2.value,
-    CascadeScheme.ACC_HF2.value,
-    CascadeScheme.HF2_CF2.value,
-    CascadeScheme.ACC_UD2.value,
+REFERENCE_GROUP_ORDERS = [
+    ('ACC',),
+    ('HF',),
+    ('UD',),
+    ('ACC', 'HF'),
+    ('HF', 'CF'),
+    ('ACC', 'UD'),
 ]
 ADAPTIVE_FILTERS = ["lms"]
 OBJECTIVE_MODE = "posthoc_aae"
@@ -327,28 +257,23 @@ DATA_SPLIT_MODE = "all_train"
 MAX_ITERATIONS = 200
 NUM_REPEATS = 1
 RANDOM_STATE = 42
-TW_F = 0.0
+CORE_PARAMS = resolve_core_config()
+prewarm_s = CORE_PARAMS.prewarm_s
 UD_CALCULATION_MODE = "smoothed"  # raw=原始 Uh/Uc 直接计算；smoothed=四路电压分别平滑后计算，默认为模式2。
-UD_SMOOTHING_WINDOW_S = 0.05  # 模式2中心移动中位数窗口(秒)；100 Hz 下 0.1 秒约为 10 点，可调。
+UD_SMOOTHING_WINDOW_S = 0.1  # 模式2中心移动中位数窗口(秒)；100 Hz 下 0.1 秒约为 10 点，可调。
 TRAIN_HR_POSTPROCESS_METHOD = "fft"  # 可选 fft/ssr，并进入运行目录名
 
-# 总开关：legacy 完全使用旧追踪；enhanced 再由下面六个布尔开关逐项控制。
-TRACKER_MODE = "enhanced"
-ENABLE_DIRECTIONAL_TRACKING = True
-ENABLE_DYNAMIC_PENALTY = True
-ENABLE_CONTINUITY_PROTECTION = True
-ENABLE_LOW_LOCK_RECOVERY = True
-ENABLE_HIGH_LOCK_RECOVERY = True
-ENABLE_POST_MOTION_PROTECTION = True
+# 核心增强追踪开关来自冻结preset；此处只配置独立protocol policy。
+MOTION_POLICY = "single_bout"  # protocol选择策略；检测器始终返回全部runs。
 
 RUN_OUTPUT_DIR = build_subject_output_dir(
     subject_dir=SUBJECT_DIR,
     target_scopes=TARGET_SCOPES,
-    cascade_schemes=CASCADE_SCHEMES,
+    reference_group_orders=REFERENCE_GROUP_ORDERS,
     adaptive_filters=ADAPTIVE_FILTERS,
     objective_mode=OBJECTIVE_MODE,
     data_split_mode=DATA_SPLIT_MODE,
-    tw_f_s=TW_F,
+    prewarm_s=prewarm_s,
     postprocess_method=TRAIN_HR_POSTPROCESS_METHOD,
 )
 RESULTS_ROOT = RUN_OUTPUT_DIR
@@ -365,43 +290,39 @@ print("RUN_OUTPUT_DIR:", RUN_OUTPUT_DIR)
 # 耗时风险：无。
 FS_ORIGIN = 100
 FS_TARGET = 100
-TW = 8
-NORMALIZATION_MODE = "minmax"
-QC_POLICY = "fallback_baseline"
-DELAY_ESTIMATION_MODE = "envelope"  # 可选 envelope/direct
-ALIGNMENT_TW = 12.0
-ALIGNMENT_STEP_S = 1.0
+hr_window_s = 8
+NORMALIZATION_MODE = CORE_PARAMS.normalization_mode
+QC_POLICY = CORE_PARAMS.qc_policy
+DELAY_ESTIMATION_MODE = CORE_PARAMS.delay_estimation_mode  # core固定envelope；仅延迟估计，不读取参考HR。
+EVALUATION_WINDOW_S = CORE_PARAMS.evaluation_window_s
+EVALUATION_STEP_S = CORE_PARAMS.evaluation_step_s
 
-REST_HR_BAND_BPM = (40.0, 180.0)
+REST_HR_BAND_BPM = CORE_PARAMS.Rest_HR_Band_BPM
 REST_HR_BAND_HZ = tuple(value / 60.0 for value in REST_HR_BAND_BPM)
-REST_HR_TRACK_BAND_BPM = 30.0
-REST_HR_SLEW_LIMIT_BPM = 6.0
-REST_HR_SLEW_STEP_BPM = 4.0
-REST_HR_SMOOTH_METHOD = "median"
-REST_HR_SMOOTH_WIN = 3
-REST_HR_PEAK_PERCENT = 0.3
-REST_HR_SPEC_PENALTY_ENABLE = True
-REST_HR_SPEC_PENALTY_WEIGHT = 0.2
-REST_HR_SPEC_PENALTY_WIDTH_HZ = 0.2
+REST_HR_TRACK_BAND_BPM = CORE_PARAMS.Rest_HR_Track_Band_BPM
+REST_HR_SLEW_LIMIT_BPM = CORE_PARAMS.Rest_HR_Slew_Limit_BPM
+REST_HR_SLEW_STEP_BPM = CORE_PARAMS.Rest_HR_Slew_Step_BPM
+REST_HR_SMOOTH_METHOD = CORE_PARAMS.Rest_HR_Smooth_Method
+REST_HR_SMOOTH_WIN = CORE_PARAMS.Rest_HR_Smooth_Win
+REST_HR_PEAK_PERCENT = CORE_PARAMS.Rest_HR_Peak_Percent
+REST_HR_SPEC_PENALTY_ENABLE = CORE_PARAMS.Rest_HR_Spec_Penalty_Enable
+REST_HR_SPEC_PENALTY_WEIGHT = CORE_PARAMS.Rest_HR_Spec_Penalty_Weight
+REST_HR_SPEC_PENALTY_WIDTH_HZ = CORE_PARAMS.Rest_HR_Spec_Penalty_Width_Hz
 REST_ALIGNMENT_SCORE_MODE = "aae"
 
 ENABLE_TIME_BIAS_AFTER = True
 TIME_BIAS_AFTER_RANGE_S = (-5.0, 5.0)
 TIME_BIAS_AFTER_STEP_S = 1.0
 TIME_BIAS_AFTER_MODE = "posthoc_oracle_alignment"
-RECOVERY_GRACE_S = 10.0
-RECOVERY_DIFF_BPM = 20.0
-RECOVERY_CROSS_DIFF_BPM = 8.0
 
 PPG_INPUT_TRANSFORM = "log_absorbance"
 LOG_ABSORBANCE_BASELINE_MODE = "rolling_median"
 LOG_ABSORBANCE_BASELINE_WINDOW_S = 5.0
 LOG_ABSORBANCE_EPS = 1e-6
 LOG_ABSORBANCE_RATIO_CLIP = (1e-3, 1e3)
-GLOBAL_OBJECTIVE_STRATEGY = "current_global_adaptive"
 
 REST_HR_KWARGS = {
-    "hr_band_hz": REST_HR_BAND_HZ,
+    "hr_band_bpm": REST_HR_BAND_BPM,
     "track_band_bpm": REST_HR_TRACK_BAND_BPM,
     "slew_limit_bpm": REST_HR_SLEW_LIMIT_BPM,
     "slew_step_bpm": REST_HR_SLEW_STEP_BPM,
@@ -416,119 +337,23 @@ REST_HR_KWARGS = {
         ),
         config_code(
             r'''
-# 用途：配置 HR 后处理、四种自适应滤波器、级联保护和增强追踪全部固定阈值。
-# 输入：固定值覆盖 Optuna 解码后的同名字段；搜索参数范围由 SEARCH_SPACE 控制。
-# 输出：滤波与追踪配置变量。
+# 用途：查看冻结核心，并构造固定参数验收配置，避免用 BO 掩盖结构问题。
+# 输入：实验轴与 params.py 的完整 v1 快照。
+# 输出：FIXED_CORE_PARAMS、PRESET_METADATA；只读展示，不运行算法。
 # 是否写文件：否。
-# 耗时风险：无；启用 SSR、Volterra、RFF-LMS 或 KLMS 会增加后续训练耗时。
-REDRAW_HR_POSTPROCESS_METHOD = None   # None 表示按训练记录恢复
-SSR_NUM_ATOMS = 5
-SSR_LAMBDA = 0.15
-SSR_HARMONIC_TOL_BPM = 5.0
-SSR_FALLBACK_TO_FFT = True
-SSR_GRID_RESOLUTION_BPM = 1.0
-
-LMS_MU_MIN = 1e-6
-TRACKING_SMOOTH_WIN_LEN = 7
-SPEC_PENALTY_WEIGHT = 0.4
-RFF_SIGMA = 1.0  # 仅用于兼容缺少 sigma_scale 的旧记录
-RFF_UPDATE_MODE = "nlms"
-RFF_NLMS_EPS = 1e-9
-RFF_LEAKAGE = 0.0
-RFF_ERR_CLIP = None
-RFF_THETA_NORM_GUARD = None
-KLMS_MAX_DICTIONARY_SIZE = 300
-KLMS_CENTER_PRUNE_POLICY = "freeze_new_centers"
-KLMS_DISTANCE_MODE = "normalized"
-KLMS_NORMALIZED_UPDATE = True
-KLMS_NLMS_EPS = 1e-6
-
-CASCADE_GUARD_POLICY = "none"
-CASCADE_GUARD_RATIO_MIN = 0.05
-CASCADE_GUARD_RATIO_MAX = 5.0
-CASCADE_GUARD_FLAT_STD_EPS = 1e-6
-CASCADE_GUARD_USE_FINITE_ZSCORE = True
-
-TRACKING_RANGE_UP_BPM = None
-TRACKING_RANGE_DOWN_BPM = None
-TRACKING_SLEW_LIMIT_UP_BPM = None
-TRACKING_SLEW_STEP_UP_BPM = None
-TRACKING_SLEW_LIMIT_DOWN_BPM = None
-TRACKING_SLEW_STEP_DOWN_BPM = None
-MOTION_TRACKING_RANGE_UP_BPM = 35.0
-MOTION_TRACKING_RANGE_DOWN_BPM = 15.0
-MOTION_TRACKING_SLEW_LIMIT_UP_BPM = 5.5
-MOTION_TRACKING_SLEW_STEP_UP_BPM = 3.5
-MOTION_TRACKING_SLEW_LIMIT_DOWN_BPM = 2.0
-MOTION_TRACKING_SLEW_STEP_DOWN_BPM = 1.5
-RECOVERY_TRACKING_RANGE_UP_BPM = 20.0
-RECOVERY_TRACKING_RANGE_DOWN_BPM = 25.0
-RECOVERY_TRACKING_SLEW_LIMIT_UP_BPM = 1.5
-RECOVERY_TRACKING_SLEW_STEP_UP_BPM = 1.5
-RECOVERY_TRACKING_SLEW_LIMIT_DOWN_BPM = 3.5
-RECOVERY_TRACKING_SLEW_STEP_DOWN_BPM = 3.0
-CANDIDATE_PEAK_THRESHOLD_RATIO = 0.30
-FULL_CANDIDATE_PEAK_THRESHOLD_RATIO = 0.15
-LOW_LOCK_MIN_BPM = 50.0
-LOW_LOCK_MAX_BPM = 80.0
-LOW_LOCK_MIN_WINDOWS = 4
-LOW_LOCK_TARGET_MIN_BPM = 90.0
-LOW_LOCK_MIN_JUMP_BPM = 20.0
-LOW_LOCK_MIN_AMP_RATIO = 0.45
-LOW_LOCK_CANDIDATE_STABLE_BPM = 10.0
-LOW_LOCK_CONFIRM_WINDOWS = 3
-LOW_LOCK_STEP_BPM = 30.0
-HIGH_LOCK_CONFIRM_WINDOWS = 3
-HIGH_LOCK_COOLDOWN_WINDOWS = 4
-HIGH_LOCK_MIN_GAP_BPM = 20.0
-HIGH_LOCK_MIN_AMP_RATIO = 0.45
-HIGH_LOCK_CANDIDATE_MIN_BPM = 85.0
-HIGH_LOCK_CANDIDATE_STABLE_BPM = 10.0
-HIGH_LOCK_PENALTY_EXCLUSION_BPM = 10.0
-HIGH_LOCK_DOWN_STEP_BPM = 20.0
-HIGH_LOCK_UP_STEP_BPM = 3.0
-POST_MOTION_GUARD_SECONDS = None
-POST_MOTION_GUARD_MIN_ELAPSED_S = 5.0
-POST_MOTION_GUARD_STABLE_WINDOWS = 3
-POST_MOTION_GUARD_CROSSOVER_GAP_BPM = 2.0
-POST_MOTION_GUARD_UPWARD_GAP_BPM = 1.5
-POST_MOTION_GUARD_FFT_FLOOR_BPM = 55.0
-POST_MOTION_GUARD_RECOVERY_STEP_UP_BPM = 1.5
-POST_MOTION_GUARD_RECOVERY_STEP_DOWN_BPM = 3.0
-POST_MOTION_GUARD_RISING_WINDOWS = 3
-POST_MOTION_GUARD_RISING_SLOPE_BPM_PER_WINDOW = 1.5
-POST_MOTION_GUARD_RESCUE_GAP_BPM = 20.0
-POST_MOTION_GUARD_GAP_RESCUE_ENABLE = True
-POST_MOTION_GUARD_GAP_RESCUE_WINDOWS = 4
-POST_MOTION_GUARD_GAP_RESCUE_MIN_HITS = 3
-POST_MOTION_GUARD_FFT_STABLE_WINDOWS = 3
-POST_MOTION_GUARD_FFT_STABLE_BPM = 6.0
-
-# Optuna 离散搜索空间。需要收缩或扩展候选值时直接修改对应列表。
-SEARCH_SPACE = default_protocol_search_space()
-SEARCH_SPACE.Fs_Target = [25, 50]
-SEARCH_SPACE.TW = [6, 8, 10]
-SEARCH_SPACE.Kstop = [0.2, 0.3, 0.5]
-SEARCH_SPACE.max_order = [8, 12, 16, 20]
-SEARCH_SPACE.M_base = [1, 2]
-SEARCH_SPACE.C_scale = [0.6, 0.9, 1.2, 1.5]
-SEARCH_SPACE.K_max = [8, 12, 16, 20, 30]
-SEARCH_SPACE.Spec_Penalty_Width = [0.1, 0.2, 0.3]
-SEARCH_SPACE.hr_range_hz = [value / 60.0 for value in (20, 25, 30, 35, 40)]
-SEARCH_SPACE.slew_limit_bpm = [8, 10, 12, 14]
-SEARCH_SPACE.slew_step_bpm = [5, 7, 9]
-SEARCH_SPACE.Rest_HR_Track_Band_BPM = [20.0, 30.0, 60.0, 80.0]
-SEARCH_SPACE.Rest_HR_Slew_Limit_BPM = [1.0, 3.0, 6.0, 8.0]
-SEARCH_SPACE.Rest_HR_Slew_Step_BPM = [0.5, 2.0, 4.0]
-SEARCH_SPACE.LMS_Mu_Base = [0.004, 0.006, 0.008]
-SEARCH_SPACE.RFF_LMS_Mu_Base = [0.001, 0.002, 0.004, 0.006]
-SEARCH_SPACE.alpha_u = [0.005, 0.01, 0.03, 0.05, 0.1]
-SEARCH_SPACE.M2 = [2, 3]
-SEARCH_SPACE.rff_D = [50, 100, 200]
-SEARCH_SPACE.rff_sigma_scale = [0.5, 1.0, 2.0, 4.0]
-SEARCH_SPACE.klms_step_size = [0.005, 0.01, 0.02, 0.05]
-SEARCH_SPACE.klms_sigma = [0.5, 1.0, 2.0, 5.0]
-SEARCH_SPACE.klms_epsilon = [0.005, 0.01, 0.02, 0.05, 0.1]
+# 耗时风险：无；四层流程与所有 rescue 开关都在 preset metadata 中可检查。
+REDRAW_HR_POSTPROCESS_METHOD = None  # replay 默认恢复记录的实际 estimator。
+FIXED_REFERENCE_GROUPS_ORDER = ("ACC", "HF")  # 单组例：( "UD", )；反向例：( "HF", "ACC" )。
+FIXED_CORE_PARAMS = resolve_core_config({  # 固定验收配置；所有其余参数来自v1快照。
+    "Fs_Target": 100,  # 固定验收使用100Hz；BO另选25/50，detector仍在source域。
+    "memory_ms": 160,  # 历史正延迟上限约160ms；M/K仍由延迟映射，K并未物理统一。
+    "LMS_Mu_Base": 0.01,  # 固定验收步长；不使用BO寻找更好指标。
+    "postprocess_method": TRAIN_HR_POSTPROCESS_METHOD,  # FFT/SSR仅改变谱估计器。
+    "ppg_input_transform": PPG_INPUT_TRANSFORM,  # 从clean PPG生成algorithm input。
+    "motion_policy": MOTION_POLICY,  # single_bout最长段，multi_bout保留全部。
+})
+PRESET_METADATA = core_preset_metadata(FIXED_CORE_PARAMS)  # 核查preset/version、flags、核心参数和参考SHA。
+display(PRESET_METADATA)
 '''
         ),
         config_code(
@@ -550,123 +375,21 @@ TEST_GROUPS_PER_TYPE = 1
 CASCADE_TRAIN_BUDGETS = None
 
 TRIAL_PARAM_OVERRIDES = {
-    "TW_F": TW_F,
-    "normalization_mode": NORMALIZATION_MODE,
-    "smooth_win_len": TRACKING_SMOOTH_WIN_LEN,
-    "Spec_Penalty_Weight": SPEC_PENALTY_WEIGHT,
     "postprocess_method": TRAIN_HR_POSTPROCESS_METHOD,
-    "SSR_Num_Atoms": SSR_NUM_ATOMS,
-    "SSR_Lambda": SSR_LAMBDA,
-    "SSR_Harmonic_Tol_BPM": SSR_HARMONIC_TOL_BPM,
-    "SSR_Fallback_To_FFT": SSR_FALLBACK_TO_FFT,
-    "SSR_Grid_Resolution_BPM": SSR_GRID_RESOLUTION_BPM,
-    "LMS_Mu_Min": LMS_MU_MIN,
-    "qc_policy": QC_POLICY,
-    "delay_estimation_mode": DELAY_ESTIMATION_MODE,
-    "Alignment_TW": ALIGNMENT_TW,
-    "Alignment_Step": ALIGNMENT_STEP_S,
-    "Rest_HR_Band_BPM": REST_HR_BAND_BPM,
-    "Rest_HR_Smooth_Method": REST_HR_SMOOTH_METHOD,
-    "Rest_HR_Smooth_Win": REST_HR_SMOOTH_WIN,
-    "Rest_HR_Peak_Percent": REST_HR_PEAK_PERCENT,
-    "Rest_HR_Spec_Penalty_Enable": REST_HR_SPEC_PENALTY_ENABLE,
-    "Rest_HR_Spec_Penalty_Weight": REST_HR_SPEC_PENALTY_WEIGHT,
-    "Rest_HR_Spec_Penalty_Width_Hz": REST_HR_SPEC_PENALTY_WIDTH_HZ,
-    "Rest_Alignment_Score_Mode": REST_ALIGNMENT_SCORE_MODE,
+    "ppg_input_transform": PPG_INPUT_TRANSFORM,
+    "motion_policy": MOTION_POLICY,  # 单/多bout只控制protocol选择，不修改detector。
     "Enable_Time_Bias_After": ENABLE_TIME_BIAS_AFTER,
     "Time_Bias_After_Range_S": TIME_BIAS_AFTER_RANGE_S,
     "Time_Bias_After_Step_S": TIME_BIAS_AFTER_STEP_S,
     "Time_Bias_After_Mode": TIME_BIAS_AFTER_MODE,
-    "Recovery_Grace_S": RECOVERY_GRACE_S,
-    "Recovery_Diff_Bpm": RECOVERY_DIFF_BPM,
-    "Recovery_Cross_Diff_Bpm": RECOVERY_CROSS_DIFF_BPM,
-    "rff_sigma": RFF_SIGMA,
-    "rff_update_mode": RFF_UPDATE_MODE,
-    "rff_nlms_eps": RFF_NLMS_EPS,
-    "rff_leakage": RFF_LEAKAGE,
-    "rff_err_clip": RFF_ERR_CLIP,
-    "rff_theta_norm_guard": RFF_THETA_NORM_GUARD,
-    "klms_max_dictionary_size": KLMS_MAX_DICTIONARY_SIZE,
-    "klms_center_prune_policy": KLMS_CENTER_PRUNE_POLICY,
-    "klms_distance_mode": KLMS_DISTANCE_MODE,
-    "klms_normalized_update": KLMS_NORMALIZED_UPDATE,
-    "klms_nlms_eps": KLMS_NLMS_EPS,
-    "ppg_input_transform": PPG_INPUT_TRANSFORM,
-    "log_absorbance_baseline_mode": LOG_ABSORBANCE_BASELINE_MODE,
-    "log_absorbance_baseline_window_s": LOG_ABSORBANCE_BASELINE_WINDOW_S,
-    "log_absorbance_eps": LOG_ABSORBANCE_EPS,
-    "log_absorbance_ratio_clip": LOG_ABSORBANCE_RATIO_CLIP,
-    "global_objective_strategy": GLOBAL_OBJECTIVE_STRATEGY,
-    "cascade_guard_policy": CASCADE_GUARD_POLICY,
-    "cascade_guard_ratio_min": CASCADE_GUARD_RATIO_MIN,
-    "cascade_guard_ratio_max": CASCADE_GUARD_RATIO_MAX,
-    "cascade_guard_flat_std_eps": CASCADE_GUARD_FLAT_STD_EPS,
-    "cascade_guard_use_finite_zscore": CASCADE_GUARD_USE_FINITE_ZSCORE,
-    "tracker_mode": TRACKER_MODE,
-    "enable_directional_tracking": ENABLE_DIRECTIONAL_TRACKING,
-    "enable_dynamic_penalty": ENABLE_DYNAMIC_PENALTY,
-    "enable_continuity_protection": ENABLE_CONTINUITY_PROTECTION,
-    "enable_low_lock_recovery": ENABLE_LOW_LOCK_RECOVERY,
-    "enable_high_lock_recovery": ENABLE_HIGH_LOCK_RECOVERY,
-    "enable_post_motion_protection": ENABLE_POST_MOTION_PROTECTION,
-    "tracking_range_up_bpm": TRACKING_RANGE_UP_BPM,
-    "tracking_range_down_bpm": TRACKING_RANGE_DOWN_BPM,
-    "tracking_slew_limit_up_bpm": TRACKING_SLEW_LIMIT_UP_BPM,
-    "tracking_slew_step_up_bpm": TRACKING_SLEW_STEP_UP_BPM,
-    "tracking_slew_limit_down_bpm": TRACKING_SLEW_LIMIT_DOWN_BPM,
-    "tracking_slew_step_down_bpm": TRACKING_SLEW_STEP_DOWN_BPM,
-    "motion_tracking_range_up_bpm": MOTION_TRACKING_RANGE_UP_BPM,
-    "motion_tracking_range_down_bpm": MOTION_TRACKING_RANGE_DOWN_BPM,
-    "motion_tracking_slew_limit_up_bpm": MOTION_TRACKING_SLEW_LIMIT_UP_BPM,
-    "motion_tracking_slew_step_up_bpm": MOTION_TRACKING_SLEW_STEP_UP_BPM,
-    "motion_tracking_slew_limit_down_bpm": MOTION_TRACKING_SLEW_LIMIT_DOWN_BPM,
-    "motion_tracking_slew_step_down_bpm": MOTION_TRACKING_SLEW_STEP_DOWN_BPM,
-    "recovery_tracking_range_up_bpm": RECOVERY_TRACKING_RANGE_UP_BPM,
-    "recovery_tracking_range_down_bpm": RECOVERY_TRACKING_RANGE_DOWN_BPM,
-    "recovery_tracking_slew_limit_up_bpm": RECOVERY_TRACKING_SLEW_LIMIT_UP_BPM,
-    "recovery_tracking_slew_step_up_bpm": RECOVERY_TRACKING_SLEW_STEP_UP_BPM,
-    "recovery_tracking_slew_limit_down_bpm": RECOVERY_TRACKING_SLEW_LIMIT_DOWN_BPM,
-    "recovery_tracking_slew_step_down_bpm": RECOVERY_TRACKING_SLEW_STEP_DOWN_BPM,
-    "candidate_peak_threshold_ratio": CANDIDATE_PEAK_THRESHOLD_RATIO,
-    "full_candidate_peak_threshold_ratio": FULL_CANDIDATE_PEAK_THRESHOLD_RATIO,
-    "low_lock_min_bpm": LOW_LOCK_MIN_BPM,
-    "low_lock_max_bpm": LOW_LOCK_MAX_BPM,
-    "low_lock_min_windows": LOW_LOCK_MIN_WINDOWS,
-    "low_lock_target_min_bpm": LOW_LOCK_TARGET_MIN_BPM,
-    "low_lock_min_jump_bpm": LOW_LOCK_MIN_JUMP_BPM,
-    "low_lock_min_amp_ratio": LOW_LOCK_MIN_AMP_RATIO,
-    "low_lock_candidate_stable_bpm": LOW_LOCK_CANDIDATE_STABLE_BPM,
-    "low_lock_confirm_windows": LOW_LOCK_CONFIRM_WINDOWS,
-    "low_lock_step_bpm": LOW_LOCK_STEP_BPM,
-    "high_lock_confirm_windows": HIGH_LOCK_CONFIRM_WINDOWS,
-    "high_lock_cooldown_windows": HIGH_LOCK_COOLDOWN_WINDOWS,
-    "high_lock_min_gap_bpm": HIGH_LOCK_MIN_GAP_BPM,
-    "high_lock_min_amp_ratio": HIGH_LOCK_MIN_AMP_RATIO,
-    "high_lock_candidate_min_bpm": HIGH_LOCK_CANDIDATE_MIN_BPM,
-    "high_lock_candidate_stable_bpm": HIGH_LOCK_CANDIDATE_STABLE_BPM,
-    "high_lock_penalty_exclusion_bpm": HIGH_LOCK_PENALTY_EXCLUSION_BPM,
-    "high_lock_down_step_bpm": HIGH_LOCK_DOWN_STEP_BPM,
-    "high_lock_up_step_bpm": HIGH_LOCK_UP_STEP_BPM,
-    "post_motion_guard_seconds": POST_MOTION_GUARD_SECONDS,
-    "post_motion_guard_min_elapsed_s": POST_MOTION_GUARD_MIN_ELAPSED_S,
-    "post_motion_guard_stable_windows": POST_MOTION_GUARD_STABLE_WINDOWS,
-    "post_motion_guard_crossover_gap_bpm": POST_MOTION_GUARD_CROSSOVER_GAP_BPM,
-    "post_motion_guard_upward_gap_bpm": POST_MOTION_GUARD_UPWARD_GAP_BPM,
-    "post_motion_guard_fft_floor_bpm": POST_MOTION_GUARD_FFT_FLOOR_BPM,
-    "post_motion_guard_recovery_step_up_bpm": POST_MOTION_GUARD_RECOVERY_STEP_UP_BPM,
-    "post_motion_guard_recovery_step_down_bpm": POST_MOTION_GUARD_RECOVERY_STEP_DOWN_BPM,
-    "post_motion_guard_rising_windows": POST_MOTION_GUARD_RISING_WINDOWS,
-    "post_motion_guard_rising_slope_bpm_per_window": POST_MOTION_GUARD_RISING_SLOPE_BPM_PER_WINDOW,
-    "post_motion_guard_rescue_gap_bpm": POST_MOTION_GUARD_RESCUE_GAP_BPM,
-    "post_motion_guard_gap_rescue_enable": POST_MOTION_GUARD_GAP_RESCUE_ENABLE,
-    "post_motion_guard_gap_rescue_windows": POST_MOTION_GUARD_GAP_RESCUE_WINDOWS,
-    "post_motion_guard_gap_rescue_min_hits": POST_MOTION_GUARD_GAP_RESCUE_MIN_HITS,
-    "post_motion_guard_fft_stable_windows": POST_MOTION_GUARD_FFT_STABLE_WINDOWS,
-    "post_motion_guard_fft_stable_bpm": POST_MOTION_GUARD_FFT_STABLE_BPM,
 }
+SEARCH_SPACE = default_protocol_search_space()  # 每滤波器只有四维；候选列表集中于params.py。
+for filter_name in ADAPTIVE_FILTERS:
+    print(filter_name, {name: SEARCH_SPACE.options(name, adaptive_filter=filter_name)
+                        for name in SEARCH_SPACE.names_for_filter(filter_name)})
 
-RUN_STATIC_QC = True
-RUN_PREPROCESS_PREVIEW = True
+RUN_STATIC_QC = False
+RUN_PREPROCESS_PREVIEW = False
 RUN_ALIGNMENT_DIAGNOSTICS = False
 RUN_FULLFIELD_PLOT = False
 RUN_RAW_PPG_PLOT = False
@@ -681,6 +404,8 @@ RUN_CROSS_WINDOW_DIAGNOSTICS = False
 RUN_BATCH_REFERENCE_COMPARE = False
 RUN_BATCH_TARGET_HR_REDRAW = False
 CONNECTIVITY_MAX_ITERATIONS = 1
+
+RUN_FIXED_CORE = False  # 先固定运行并检查边界/曲线/metadata，再决定是否打开BO。
 '''
         ),
     ]
@@ -731,7 +456,7 @@ else:
     cells += section(
         2,
         "单样本预处理、分段和对齐预览",
-        """通过 motion/index 选择一个样本，检查 CF2、HF2、HF2comp、UD2、ACC、QC 和运动分段。
+        """通过 motion/index 选择一个样本，检查 CF2、HF、HFcomp、UD、ACC、QC 和运动分段。
 
 本节涉及的参数和可配置项如下：
 
@@ -743,7 +468,7 @@ else:
 | `SUBJECT_DIR` | 当前唯一受试者目录 | 在第 0 节或环境变量 `PPG_SUBJECT_DIR` 中设置；本节不会扫描其他受试者。 |
 | `calibration` | 当前受试者的标定系数 | 不是可搜索超参数；固定由第 1 节从 `SUBJECT_DIR.parent / "ck.mat"` 解析并校验。 |
 | `FS_ORIGIN` | 原始传感器采样率 | change6 数据协议固定为 100 Hz；通常保持 `100`，修改后必须与采集序号和真实采样率一致。 |
-| `TW` | 本节运动分段的窗口长度，单位秒 | 预览默认 `8` 秒。这里只影响预览分段；正式训练中的 trial 窗长由 `SEARCH_SPACE.TW` 候选列表采样。 |
+| `hr_window_s` | 本节运动分段的窗口长度，单位秒 | 固定 `8` 秒，步长固定 `1` 秒；detector 与正式 HR observation 都使用此时间网格，但独立计算。 |
 
 本节完成信号预处理和运动分段，并加载参考 HR，为后续对齐诊断准备数据；真正的全局
 Tdelay 搜索和对齐图在第 3 节执行。`PPG_INPUT_TRANSFORM` 则在正式求解窗口内生效，
@@ -762,7 +487,7 @@ PREVIEW_MOTION_INDEX = 1
 # SUBJECT_DIR: 唯一受试者目录，已在第 0 节解析；本节不会切换或扫描其他受试者。
 # calibration: 第 1 节从 SUBJECT_DIR.parent/ck.mat 得到，不允许在此硬编码标定数值。
 # FS_ORIGIN: 原始采样率，change6/Pydisplay 协议固定按 100 Hz 和序号字段校验。
-# TW: 仅用于本节 detect_activity_segments 的分段窗口；正式训练由 SEARCH_SPACE.TW 采样。
+# hr_window_s: detector 和 observation 固定8秒/1秒；prewarm、memory 不改变窗口数量。
 preview_pair = None
 preview_dataset = None
 preview_segment = None
@@ -784,13 +509,7 @@ if RUN_PREPROCESS_PREVIEW and discovery is not None:
             ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S,
         )
         datasets[preview_pair.motion_id] = preview_dataset
-        preview_segment = detect_activity_segments(
-            preview_dataset.accx,
-            preview_dataset.accy,
-            preview_dataset.accz,
-            preview_dataset.fs,
-            TW=TW,
-        )
+        preview_segment = apply_motion_protocol(detect_source_imu_segments(preview_dataset.source_imu), MOTION_POLICY)
         display(preview_dataset.to_frame().head())
         print("样本：", preview_pair.sample_id)
         print("标定/序号元数据：", preview_dataset.source_metadata)
@@ -799,6 +518,37 @@ else:
     print("RUN_PREPROCESS_PREVIEW=False 或尚未发现配对，跳过预览。")
 ''',
     )
+    cells.append(markdown('''
+### 固定参数验收：先查看曲线与状态，再考虑搜索
+
+输入是第2节的 preview_dataset。求解内部先取不含参考HR的 sensor_view；完整预测完成后才计算误差。
+输出保存固定配置、各窗口状态、候选来源和Final。window_start_s / window_center_s / window_end_s
+分别描述8秒窗的边界与中心，phase、scope和handoff都以center判断。参考覆盖不足只使误差为NaN。
+'''))
+    cells.append(code(r'''
+# 用途：固定100Hz、160ms、LMS步长0.01运行核心，不创建Optuna study。
+# 输入：preview_dataset（先打开RUN_PREPROCESS_PREVIEW）。
+# 输出：fixed_core/窗口CSV和完整preset JSON，检查中心时间、phase、source与handoff。
+# 是否写文件：是，仅RUN_FIXED_CORE=True时。
+# 耗时风险：中；完整求解一个记录。
+fixed_result = None
+if RUN_FIXED_CORE:
+    if preview_dataset is None:
+        raise ValueError("请先运行第2节预览")
+    fixed_result = run_protocol_trial(preview_dataset, FIXED_REFERENCE_GROUPS_ORDER,
+                                      TARGET_SCOPES[0], FIXED_CORE_PARAMS, collect_frame=True)
+    if not fixed_result.success:
+        raise RuntimeError(fixed_result.reason)
+    fixed_dir = RUN_OUTPUT_DIR / "fixed_core"
+    fixed_dir.mkdir(parents=True, exist_ok=True)
+    fixed_result.frame.to_csv(fixed_dir / "windows.csv", index=False)
+    import json
+    (fixed_dir / "preset.json").write_text(json.dumps(PRESET_METADATA, indent=2), encoding="utf-8")
+    display(fixed_result.frame.head())
+    print("Scope Final AAE:", fixed_result.final_aae_bpm, "检测/选择:", fixed_result.segment_info)
+else:
+    print("RUN_FIXED_CORE=False，跳过固定求解。")
+'''))
     cells += section(
         3,
         "输出静息段全局 Tdelay 对齐诊断图",
@@ -826,9 +576,9 @@ if RUN_ALIGNMENT_DIAGNOSTICS and discovery is not None:
         datasets,
         RUN_OUTPUT_DIR / "alignment_diagnostics",
         fs_target=FS_TARGET,
-        TW=TW,
-        alignment_TW=ALIGNMENT_TW,
-        alignment_step_s=ALIGNMENT_STEP_S,
+        hr_window_s=hr_window_s,
+        evaluation_window_s=EVALUATION_WINDOW_S,
+        evaluation_step_s=EVALUATION_STEP_S,
         rest_hr_kwargs=REST_HR_KWARGS,
         alignment_score_mode=REST_ALIGNMENT_SCORE_MODE,
     )
@@ -864,8 +614,8 @@ if RUN_FULLFIELD_PLOT and discovery is not None:
         datasets,
         RUN_OUTPUT_DIR / "fullfield_ppg_hr",
         fs_target=FS_TARGET,
-        TW=TW,
-        step_s=ALIGNMENT_STEP_S,
+        hr_window_s=hr_window_s,
+        step_s=EVALUATION_STEP_S,
         **REST_HR_KWARGS,
     )
     print(fullfield_paths)
@@ -891,7 +641,7 @@ def notebook_progress(info):
     current = f"{int(info.get('mode_current', 0))}/{int(info.get('mode_total', 0))}"
     mode = (
         f"{info.get('motion_type')} / {info.get('target_scope_value')} / "
-        f"{info.get('cascade_scheme_display')} / {str(info.get('adaptive_filter')).upper()}"
+        f"{info.get('reference_order_key')} / {str(info.get('adaptive_filter')).upper()}"
     )
     if info.get("success"):
         print(
@@ -906,7 +656,7 @@ def notebook_progress(info):
         print(f"[{current}] {state}: {mode} | 原因={info.get('reason', '')} | 耗时={float(info.get('training_elapsed_s', 0.0)):.1f}s")
 
 
-def run_training_cell(*, max_iterations, target_scopes, cascade_schemes, adaptive_filters):
+def run_training_cell(*, max_iterations, target_scopes, reference_group_orders, adaptive_filters):
     return run_batch_adaptive_protocol(
         subject_dir=SUBJECT_DIR,
         output_root=RUN_OUTPUT_DIR,
@@ -925,7 +675,7 @@ def run_training_cell(*, max_iterations, target_scopes, cascade_schemes, adaptiv
         search_space=SEARCH_SPACE,
         trial_param_overrides=TRIAL_PARAM_OVERRIDES,
         target_scopes=target_scopes,
-        cascade_schemes=cascade_schemes,
+        reference_group_orders=reference_group_orders,
         adaptive_filters=adaptive_filters,
         objective_mode=OBJECTIVE_MODE,
         data_split_mode=DATA_SPLIT_MODE,
@@ -967,8 +717,8 @@ if RUN_RAW_PPG_PLOT and discovery is not None:
         RUN_OUTPUT_DIR / "raw_ppg_dual_axis",
         fs_target=FS_TARGET,
         fs_origin=FS_ORIGIN,
-        TW=TW,
-        step_s=ALIGNMENT_STEP_S,
+        hr_window_s=hr_window_s,
+        step_s=EVALUATION_STEP_S,
         **REST_HR_KWARGS,
     )
     print(raw_ppg_paths)
@@ -986,29 +736,12 @@ else:
 # 输出：RUN_OUTPUT_DIR 下的 QC、图表、Stage-6 记录、history 和模式 checkpoint。
 # 是否写文件：是，仅在 RUN_ALL_TRAIN=True 时。
 # 耗时风险：高；真实数据会对每个运动/模式执行完整 Optuna 优化。
-TARGET_SCOPES = [TargetScope.MOTION_POST10.value]
-CASCADE_SCHEMES = [
-    CascadeScheme.ACC.value,
-    CascadeScheme.HF2.value,
-    CascadeScheme.UD2.value,
-    CascadeScheme.ACC_HF2.value,
-    CascadeScheme.HF2_CF2.value,
-    CascadeScheme.ACC_UD2.value,
-]
-ADAPTIVE_FILTERS = ["lms"]
-OBJECTIVE_MODE = "posthoc_aae"
-DATA_SPLIT_MODE = "all_train"
-MAX_ITERATIONS = 200
-NUM_REPEATS = 1
-RANDOM_STATE = 42
-TW_F = 0.0
-
 result_all_train = None
 if RUN_ALL_TRAIN:
     result_all_train = run_training_cell(
         max_iterations=MAX_ITERATIONS,
         target_scopes=TARGET_SCOPES,
-        cascade_schemes=CASCADE_SCHEMES,
+        reference_group_orders=REFERENCE_GROUP_ORDERS,
         adaptive_filters=ADAPTIVE_FILTERS,
     )
     RESULTS_ROOT = result_all_train.output_root
@@ -1017,61 +750,30 @@ else:
     print("RUN_ALL_TRAIN=False，未创建 Optuna study。")
 ''',
     )
-    cells.append(nbformat.v4.new_code_cell(r'''
-TARGET_SCOPES = [TargetScope.MOTION_POST10.value]
-CASCADE_SCHEMES = [
-    CascadeScheme.ACC.value,
-    CascadeScheme.HF2.value,
-    CascadeScheme.UD2.value,
-    CascadeScheme.ACC_HF2.value,
-    CascadeScheme.HF2_CF2.value,
-    CascadeScheme.ACC_UD2.value,
-]
-ADAPTIVE_FILTERS = ["volterra"]
-OBJECTIVE_MODE = "posthoc_aae"
-DATA_SPLIT_MODE = "all_train"
-MAX_ITERATIONS = 200
-NUM_REPEATS = 1
-RANDOM_STATE = 42
-TW_F = 0.0
-
-result_all_train = None
-if RUN_ALL_TRAIN:
-    result_all_train = run_training_cell(
-        max_iterations=MAX_ITERATIONS,
-        target_scopes=TARGET_SCOPES,
-        cascade_schemes=CASCADE_SCHEMES,
-        adaptive_filters=ADAPTIVE_FILTERS,
-    )
-    RESULTS_ROOT = result_all_train.output_root
-    print("训练结果：", RESULTS_ROOT)
-else:
-    print("RUN_ALL_TRAIN=False，未创建 Optuna study。")
-'''.strip() + "\n"))
     cells += section(
         8,
         "当前配置的模式连通性检查",
         "模式数量按已发现运动数 × scope × scheme × filter 动态计算，不再使用旧的 84 模式。",
         r'''
-# # 用途：用极小 trial 数检查当前 motion/scope/scheme/filter 组合能否完整连通。
-# # 输入：CONNECTIVITY_MAX_ITERATIONS 和当前实验组合。
-# # 输出：与正式训练共用模式级目录和配置指纹；建议使用独立 scheme 子集测试。
-# # 是否写文件：是，仅在 RUN_CONNECTIVITY_CHECK=True 时。
-# # 耗时风险：中到高；即使每模式 1 trial，也会处理所有已选模式和全部数据。
-# motion_count = len({pair.motion_type for pair in discovery.pairs}) if discovery is not None else 0
-# configured_mode_count = motion_count * len(TARGET_SCOPES) * len(CASCADE_SCHEMES) * len(ADAPTIVE_FILTERS)
-# print("当前配置模式数：", configured_mode_count)
-# result_connectivity = None
-# if RUN_CONNECTIVITY_CHECK:
-#     result_connectivity = run_training_cell(
-#         max_iterations=CONNECTIVITY_MAX_ITERATIONS,
-#         target_scopes=TARGET_SCOPES,
-#         cascade_schemes=CASCADE_SCHEMES,
-#         adaptive_filters=ADAPTIVE_FILTERS,
-#     )
-#     RESULTS_ROOT = result_connectivity.output_root
-# else:
-#     print("RUN_CONNECTIVITY_CHECK=False，跳过连通性检查。")
+# 用途：用极小 trial 数检查当前 motion/scope/scheme/filter 组合能否完整连通。
+# 输入：CONNECTIVITY_MAX_ITERATIONS 和当前实验组合。
+# 输出：与正式训练共用模式级目录和配置指纹；建议使用独立 scheme 子集测试。
+# 是否写文件：是，仅在 RUN_CONNECTIVITY_CHECK=True 时。
+# 耗时风险：中到高；即使每模式 1 trial，也会处理所有已选模式和全部数据。
+motion_count = len({pair.motion_type for pair in discovery.pairs}) if discovery is not None else 0
+configured_mode_count = motion_count * len(TARGET_SCOPES) * len(REFERENCE_GROUP_ORDERS) * len(ADAPTIVE_FILTERS)
+print("当前配置模式数：", configured_mode_count)
+result_connectivity = None
+if RUN_CONNECTIVITY_CHECK:
+    result_connectivity = run_training_cell(
+        max_iterations=CONNECTIVITY_MAX_ITERATIONS,
+        target_scopes=TARGET_SCOPES,
+        reference_group_orders=REFERENCE_GROUP_ORDERS,
+        adaptive_filters=ADAPTIVE_FILTERS,
+    )
+    RESULTS_ROOT = result_connectivity.output_root
+else:
+    print("RUN_CONNECTIVITY_CHECK=False，跳过连通性检查。")
 ''',
     )
     cells += section(
@@ -1122,15 +824,11 @@ REPLAY_MOTION_TYPE = "write"
 REPLAY_MOTION_INDEX = 1
 REPLAY_TARGET_SCOPE = TargetScope.MOTION_POST10.value
 REPLAY_ADAPTIVE_FILTER = "lms"
-REPLAY_CASCADE_SCHEME = CascadeScheme.ACC.value
+REPLAY_REFERENCE_ORDER_KEY = ReferenceConfig(('ACC',)).reference_order_key
 REPLAY_ADAPTIVE_DATA_TYPE = ""
-REPLAY_TW_F = TW_F
+REPLAY_prewarm_s = prewarm_s
 REPLAY_SPLIT = ""
 REPLAY_MODE = ""
-REPLAY_GUARD_RATIO_MIN_OVERRIDE = None
-REPLAY_GUARD_RATIO_MAX_OVERRIDE = None
-REPLAY_GUARD_FLAT_STD_EPS_OVERRIDE = None
-REPLAY_GUARD_USE_FINITE_ZSCORE_OVERRIDE = None
 REPLAY_OUTPUT_DIR = Path(RESULTS_ROOT) / "replay"
 
 def select_subject_pair(motion_type, motion_index):
@@ -1160,19 +858,15 @@ if RUN_STAGE7_REPLAY:
         target_scope=REPLAY_TARGET_SCOPE,
         adaptive_filter=REPLAY_ADAPTIVE_FILTER,
         adaptive_data_type=REPLAY_ADAPTIVE_DATA_TYPE,
-        cascade_scheme=REPLAY_CASCADE_SCHEME,
-        TW_F=REPLAY_TW_F,
+        reference_config=REPLAY_REFERENCE_ORDER_KEY,
+        prewarm_s=REPLAY_prewarm_s,
         fs_origin=FS_ORIGIN,
         ud_calculation_mode=UD_CALCULATION_MODE,
         ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S,
-        guard_ratio_min_override=REPLAY_GUARD_RATIO_MIN_OVERRIDE,
-        guard_ratio_max_override=REPLAY_GUARD_RATIO_MAX_OVERRIDE,
-        guard_flat_std_eps_override=REPLAY_GUARD_FLAT_STD_EPS_OVERRIDE,
-        guard_use_finite_zscore_override=REPLAY_GUARD_USE_FINITE_ZSCORE_OVERRIDE,
         postprocess_method_override=REDRAW_HR_POSTPROCESS_METHOD,
     )
     print(replay_paths)
-    display(Image(filename=str(replay_paths["plot_guarded"])))
+    display(Image(filename=str(replay_paths["plot"])))
 else:
     print("RUN_STAGE7_REPLAY=False，跳过单样本回放。")
 ''',
@@ -1180,15 +874,15 @@ else:
     cells += section(
         11,
         "对单个样本输出窗口级波形与频谱诊断",
-        "复用第 10 节的样本和参数选择器，查看指定对齐窗口的输入、频谱、权重和追踪状态。",
+        "复用第 10 节的样本和参数选择器，查看指定传感器时间窗口的输入、频谱、权重和追踪状态。",
         r'''
 # 用途：从 Stage-6 参数记录重建一个窗口的完整诊断图和状态摘要。
-# 输入：第 10 节 REPLAY_* 配置以及 MANUAL_ALIGNED_FFT_START_S。
+# 输入：第 10 节 REPLAY_* 配置以及 DIAGNOSTIC_WINDOW_START_S。
 # 输出：RESULTS_ROOT/window_diagnostics 下的图表和诊断信息。
 # 是否写文件：是，仅在 RUN_WINDOW_DIAGNOSTICS=True 时。
 # 耗时风险：中；执行单样本回放和单窗口诊断，不启动 Optuna。
 DIAGNOSTIC_OUTPUT_DIR = Path(RESULTS_ROOT) / "window_diagnostics"
-MANUAL_ALIGNED_FFT_START_S = 80.0
+DIAGNOSTIC_WINDOW_START_S = 80.0
 window_diagnostics = {}
 if RUN_WINDOW_DIAGNOSTICS:
     diagnostic_pair = select_subject_pair(REPLAY_MOTION_TYPE, REPLAY_MOTION_INDEX)
@@ -1197,22 +891,18 @@ if RUN_WINDOW_DIAGNOSTICS:
         ref_csv=diagnostic_pair.ref_csv,
         results_root=RESULTS_ROOT,
         output_dir=DIAGNOSTIC_OUTPUT_DIR,
-        aligned_fft_start_s=MANUAL_ALIGNED_FFT_START_S,
+        window_start_s=DIAGNOSTIC_WINDOW_START_S,
         motion_type=REPLAY_MOTION_TYPE,
         split=REPLAY_SPLIT,
         mode=REPLAY_MODE,
         target_scope=REPLAY_TARGET_SCOPE,
         adaptive_filter=REPLAY_ADAPTIVE_FILTER,
         adaptive_data_type=REPLAY_ADAPTIVE_DATA_TYPE,
-        cascade_scheme=REPLAY_CASCADE_SCHEME,
-        TW_F=REPLAY_TW_F,
+        reference_config=REPLAY_REFERENCE_ORDER_KEY,
+        prewarm_s=REPLAY_prewarm_s,
         fs_origin=FS_ORIGIN,
         ud_calculation_mode=UD_CALCULATION_MODE,
         ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S,
-        guard_ratio_min_override=REPLAY_GUARD_RATIO_MIN_OVERRIDE,
-        guard_ratio_max_override=REPLAY_GUARD_RATIO_MAX_OVERRIDE,
-        guard_flat_std_eps_override=REPLAY_GUARD_FLAT_STD_EPS_OVERRIDE,
-        guard_use_finite_zscore_override=REPLAY_GUARD_USE_FINITE_ZSCORE_OVERRIDE,
         postprocess_method_override=REDRAW_HR_POSTPROCESS_METHOD,
     )
     print(window_diagnostics)
@@ -1231,10 +921,10 @@ else:
 # 是否写文件：是，仅在 RUN_CROSS_MOTION_SUMMARY=True 时。
 # 耗时风险：低；只读取结果记录，不回放、不训练。
 SUMMARY_ADAPTIVE_FILTER = "lms"
-SUMMARY_CASCADE_SCHEME = CascadeScheme.ACC.value
+SUMMARY_REFERENCE_ORDER_KEY = ReferenceConfig(('ACC',)).reference_order_key
 SUMMARY_ADAPTIVE_DATA_TYPE = ""
 SUMMARY_TARGET_SCOPE = TargetScope.MOTION_POST10.value
-SUMMARY_TW_F = TW_F
+SUMMARY_prewarm_s = prewarm_s
 SUMMARY_TABLE_OUTPUT_DIR = Path(RESULTS_ROOT) / "summary_tables"
 summary_path = None
 if RUN_CROSS_MOTION_SUMMARY:
@@ -1243,9 +933,9 @@ if RUN_CROSS_MOTION_SUMMARY:
         results_root=RESULTS_ROOT,
         adaptive_filter=SUMMARY_ADAPTIVE_FILTER,
         adaptive_data_type=SUMMARY_ADAPTIVE_DATA_TYPE,
-        cascade_scheme=SUMMARY_CASCADE_SCHEME,
+        reference_config=SUMMARY_REFERENCE_ORDER_KEY,
         target_scope=SUMMARY_TARGET_SCOPE,
-        TW_F=SUMMARY_TW_F,
+        prewarm_s=SUMMARY_prewarm_s,
     )
     print(summary_path)
     display(pd.read_csv(summary_path))
@@ -1267,9 +957,9 @@ CROSS_MOTION_TYPE = "write"
 CROSS_MOTION_INDEX = 1
 CROSS_TARGET_SCOPE = TargetScope.MOTION_POST10.value
 CROSS_ADAPTIVE_FILTER = "lms"
-CROSS_PARAM_SCHEME = CascadeScheme.HF2.value
-CROSS_APPLIED_SCHEME = CascadeScheme.ACC.value
-CROSS_TW_F = TW_F
+CROSS_PARAM_SCHEME = ReferenceConfig(('HF',)).reference_order_key
+CROSS_APPLIED_SCHEME = ReferenceConfig(('ACC',)).reference_order_key
+CROSS_prewarm_s = prewarm_s
 CROSS_OUTPUT_DIR = Path(RESULTS_ROOT) / "cross_replay"
 cross_replay_paths = {}
 if RUN_CROSS_STAGE7_REPLAY:
@@ -1282,9 +972,9 @@ if RUN_CROSS_STAGE7_REPLAY:
         motion_type=CROSS_MOTION_TYPE,
         target_scope=CROSS_TARGET_SCOPE,
         adaptive_filter=CROSS_ADAPTIVE_FILTER,
-        cascade_scheme=CROSS_PARAM_SCHEME,
-        override_cascade_scheme=CROSS_APPLIED_SCHEME,
-        TW_F=CROSS_TW_F,
+        reference_config=CROSS_PARAM_SCHEME,
+        override_reference_config=CROSS_APPLIED_SCHEME,
+        prewarm_s=CROSS_prewarm_s,
         fs_origin=FS_ORIGIN,
         ud_calculation_mode=UD_CALCULATION_MODE,
         ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S,
@@ -1301,12 +991,12 @@ else:
         "对第 13 节的参数来源 scheme 与实际运行 scheme 生成相同窗口的波形、频谱和状态诊断。",
         r'''
 # 用途：定位跨 scheme 回放在指定窗口中的通道、频谱峰和追踪选择差异。
-# 输入：第 13 节 CROSS_* 配置和 CROSS_ALIGNED_FFT_START_S。
+# 输入：第 13 节 CROSS_* 配置和 CROSS_WINDOW_START_S。
 # 输出：RESULTS_ROOT/cross_window_diagnostics 下的诊断图和摘要。
 # 是否写文件：是，仅在 RUN_CROSS_WINDOW_DIAGNOSTICS=True 时。
 # 耗时风险：中；执行单样本、单窗口诊断，不启动 Optuna。
 CROSS_DIAGNOSTIC_OUTPUT_DIR = Path(RESULTS_ROOT) / "cross_window_diagnostics"
-CROSS_ALIGNED_FFT_START_S = 80.0
+CROSS_WINDOW_START_S = 80.0
 cross_window_diagnostics = {}
 if RUN_CROSS_WINDOW_DIAGNOSTICS:
     cross_diagnostic_pair = select_subject_pair(CROSS_MOTION_TYPE, CROSS_MOTION_INDEX)
@@ -1315,13 +1005,13 @@ if RUN_CROSS_WINDOW_DIAGNOSTICS:
         ref_csv=cross_diagnostic_pair.ref_csv,
         results_root=RESULTS_ROOT,
         output_dir=CROSS_DIAGNOSTIC_OUTPUT_DIR,
-        aligned_fft_start_s=CROSS_ALIGNED_FFT_START_S,
+        window_start_s=CROSS_WINDOW_START_S,
         motion_type=CROSS_MOTION_TYPE,
         target_scope=CROSS_TARGET_SCOPE,
         adaptive_filter=CROSS_ADAPTIVE_FILTER,
-        cascade_scheme=CROSS_PARAM_SCHEME,
-        override_cascade_scheme=CROSS_APPLIED_SCHEME,
-        TW_F=CROSS_TW_F,
+        reference_config=CROSS_PARAM_SCHEME,
+        override_reference_config=CROSS_APPLIED_SCHEME,
+        prewarm_s=CROSS_prewarm_s,
         fs_origin=FS_ORIGIN,
         ud_calculation_mode=UD_CALCULATION_MODE,
         ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S,
@@ -1343,8 +1033,8 @@ else:
 # 是否写文件：是，仅在 RUN_BATCH_REFERENCE_COMPARE=True 时。
 # 耗时风险：中到高；逐样本复评估两套 scheme，但不会运行 Optuna。
 REFERENCE_COMPARE_MOTION_TYPE = "write"
-REFERENCE_COMPARE_PARAM_SCHEME = CascadeScheme.HF2.value
-REFERENCE_COMPARE_APPLIED_SCHEME = CascadeScheme.ACC.value
+REFERENCE_COMPARE_PARAM_SCHEME = ReferenceConfig(('HF',)).reference_order_key
+REFERENCE_COMPARE_APPLIED_SCHEME = ReferenceConfig(('ACC',)).reference_order_key
 REFERENCE_COMPARE_TARGET_SCOPE = TargetScope.MOTION_POST10.value
 REFERENCE_COMPARE_ADAPTIVE_FILTER = "lms"
 REFERENCE_COMPARE_BEST_PARAMS_CSV = (
@@ -1358,8 +1048,8 @@ reference_compare_paths = {}
 if RUN_BATCH_REFERENCE_COMPARE:
     reference_compare_paths = run_batch_reference_compare(
         motion_type=REFERENCE_COMPARE_MOTION_TYPE,
-        best_param_source_cascade_scheme=REFERENCE_COMPARE_PARAM_SCHEME,
-        actual_reference_cascade_scheme=REFERENCE_COMPARE_APPLIED_SCHEME,
+        best_param_source_reference_config=REFERENCE_COMPARE_PARAM_SCHEME,
+        actual_reference_reference_config=REFERENCE_COMPARE_APPLIED_SCHEME,
         target_scope=REFERENCE_COMPARE_TARGET_SCOPE,
         adaptive_filter=REFERENCE_COMPARE_ADAPTIVE_FILTER,
         best_param_csv_path=REFERENCE_COMPARE_BEST_PARAMS_CSV,
@@ -1385,10 +1075,10 @@ else:
 # 是否写文件：是，仅在 RUN_BATCH_TARGET_HR_REDRAW=True 时；不会创建 Optuna study。
 # 耗时风险：中到高；每个样本回放一次滤波流程，但不训练、不搜索超参数。
 BATCH_TARGET_SCOPE = TargetScope.MOTION_POST10.value  # 目标段；默认运动段至运动结束后 10 秒，仅控制评价范围。
-BATCH_TARGET_CASCADE_SCHEME = CascadeScheme.ACC.value  # 每次只回放一个 scheme；可改为其余五种 change6 scheme。
+BATCH_TARGET_REFERENCE_ORDER_KEY = ReferenceConfig(('ACC',)).reference_order_key  # 每次只回放一个 scheme；可改为其余五种 change6 scheme。
 BATCH_TARGET_ADAPTIVE_FILTER = "volterra"  # 选择已训练滤波器；应与 Stage-6 最优记录完全匹配。
 BATCH_TARGET_DATA_SPLIT_MODE = "all_train"  # 选择记录中的 mode；默认同 motion 全 index 联合训练。
-BATCH_TARGET_TW_F = TW_F  # 匹配最优记录的前置收敛上下文；None 表示不按 TW_F 筛选。
+BATCH_TARGET_prewarm_s = prewarm_s  # 匹配最优记录的前置收敛上下文；None 表示不按 prewarm_s 筛选。
 BATCH_TARGET_OUTPUT_DIR = Path(RESULTS_ROOT) / "batch_target_hr_curves"  # 输出基目录；后端会追加模式签名。
 batch_target_manifest = pd.DataFrame()
 if RUN_BATCH_TARGET_HR_REDRAW:
@@ -1396,10 +1086,10 @@ if RUN_BATCH_TARGET_HR_REDRAW:
         subject_dir=SUBJECT_DIR,
         results_root=RESULTS_ROOT,
         target_scope=BATCH_TARGET_SCOPE,
-        cascade_scheme=BATCH_TARGET_CASCADE_SCHEME,
+        reference_config=BATCH_TARGET_REFERENCE_ORDER_KEY,
         adaptive_filter=BATCH_TARGET_ADAPTIVE_FILTER,
         data_split_mode=BATCH_TARGET_DATA_SPLIT_MODE,
-        TW_F=BATCH_TARGET_TW_F,
+        prewarm_s=BATCH_TARGET_prewarm_s,
         output_dir=BATCH_TARGET_OUTPUT_DIR,
         fs_origin=FS_ORIGIN,
         ud_calculation_mode=UD_CALCULATION_MODE,

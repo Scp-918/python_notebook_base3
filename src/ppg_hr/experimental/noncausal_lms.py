@@ -31,6 +31,10 @@ class LmsDesign:
     curr_corr: float
     mode: str
     sensor_type: str
+    history_tap_limit: int
+    history_span_ms: float
+    forward_span_ms: float
+    tap_count: int
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly representation."""
@@ -50,7 +54,6 @@ def map_delay_to_lms_params(
     ``mu = max(mu_min, LMS_Mu_Base - abs_corr / 100)`` 收缩步长。
     """
 
-    del fs
     if isinstance(delay, ChannelDelay):
         D = int(delay.D_opt_samples)
         curr_corr = abs(float(delay.R_max))
@@ -58,13 +61,15 @@ def map_delay_to_lms_params(
         D = int(delay)
         curr_corr = 0.0
 
-    max_order = int(_get_param(search_params, "max_order"))
+    history_tap_limit = max(
+        1, round(float(_get_param(search_params, "memory_ms")) * fs / 1000.0)
+    )
     M_base = int(_get_param(search_params, "M_base"))
     C_scale = float(_get_param(search_params, "C_scale"))
     K_max = int(_get_param(search_params, "K_max"))
 
     if D > 0:
-        M = min(max(1, int(np.floor(abs(D) * C_scale))), max_order)
+        M = min(max(1, int(np.floor(abs(D) * C_scale))), history_tap_limit)
         K = 0
         mode = "causal"
     elif D < 0:
@@ -85,6 +90,10 @@ def map_delay_to_lms_params(
         curr_corr=float(curr_corr),
         mode=mode,
         sensor_type=str(sensor_type),
+        history_tap_limit=history_tap_limit,
+        history_span_ms=(M - 1) * 1000.0 / fs,
+        forward_span_ms=K * 1000.0 / fs,
+        tap_count=M + K,
     )
 
 
@@ -116,7 +125,10 @@ def noncausal_lms_filter(
     X, valid_indices = build_noncausal_tap_matrix(u_arr, M, K)
     if valid_indices.size == 0:
         if return_diagnostics:
-            return out, {"weight_norm_t": np.asarray([], dtype=float), "max_abs_weight_t": np.asarray([], dtype=float)}
+            return out, {
+                "weight_norm_t": np.asarray([], dtype=float),
+                "max_abs_weight_t": np.asarray([], dtype=float),
+            }
         return out
 
     span = X.shape[1]

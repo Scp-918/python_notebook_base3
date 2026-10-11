@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+from ppg_hr.experimental.preprocess_protocol import SourceImu
+
 import numpy as np
 
 from ppg_hr.experimental.alignment import (
-    align_ppg_to_ref_hr,
+    evaluate_rest_alignment,
     apply_rest_hr_slew_limit,
-    build_aligned_training_windows,
+    build_sensor_window_plan,
     estimate_global_tdelay_from_rest,
     extract_rest_ppg_hr_tracked,
     smooth_rest_hr_sequence,
 )
-from ppg_hr.experimental.cascade_solver import _global_tdelay_cache_key
+from ppg_hr.experimental.cascade_solver import _sensor_base_cache_key
 from ppg_hr.experimental.preprocess_protocol import ProtocolDataset
 from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams
 from ppg_hr.experimental.segmentation import SegmentInfo
@@ -47,6 +49,11 @@ def _synthetic_dataset(fs: int = 50, duration_s: float = 90.0) -> tuple[Protocol
         gyroz=zeros,
         ref_time_s=ref_time,
         ref_hr_bpm=ref_hr,
+        source_imu=SourceImu(fs,t,zeros,zeros,zeros,zeros,zeros,zeros),
+
+        ppg_clean_green=ppg,
+        ppg_clean_red=0.8 * ppg,
+        ppg_clean_ir=0.6 * ppg,
     )
     segment = SegmentInfo(
         status="ok",
@@ -59,6 +66,7 @@ def _synthetic_dataset(fs: int = 50, duration_s: float = 90.0) -> tuple[Protocol
         window_std=np.asarray([], dtype=float),
         motion_flags=np.asarray([], dtype=bool),
         labels=np.asarray([], dtype=str),
+        motion_runs=((50.0,65.0),),
     )
     return ds, segment
 
@@ -69,49 +77,50 @@ def test_alignment_tdelay_uses_alignment_tw_while_training_windows_use_train_tw(
         ds,
         segment,
         ds.fs,
-        alignment_TW=8.0,
-        alignment_step_s=1.0,
+        evaluation_window_s=8.0,
+        evaluation_step_s=1.0,
         delay_range_s=(-1.0, 1.0),
         delay_step_s=0.5,
     )
 
-    aligned_6 = build_aligned_training_windows(ds, segment, ds.fs, train_TW=6.0, best_tdelay_s=estimate.best_tdelay_s, tdelay_result=estimate)
-    aligned_10 = build_aligned_training_windows(ds, segment, ds.fs, train_TW=10.0, best_tdelay_s=estimate.best_tdelay_s, tdelay_result=estimate)
+    assert np.all(estimate.rest_ppg_hr.times_s >= 5.0)
+    aligned_6 = build_sensor_window_plan(ds.sensor_view(), segment, ds.fs, hr_window_s=8)
+    aligned_10 = build_sensor_window_plan(ds.sensor_view(), segment, ds.fs, hr_window_s=8)
 
     assert aligned_6.alignment_info.best_tdelay_s == aligned_10.alignment_info.best_tdelay_s
-    assert aligned_6.alignment_info.alignment_tw_s == 8.0
-    assert aligned_10.alignment_info.alignment_tw_s == 8.0
-    assert aligned_6.alignment_info.train_tw_s == 6.0
-    assert aligned_10.alignment_info.train_tw_s == 10.0
-    assert aligned_6.window_centers_s.size != aligned_10.window_centers_s.size
-    assert not np.array_equal(aligned_6.window_centers_s, aligned_10.window_centers_s)
+    assert aligned_6.alignment_info.evaluation_window_s == 8.0
+    assert aligned_10.alignment_info.evaluation_window_s == 8.0
+    assert aligned_6.alignment_info.hr_window_s == 8.0
+    assert aligned_10.alignment_info.hr_window_s == 8.0
+    assert aligned_6.window_centers_s.size == aligned_10.window_centers_s.size
+    np.testing.assert_equal(aligned_6.window_centers_s, aligned_10.window_centers_s)
 
 
-def test_compat_wrapper_keeps_alignment_tw_independent_from_tw() -> None:
+def test_evaluation_wrapper_keeps_sensor_windows_unchanged() -> None:
     ds, segment = _synthetic_dataset()
-    aligned_6 = align_ppg_to_ref_hr(ds, segment, TW=6.0, fs_target=ds.fs, alignment_TW=8.0, delay_range_s=(-1.0, 1.0), delay_step_s=0.5)
-    aligned_10 = align_ppg_to_ref_hr(ds, segment, TW=10.0, fs_target=ds.fs, alignment_TW=8.0, delay_range_s=(-1.0, 1.0), delay_step_s=0.5)
+    aligned_6 = evaluate_rest_alignment(ds, segment, hr_window_s=8, fs_target=ds.fs, evaluation_window_s=8.0, delay_range_s=(-1.0, 1.0), delay_step_s=0.5)
+    aligned_10 = evaluate_rest_alignment(ds, segment, hr_window_s=8, fs_target=ds.fs, evaluation_window_s=8.0, delay_range_s=(-1.0, 1.0), delay_step_s=0.5)
 
     assert aligned_6.alignment_info.best_tdelay_s == aligned_10.alignment_info.best_tdelay_s
-    assert aligned_6.alignment_info.alignment_tw_s == 8.0
-    assert aligned_10.alignment_info.alignment_tw_s == 8.0
-    assert aligned_6.alignment_info.train_tw_s == 6.0
-    assert aligned_10.alignment_info.train_tw_s == 10.0
+    assert aligned_6.alignment_info.evaluation_window_s == 8.0
+    assert aligned_10.alignment_info.evaluation_window_s == 8.0
+    assert aligned_6.alignment_info.hr_window_s == 8.0
+    assert aligned_10.alignment_info.hr_window_s == 8.0
 
 
-def test_alignment_accepts_notebook_hr_band_hz_kwargs() -> None:
+def test_evaluation_accepts_notebook_hr_band_bpm_kwargs() -> None:
     ds, segment = _synthetic_dataset()
 
-    aligned = align_ppg_to_ref_hr(
+    aligned = evaluate_rest_alignment(
         ds,
         segment,
-        TW=8.0,
+        hr_window_s=8.0,
         fs_target=ds.fs,
-        alignment_TW=8.0,
+        evaluation_window_s=8.0,
         delay_range_s=(-0.5, 0.5),
         delay_step_s=0.5,
         rest_hr_kwargs={
-            "hr_band_hz": (40.0 / 60.0, 180.0 / 60.0),
+            "hr_band_bpm": (40.0, 180.0),
             "track_band_bpm": 30.0,
         },
     )
@@ -119,18 +128,18 @@ def test_alignment_accepts_notebook_hr_band_hz_kwargs() -> None:
     assert np.isfinite(aligned.alignment_info.best_tdelay_s)
 
 
-def test_global_tdelay_cache_key_excludes_train_tw() -> None:
+def test_sensor_base_cache_key_excludes_train_tw() -> None:
     ds, _ = _synthetic_dataset()
-    p6 = ProtocolTrialParams(Fs_Target=50, TW=6.0, Alignment_TW=8.0)
-    p10 = ProtocolTrialParams(Fs_Target=50, TW=10.0, Alignment_TW=8.0)
-    assert _global_tdelay_cache_key(ds, p6) == _global_tdelay_cache_key(ds, p10)
-    changed_peak_rule = ProtocolTrialParams(Fs_Target=50, TW=6.0, Alignment_TW=8.0, Rest_HR_Peak_Percent=0.5)
-    assert _global_tdelay_cache_key(ds, p6) != _global_tdelay_cache_key(ds, changed_peak_rule)
-    std_mode = ProtocolTrialParams(Fs_Target=50, TW=6.0, Alignment_TW=8.0, Rest_Alignment_Score_Mode="std")
-    assert _global_tdelay_cache_key(ds, p6) != _global_tdelay_cache_key(ds, std_mode)
+    p6 = ProtocolTrialParams(Fs_Target=50, hr_window_s=8, evaluation_window_s=8.0)
+    p10 = ProtocolTrialParams(Fs_Target=50, hr_window_s=8, evaluation_window_s=8.0)
+    assert _sensor_base_cache_key(ds, p6) == _sensor_base_cache_key(ds, p10)
+    changed_peak_rule = ProtocolTrialParams(Fs_Target=50, hr_window_s=8, evaluation_window_s=8.0, Rest_HR_Peak_Percent=0.5)
+    assert _sensor_base_cache_key(ds, p6) == _sensor_base_cache_key(ds, changed_peak_rule)
+    std_mode = ProtocolTrialParams(Fs_Target=50, hr_window_s=8, evaluation_window_s=8.0, Rest_Alignment_Score_Mode="std")
+    assert _sensor_base_cache_key(ds, p6) == _sensor_base_cache_key(ds, std_mode)
 
 
-def test_global_tdelay_cache_key_includes_ppg_input_transform_fields() -> None:
+def test_sensor_base_cache_key_includes_ppg_input_transform_fields() -> None:
     ds, _ = _synthetic_dataset()
     raw = ProtocolTrialParams(Fs_Target=50, ppg_input_transform="raw_bandpass")
     log_abs = ProtocolTrialParams(Fs_Target=50, ppg_input_transform="log_absorbance")
@@ -140,8 +149,8 @@ def test_global_tdelay_cache_key_includes_ppg_input_transform_fields() -> None:
         log_absorbance_baseline_window_s=7.0,
     )
 
-    assert _global_tdelay_cache_key(ds, raw) != _global_tdelay_cache_key(ds, log_abs)
-    assert _global_tdelay_cache_key(ds, log_abs) != _global_tdelay_cache_key(ds, changed_window)
+    assert _sensor_base_cache_key(ds, raw) != _sensor_base_cache_key(ds, log_abs)
+    assert _sensor_base_cache_key(ds, log_abs) != _sensor_base_cache_key(ds, changed_window)
 
 
 def test_rest_alignment_score_mode_outputs_aae_and_std_scores() -> None:
@@ -150,8 +159,8 @@ def test_rest_alignment_score_mode_outputs_aae_and_std_scores() -> None:
         ds,
         segment,
         ds.fs,
-        alignment_TW=8.0,
-        alignment_step_s=1.0,
+        evaluation_window_s=8.0,
+        evaluation_step_s=1.0,
         delay_range_s=(-0.5, 0.5),
         delay_step_s=0.5,
         alignment_score_mode="aae",

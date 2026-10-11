@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from ppg_hr.experimental.preprocess_protocol import SourceImu
+
 import json
 from pathlib import Path
+
+from ppg_hr.params import RESULT_SCHEMA_VERSION
 from types import SimpleNamespace
 
 import numpy as np
@@ -35,6 +39,11 @@ def _dataset(sample_id: str) -> ProtocolDataset:
         gyroz=zeros,
         ref_time_s=time_s,
         ref_hr_bpm=70.0 + time_s,
+        source_imu=SourceImu(1,time_s,zeros,zeros,zeros,zeros,zeros,zeros),
+
+        ppg_clean_green=zeros,
+        ppg_clean_red=zeros,
+        ppg_clean_ir=zeros,
     )
 
 
@@ -54,27 +63,28 @@ def _pair(root: Path, motion: str, index: int) -> SamplePair:
 def _write_stage6_records(results_root: Path, motion: str) -> None:
     motion_dir = results_root / "motion_types" / motion
     motion_dir.mkdir(parents=True)
-    params = ProtocolTrialParams(TW=2, TW_F=0.0, Fs_Target=1, adaptive_filter="lms")
+    params = ProtocolTrialParams(hr_window_s=8, prewarm_s=0.0, Fs_Target=1, adaptive_filter="lms")
     pd.DataFrame(
         [
             {
+                "result_schema_version": RESULT_SCHEMA_VERSION,
                 "motion_type": motion,
                 "split": "test",
                 "mode": "all_train",
                 "target_scope": "motion_post10",
-                "cascade_scheme": "ACC",
+                "reference_order_key": "ACC",
                 "adaptive_filter": "lms",
                 "adaptive_data_type": "ACC",
-                "TW_F": 0.0,
+                "prewarm_s": 0.0,
                 "best_params_json": json.dumps(params.to_dict()),
             }
         ]
     ).to_csv(motion_dir / "best_params_and_alignment.csv", index=False)
-    pd.DataFrame([{"motion_type": motion}]).to_csv(motion_dir / "best_metrics.csv", index=False)
-    pd.DataFrame([{"motion_type": motion}]).to_csv(
+    pd.DataFrame([{"result_schema_version": RESULT_SCHEMA_VERSION, "motion_type": motion}]).to_csv(motion_dir / "best_metrics.csv", index=False)
+    pd.DataFrame([{"result_schema_version": RESULT_SCHEMA_VERSION, "motion_type": motion}]).to_csv(
         motion_dir / "motion_frequency_and_params.csv", index=False
     )
-    (motion_dir / "full_report.json").write_text("{}", encoding="utf-8")
+    (motion_dir / "full_report.json").write_text(json.dumps({"result_schema_version": RESULT_SCHEMA_VERSION}), encoding="utf-8")
 
 
 def test_redraw_subject_target_hr_curves_batches_all_pairs_in_canonical_order(
@@ -114,7 +124,7 @@ def test_redraw_subject_target_hr_curves_batches_all_pairs_in_canonical_order(
                 "time_s": [0.0, 1.0, 2.0],
                 "is_filtered_segment": [False, True, True],
                 "segment_label": ["rest", "motion", "recovery"],
-                "baseline_ppg_hr_bpm": [69.0, 70.0, 71.0],
+                "baseline_hr_bpm": [69.0, 70.0, 71.0],
                 "adaptive_hr_bpm": [70.0, 71.0, 72.0],
                 "final_hr_bpm": [70.0, 72.0, 74.0],
                 "final_source": ["baseline_fft", "adaptive_lms", "adaptive_lms"],
@@ -133,10 +143,10 @@ def test_redraw_subject_target_hr_curves_batches_all_pairs_in_canonical_order(
         subject_dir=subject_dir,
         results_root=results_root,
         target_scope="motion_post10",
-        cascade_scheme="ACC",
+        reference_config="ACC",
         adaptive_filter="lms",
         data_split_mode="all_train",
-        TW_F=0.0,
+        prewarm_s=0.0,
         fs_origin=1,
     )
 
@@ -185,12 +195,13 @@ def test_redraw_subject_target_hr_curves_rejects_discovery_issues(tmp_path: Path
 
 def test_subject_batch_best_record_requires_unique_exact_match() -> None:
     row = {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
         "motion_type": "write",
         "mode": "all_train",
         "target_scope": "motion_post10",
-        "cascade_scheme": "ACC",
+        "reference_order_key": "ACC",
         "adaptive_filter": "lms",
-        "TW_F": 0.0,
+        "prewarm_s": 0.0,
     }
     duplicated = pd.DataFrame([row, row])
 
@@ -200,9 +211,9 @@ def test_subject_batch_best_record_requires_unique_exact_match() -> None:
             motion_type="write",
             data_split_mode="all_train",
             target_scope="motion_post10",
-            cascade_scheme="ACC",
+            reference_config="ACC",
             adaptive_filter="lms",
-            TW_F=0.0,
+            prewarm_s=0.0,
         )
     except ValueError as exc:
         assert "found 2" in str(exc)

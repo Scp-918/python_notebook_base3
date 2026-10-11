@@ -20,7 +20,7 @@ def main() -> None:
     project_root = Path(__file__).resolve().parent
     src_dir = project_root / "src"
     testdata_dir = project_root / "testdata"
-    output_root = project_root / "outputs" / "debug__ACC3__lms__accuracy__all_train"
+    output_root = project_root / "outputs" / "debug__ACC__lms__accuracy__all_train"
     sys.path.insert(0, str(src_dir))
 
     try:
@@ -41,7 +41,7 @@ def main() -> None:
                 "TRIAL "
                 f"motion_type={info.get('motion_type')} "
                 f"mode={info.get('mode_idx')}/{info.get('mode_total')} "
-                f"{info.get('target_scope_value')} {info.get('cascade_scheme')} {info.get('adaptive_filter')} "
+                f"{info.get('target_scope_value')} {info.get('reference_order_key')} {info.get('adaptive_filter')} "
                 f"objective={info.get('objective_value')} "
                 f"AAE={info.get('aae_bpm')} "
                 f"accuracy={info.get('accuracy_pct')}",
@@ -62,7 +62,7 @@ def main() -> None:
         debug_mode=True,
         search_space=ProtocolSearchParams(),
         target_scopes=["motion_only"],
-        cascade_schemes=["ACC3"],
+        reference_group_orders=[('ACC',)],
         adaptive_filters=["lms"],
         objective_mode="accuracy",
         data_split_mode="all_train",

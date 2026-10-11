@@ -1,0 +1,178 @@
+from __future__ import annotations
+
+from ppg_hr.experimental.preprocess_protocol import SourceImu
+
+import json
+
+import numpy as np
+
+from ppg_hr.experimental.alignment import SensorWindowPlan, AlignmentInfo
+from ppg_hr.experimental.cascade_solver import (
+    _TrialBase,
+    _get_normalised_window_cache,
+    _run_windows,
+)
+from ppg_hr.experimental.preprocess_protocol import ProtocolDataset
+from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams
+from ppg_hr.experimental.segmentation import SegmentInfo
+from ppg_hr.params import ReferenceConfig, TargetScope
+
+
+def _prewarm_base(fs: int = 20) -> _TrialBase:
+    n = fs * 11
+    t = np.arange(n, dtype=float) / fs
+    ppg = np.sin(2 * np.pi * 1.2 * t)
+    acc = np.sin(2 * np.pi * 1.2 * t + 0.1)
+    zeros = np.zeros_like(t)
+    dataset = ProtocolDataset(
+        sample_stem="multi_twf1",
+        fs=fs,
+        time_s=t,
+        ppg_green=ppg,
+        ppg_red=ppg,
+        ppg_ir=ppg,
+        hf1=zeros,
+        hf2=zeros,
+        cf1=zeros,
+        cf2=zeros,
+        accx=acc,
+        accy=0.5 * acc,
+        accz=0.25 * acc,
+        gyrox=zeros,
+        gyroy=zeros,
+        gyroz=zeros,
+        ref_time_s=np.arange(5, dtype=float),
+        ref_hr_bpm=np.full(5, 72.0),
+        source_imu=SourceImu(fs, t, acc, 0.5 * acc, 0.25 * acc, zeros, zeros, zeros),
+
+        ppg_clean_green=ppg,
+        ppg_clean_red=ppg,
+        ppg_clean_ir=ppg,
+    )
+    segment = SegmentInfo(
+        status="ok",
+        reason="",
+        motion_start_s=0.0,
+        motion_end_s=5.0,
+        motion_threshold=0.0,
+        window_starts_s=np.asarray([0.0, 1.0, 2.0]),
+        window_centers_s=np.asarray([4.0, 5.0, 6.0]),
+        window_std=np.asarray([], dtype=float),
+        motion_flags=np.asarray([], dtype=bool),
+        labels=np.asarray(["motion", "motion", "motion"], dtype=object),
+        motion_runs=((0.0, 5.0),),
+    )
+    aligned = SensorWindowPlan(
+        dataset=dataset,
+        segment_info=segment,
+        alignment_info=AlignmentInfo(0.0, {0.0: 0.0}, 1.0, 3, hr_window_s=8),
+        window_starts_s=np.asarray([0.0, 1.0, 2.0]),
+        window_centers_s=np.asarray([4.0, 5.0, 6.0]),
+        segment_labels=np.asarray(["motion", "motion", "motion"], dtype=object),
+        rest_indices=np.asarray([], dtype=int),
+        motion_indices=np.asarray([0, 1, 2], dtype=int),
+        recovery_indices=np.asarray([], dtype=int),
+    )
+    return _TrialBase(
+        dataset=dataset,
+        fs=fs,
+        segment_info=segment,
+        aligned=aligned,
+        motion_frequency=1.2,
+    )
+
+
+def test_prewarm_context_keeps_fft_center_and_records_context_lengths() -> None:
+    base = _prewarm_base()
+    params = ProtocolTrialParams(
+        Fs_Target=20, hr_window_s=8, prewarm_s=1.0, memory_ms=4, M_base=1, K_max=2
+    )
+
+    frame = _run_windows(
+        base,
+        ReferenceConfig(('ACC',)),
+        TargetScope.MOTION_ONLY,
+        params,
+        1.2,
+        collect_frame=True,
+        collect_stages=True,
+    ).frame
+
+    np.testing.assert_allclose(frame["time_s"].to_numpy(dtype=float), [4.0, 5.0, 6.0])
+    np.testing.assert_allclose(
+        frame["fft_start_s"].to_numpy(dtype=float), [0.0, 1.0, 2.0]
+    )
+    np.testing.assert_allclose(
+        frame["fft_end_s"].to_numpy(dtype=float), [8.0, 9.0, 10.0]
+    )
+    assert frame["fft_input_samples"].tolist() == [160, 160, 160]
+    assert frame["adaptive_input_samples"].tolist() == [180, 180, 180]
+    assert frame.loc[0, "prewarm_context_status"] == "padded_left"
+    assert frame.loc[1, "prewarm_context_status"] == "full"
+    assert frame.loc[0, "adaptive_start_s"] == -1.0
+    assert frame.loc[0, "adaptive_source_start_s"] == 0.0
+
+    stages = json.loads(frame.loc[1, "adaptive_stages_json"])
+    assert stages
+    assert "reference_channel_ranking" in stages[0]
+    assert "penalty_ref_channel" in stages[0]
+    assert stages[0]["adaptive_input_samples"] == 180
+
+
+def test_zero_prewarm_uses_only_observation_samples() -> None:
+    base = _prewarm_base()
+    params = ProtocolTrialParams(
+        Fs_Target=20, hr_window_s=8, prewarm_s=0.0, memory_ms=4, M_base=1, K_max=2
+    )
+
+    frame = _run_windows(
+        base,
+        ReferenceConfig(('ACC',)),
+        TargetScope.MOTION_ONLY,
+        params,
+        1.2,
+        collect_frame=True,
+        collect_stages=False,
+    ).frame
+
+    assert frame["fft_input_samples"].tolist() == [160, 160, 160]
+    assert frame["adaptive_input_samples"].tolist() == [160, 160, 160]
+    np.testing.assert_allclose(frame["adaptive_start_s"], frame["fft_start_s"])
+    assert set(frame["prewarm_context_status"]) == {"full"}
+
+
+def test_normalised_window_cache_is_isolated_by_prewarm() -> None:
+    base = _prewarm_base()
+    params0 = ProtocolTrialParams(
+        Fs_Target=20, hr_window_s=8, prewarm_s=0.0, memory_ms=4, M_base=1, K_max=2
+    )
+    params1 = ProtocolTrialParams(
+        Fs_Target=20, hr_window_s=8, prewarm_s=1.0, memory_ms=4, M_base=1, K_max=2
+    )
+
+    cache0 = _get_normalised_window_cache(base, params0)
+    cache1 = _get_normalised_window_cache(base, params1)
+
+    assert cache0.adaptive_win_len == 160
+    assert cache1.adaptive_win_len == 180
+    assert cache0 is not cache1
+
+
+def test_ud_formula_channels_are_directly_minmax_normalised_in_adaptive_context() -> (
+    None
+):
+    base = _prewarm_base()
+    raw_ud1 = np.linspace(10.0, 30.0, len(base.dataset.time_s))
+    raw_ud2 = np.linspace(-4.0, 8.0, len(base.dataset.time_s)) ** 2
+    base.dataset.ud1 = raw_ud1
+    base.dataset.ud2 = raw_ud2
+    params = ProtocolTrialParams(
+        Fs_Target=20, hr_window_s=8, prewarm_s=1.0, normalization_mode="minmax"
+    )
+
+    cache = _get_normalised_window_cache(base, params)
+
+    for name in ("ud1", "ud2"):
+        values = cache.adaptive_norm_by_channel[name][1]
+        assert float(values.min()) == 0.0
+        assert float(values.max()) == 1.0

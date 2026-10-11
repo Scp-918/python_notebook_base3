@@ -1,38 +1,38 @@
-"""Signed PPG-to-reference HR delay alignment for the protocol.
+"""Sensor-center window plans and post-prediction reference evaluation.
 
-中文说明：本模块把“全局 Tdelay 估计”和“后续训练窗口构建”拆成两步。
-全局 Tdelay 只使用固定的 ``alignment_TW``（默认 8 s）在静息段提取 tracked
-PPG-HR 并搜索时延；后续自适应滤波训练/验证/测试窗口继续使用 trial 的
-``train_TW`` / ``params.TW``。二者物理含义不同，不能混用。
-
-Signed Tdelay 的通道平移语义继续保持旧逻辑：delay_s > 0 时传感器侧左移；
-delay_s < 0 时用首样本补头并右移；delay_s == 0 时不移动。
+Reference offsets affect scoring and plots only. Sensor signals and prediction
+windows are never shifted or cropped to match reference coverage.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from threading import Lock
 from typing import Any
+
+from .penalty_policy import PenaltyPolicy
 
 import numpy as np
 import pandas as pd
 
 from ..core.find_near_biggest import find_near_biggest
 from ..preprocess.utils import smoothdata_movmedian
-from .preprocess_protocol import ProtocolDataset
+from .preprocess_protocol import ProtocolDataset, SensorDataset
 from .segmentation import SegmentInfo
-from .spectral_utils import compute_power_spectrum, fft_peak_candidates, prepare_fft_window
+from .spectral_utils import (
+    compute_power_spectrum,
+    fft_peak_candidates,
+    prepare_fft_window,
+)
 
 __all__ = [
-    "AlignedDataset",
+    "SensorWindowPlan",
     "AlignmentInfo",
     "RestHrResult",
     "TDelayEstimateResult",
     "TimeBiasAfterResult",
-    "align_ppg_to_ref_hr",
+    "evaluate_rest_alignment",
     "apply_rest_hr_slew_limit",
-    "build_aligned_training_windows",
+    "build_sensor_window_plan",
     "compute_rest_alignment_diagnostic_curve",
     "estimate_global_tdelay_from_rest",
     "extract_rest_ppg_hr_tracked",
@@ -40,12 +40,10 @@ __all__ = [
     "smooth_rest_hr_sequence",
 ]
 
-#静息窗数据
-_PRINTED_ALIGNMENT_SAMPLE_STEMS: set[str] = set()
-_PRINTED_ALIGNMENT_LOCK = Lock()
+# 静息窗数据
 _REST_ALIGNMENT_SCORE_START_S = 5.0
-DEFAULT_ALIGNMENT_TW = 8.0
-DEFAULT_ALIGNMENT_STEP_S = 1.0
+DEFAULT_EVALUATION_WINDOW_S = 8.0
+DEFAULT_EVALUATION_STEP_S = 1.0
 DEFAULT_REST_HR_BAND_BPM = (40.0, 180.0)
 DEFAULT_REST_HR_TRACK_BAND_BPM = 30.0
 DEFAULT_REST_HR_SLEW_LIMIT_BPM = 6.0
@@ -157,8 +155,8 @@ class AlignmentInfo:
     num_windows: int
     status: str = "ok"
     reason: str = ""
-    alignment_tw_s: float = DEFAULT_ALIGNMENT_TW
-    train_tw_s: float = 0.0
+    evaluation_window_s: float = DEFAULT_EVALUATION_WINDOW_S
+    hr_window_s: float = 0.0
     best_score: float = float("nan")
     n_valid_score_windows: int = 0
     aae_by_delay: dict[float, float] = field(default_factory=dict)
@@ -180,8 +178,8 @@ class AlignmentInfo:
             "num_windows": int(self.num_windows),
             "status": self.status,
             "reason": self.reason,
-            "alignment_tw_s": float(self.alignment_tw_s),
-            "train_tw_s": float(self.train_tw_s),
+            "evaluation_window_s": float(self.evaluation_window_s),
+            "hr_window_s": float(self.hr_window_s),
             "alignment_score_mode": str(self.alignment_score_mode),
             "best_score": float(self.best_score),
             "best_score_aae": float(self.best_score_aae),
@@ -192,16 +190,15 @@ class AlignmentInfo:
 
 
 @dataclass(frozen=True)
-class AlignedDataset:
+class SensorWindowPlan:
     """Dataset after sensor left-shift and reference half-window alignment."""
 
-    dataset: ProtocolDataset
+    dataset: SensorDataset
     segment_info: SegmentInfo
     alignment_info: AlignmentInfo
     window_starts_s: np.ndarray
     window_centers_s: np.ndarray
     segment_labels: np.ndarray
-    ref_hr_bpm: np.ndarray
     rest_indices: np.ndarray
     motion_indices: np.ndarray
     recovery_indices: np.ndarray
@@ -279,7 +276,9 @@ def search_time_bias_after(
     best_key: tuple[float, float, float, float] | None = None
 
     for idx, bias_s in enumerate(bias_grid):
-        ref_shifted = np.interp(pred_time + float(bias_s), ref_time, ref_hr, left=np.nan, right=np.nan)
+        ref_shifted = np.interp(
+            pred_time + float(bias_s), ref_time, ref_hr, left=np.nan, right=np.nan
+        )
         valid = np.isfinite(pred_hr) & np.isfinite(ref_shifted)
         n_valid = int(valid.sum())
         if n_valid < int(min_valid):
@@ -307,7 +306,14 @@ def search_time_bias_after(
 
     score_table = pd.DataFrame(
         rows,
-        columns=["time_bias_after_s", "aae_bpm", "std_bpm", "rmse_bpm", "n_valid", "selected"],
+        columns=[
+            "time_bias_after_s",
+            "aae_bpm",
+            "std_bpm",
+            "rmse_bpm",
+            "n_valid",
+            "selected",
+        ],
     )
     if best_idx is None:
         ref_after = np.interp(pred_time, ref_time, ref_hr, left=np.nan, right=np.nan)
@@ -330,7 +336,9 @@ def search_time_bias_after(
     score_table.loc[int(best_idx), "selected"] = True
     best_row = score_table.iloc[int(best_idx)]
     best_bias = float(best_row["time_bias_after_s"])
-    ref_after = np.interp(pred_time + best_bias, ref_time, ref_hr, left=np.nan, right=np.nan)
+    ref_after = np.interp(
+        pred_time + best_bias, ref_time, ref_hr, left=np.nan, right=np.nan
+    )
     return TimeBiasAfterResult(
         time_bias_after_s=best_bias,
         best_aae_bpm=float(best_row["aae_bpm"]),
@@ -360,85 +368,72 @@ def _time_bias_after_key_is_better(
     return False
 
 
-def _tdelay_score_key_is_better(
-    candidate: tuple[float, float, float, float],
-    best: tuple[float, float, float, float],
-) -> bool:
-    """Return whether a Tdelay candidate wins under the configured score mode.
-
-    中文说明：key 的顺序是“主评分、绝对 delay、RMSE、非主评分”。主评分
-    可以是 AAE 或 STD；并列时优先选择更小的绝对延迟，避免无意义的大偏移。
-    """
-
-    for cand_value, best_value in zip(candidate, best, strict=True):
-        if np.isclose(cand_value, best_value, rtol=0.0, atol=1e-9):
-            continue
-        return bool(cand_value < best_value)
-    return False
-
-
-def align_ppg_to_ref_hr(
+def evaluate_rest_alignment(
     dataset: ProtocolDataset,
     segment_info: SegmentInfo,
-    TW: int | float,
+    hr_window_s: int | float,
     fs_target: int,
     *,
-    alignment_TW: float | None = None,
-    alignment_step_s: float = DEFAULT_ALIGNMENT_STEP_S,
+    evaluation_window_s: float | None = None,
+    evaluation_step_s: float = DEFAULT_EVALUATION_STEP_S,
     delay_range_s: tuple[float, float] | None = None,
     delay_step_s: float | None = None,
     rest_hr_kwargs: dict[str, Any] | None = None,
     use_tracked_rest_hr: bool = True,
     alignment_score_mode: str = "aae",
     return_debug: bool = False,
-) -> AlignedDataset:
-    """Find global signed PPG delay and build training-window metadata.
-
-    中文说明：该兼容 wrapper 保留原调用 ``align_ppg_to_ref_hr(ds, seg, TW, fs)``。
-    这里的 ``TW`` 只表示后续自适应滤波训练/验证/测试切窗的 ``train_TW``；
-    全局 Tdelay 估计使用独立的 ``alignment_TW``，默认 8 秒，不参与贝叶斯优化。
-    """
+) -> SensorWindowPlan:
+    """Attach a post-prediction rest evaluation offset without moving sensor data."""
 
     if not segment_info.is_valid:
         raise ValueError(f"Cannot align invalid segment info: {segment_info.reason}")
 
     fs = int(fs_target)
-    train_TW = float(TW)
-    align_TW = DEFAULT_ALIGNMENT_TW if alignment_TW is None else float(alignment_TW)
+    hr_window_s = float(hr_window_s)
+    evaluation_window = (
+        DEFAULT_EVALUATION_WINDOW_S
+        if evaluation_window_s is None
+        else float(evaluation_window_s)
+    )
     if not use_tracked_rest_hr:
         rest_hr_kwargs = {**(rest_hr_kwargs or {}), "smooth_method": "none"}
     tdelay = estimate_global_tdelay_from_rest(
         dataset,
         segment_info,
         fs,
-        alignment_TW=align_TW,
-        alignment_step_s=float(alignment_step_s),
+        evaluation_window_s=evaluation_window,
+        evaluation_step_s=float(evaluation_step_s),
         delay_range_s=delay_range_s,
         delay_step_s=delay_step_s,
         rest_hr_kwargs=rest_hr_kwargs,
         alignment_score_mode=alignment_score_mode,
         return_debug=return_debug,
     )
-    _print_alignment_once(
-        dataset.sample_stem,
-        tdelay.best_tdelay_s,
-        int(tdelay.score_table["n_valid"].max()) if not tdelay.score_table.empty else 0,
-    )
-    return build_aligned_training_windows(
-        dataset,
+    plan = build_sensor_window_plan(
+        dataset.sensor_view(),
         segment_info,
         fs,
-        train_TW=train_TW,
-        best_tdelay_s=tdelay.best_tdelay_s,
-        tdelay_result=tdelay,
+        hr_window_s=hr_window_s,
+    )
+    return replace(
+        plan,
+        alignment_info=replace(
+            plan.alignment_info,
+            best_tdelay_s=tdelay.best_tdelay_s,
+            best_score=tdelay.best_score,
+            best_score_aae=tdelay.best_score_aae,
+            best_score_std=tdelay.best_score_std,
+            best_rmse=tdelay.best_rmse,
+            alignment_score_mode=tdelay.alignment_score_mode,
+        ),
     )
 
 
 def extract_rest_ppg_hr_tracked(
     ppg_signal: np.ndarray,
     fs: float,
-    tw_s: float = DEFAULT_ALIGNMENT_TW,
-    step_s: float = DEFAULT_ALIGNMENT_STEP_S,
+    tw_s: float = DEFAULT_EVALUATION_WINDOW_S,
+    step_s: float = DEFAULT_EVALUATION_STEP_S,
     hr_band_bpm: tuple[float, float] = DEFAULT_REST_HR_BAND_BPM,
     init_strategy: str = "max_peak",
     track_band_bpm: float = DEFAULT_REST_HR_TRACK_BAND_BPM,
@@ -473,7 +468,13 @@ def extract_rest_ppg_hr_tracked(
     sig = np.asarray(ppg_signal, dtype=float).ravel()
     if win_len < 4 or sig.size < win_len:
         empty = np.asarray([], dtype=float)
-        return RestHrResult(empty, empty, empty, empty, {"reason": "signal shorter than one rest HR window"})
+        return RestHrResult(
+            empty,
+            empty,
+            empty,
+            empty,
+            {"reason": "signal shorter than one rest HR window"},
+        )
 
     starts = np.arange(0, sig.size - win_len + 1, step_len, dtype=int)
     times_s = starts.astype(float) / fs + float(tw_s) / 2.0
@@ -485,7 +486,11 @@ def extract_rest_ppg_hr_tracked(
     slew_limited = np.zeros(starts.size, dtype=bool)
     penalty_applied = np.zeros(starts.size, dtype=bool)
     penalty_freq_hz = np.full(starts.size, np.nan, dtype=float)
-    penalty_arr = None if penalty_signal is None else np.asarray(penalty_signal, dtype=float).ravel()
+    penalty_arr = (
+        None
+        if penalty_signal is None
+        else np.asarray(penalty_signal, dtype=float).ravel()
+    )
 
     prev_hr: float | None = None
     for row, start in enumerate(starts):
@@ -527,12 +532,20 @@ def extract_rest_ppg_hr_tracked(
             which_peak[row] = int(which)
             if which == 0:
                 used_fallback[row] = True
-        limited = _limit_hr_transition(prev_hr, candidate, slew_limit_bpm, slew_step_bpm)
-        slew_limited[row] = bool(prev_hr is not None and np.isfinite(prev_hr) and abs(candidate - prev_hr) > slew_limit_bpm)
+        limited = _limit_hr_transition(
+            prev_hr, candidate, slew_limit_bpm, slew_step_bpm
+        )
+        slew_limited[row] = bool(
+            prev_hr is not None
+            and np.isfinite(prev_hr)
+            and abs(candidate - prev_hr) > slew_limit_bpm
+        )
         tracked_hr[row] = limited
         prev_hr = limited if np.isfinite(limited) else prev_hr
 
-    smooth_hr = smooth_rest_hr_sequence(tracked_hr, method=smooth_method, smooth_win=smooth_win)
+    smooth_hr = smooth_rest_hr_sequence(
+        tracked_hr, method=smooth_method, smooth_win=smooth_win
+    )
     quality = None
     if return_debug:
         quality = {
@@ -575,7 +588,9 @@ def apply_rest_hr_slew_limit(
     out = np.full(arr.size, np.nan, dtype=float)
     prev: float | None = None
     for idx, value in enumerate(arr):
-        out[idx] = _limit_hr_transition(prev, float(value), slew_limit_bpm, slew_step_bpm)
+        out[idx] = _limit_hr_transition(
+            prev, float(value), slew_limit_bpm, slew_step_bpm
+        )
         if np.isfinite(out[idx]):
             prev = float(out[idx])
     return out
@@ -615,285 +630,139 @@ def estimate_global_tdelay_from_rest(
     ds: ProtocolDataset,
     segment: SegmentInfo,
     fs: float,
-    alignment_TW: float = DEFAULT_ALIGNMENT_TW,
-    alignment_step_s: float = DEFAULT_ALIGNMENT_STEP_S,
+    evaluation_window_s: float = DEFAULT_EVALUATION_WINDOW_S,
+    evaluation_step_s: float = DEFAULT_EVALUATION_STEP_S,
     delay_range_s: tuple[float, float] | None = None,
     delay_step_s: float | None = None,
     rest_hr_kwargs: dict[str, Any] | None = None,
     alignment_score_mode: str = "aae",
     return_debug: bool = False,
 ) -> TDelayEstimateResult:
-    """Estimate global signed Tdelay from tracked rest-segment PPG HR.
-
-    中文说明：本函数只负责全局 Tdelay 搜索，使用固定 ``alignment_TW``；它不构建
-    后续训练窗口，也不读取 Optuna trial 的 ``params.TW``。候选 delay 的正负号
-    和边界补值继续复用当前项目的 signed Tdelay 逻辑。
-    """
-
-    if not segment.is_valid:
-        raise ValueError(f"Cannot estimate Tdelay for invalid segment info: {segment.reason}")
-    score_mode = str(alignment_score_mode).lower()
-    if score_mode == "mae":
-        score_mode = "aae"
-    if score_mode not in {"aae", "std"}:
-        raise ValueError("alignment_score_mode must be 'aae', 'mae', or 'std'")
-    fs_i = int(round(float(fs)))
-    align_tw = float(alignment_TW)
-    neg_limit = min(5.0, align_tw / 2.0)
-    if delay_range_s is None:
-        delay_range_s = (-neg_limit, 5.0)
-    step = 0.1 if delay_step_s is None else float(delay_step_s)
-    delay_grid = np.round(np.arange(float(delay_range_s[0]), float(delay_range_s[1]) + 1e-9, step), 10)
+    """Score reference offsets after extracting a fixed sensor-center rest curve."""
     kwargs = dict(rest_hr_kwargs or {})
-    kwargs.setdefault("tw_s", align_tw)
-    kwargs.setdefault("step_s", float(alignment_step_s))
-    kwargs.setdefault("return_debug", return_debug)
-
-    rows: list[dict[str, Any]] = []
-    best_delay = 0.0
-    best_score = float("inf")
-    best_score_aae = float("inf")
-    best_score_std = float("inf")
-    best_rmse = float("inf")
-    best_rest: RestHrResult | None = None
-    best_ref = np.asarray([], dtype=float)
-    best_key: tuple[float, float, float, float] | None = None
-    for delay_s in delay_grid:
-        rest = _rest_ppg_hr_tracked_for_delay(
-            ds.ppg_green,
-            fs_i,
-            delay_s=float(delay_s),
-            motion_start_s=float(segment.motion_start_s),
-            score_start_s=_REST_ALIGNMENT_SCORE_START_S,
-            rest_hr_kwargs=kwargs,
-            penalty_signal=ds.accz,
+    kwargs.update(tw_s=evaluation_window_s, step_s=evaluation_step_s)
+    full = extract_rest_ppg_hr_tracked(
+        ds.ppg_green, fs, penalty_signal=ds.accz, **kwargs
+    )
+    labels = segment.states_at(full.times_s)[0]
+    keep = (labels == "rest") & (full.times_s >= _REST_ALIGNMENT_SCORE_START_S)
+    rest = RestHrResult(
+        full.times_s[keep],
+        full.hr_bpm_raw[keep],
+        full.hr_bpm_tracked[keep],
+        full.hr_bpm_smooth[keep],
+        full.quality,
+    )
+    lo, hi = delay_range_s if delay_range_s is not None else (-5.0, 5.0)
+    step = 0.1 if delay_step_s is None else delay_step_s
+    mode = alignment_score_mode
+    if mode not in {"aae", "std"}:
+        raise ValueError("alignment_score_mode must be aae or std")
+    rows = []
+    for delay in np.arange(lo, hi + step / 2, step):
+        ref = np.interp(
+            rest.times_s + delay,
+            ds.ref_time_s,
+            ds.ref_hr_bpm,
+            left=np.nan,
+            right=np.nan,
         )
-        ref_hr = _reference_hr_for_alignment_times(ds, rest.times_s, align_tw)
-        ppg_hr = np.asarray(rest.hr_bpm_smooth, dtype=float)
-        valid = np.isfinite(ppg_hr) & np.isfinite(ref_hr)
-        n_valid = int(valid.sum())
-        if n_valid < 2:
-            score_std = score_aae = mae = rmse = selected_score = float("inf")
-        else:
-            diff = ppg_hr[valid] - ref_hr[valid]
-            score_std = float(np.nanstd(diff))
-            score_aae = float(np.nanmean(np.abs(diff)))
-            mae = score_aae
-            rmse = float(np.sqrt(np.nanmean(diff**2)))
-            selected_score = score_aae if score_mode == "aae" else score_std
+        valid = np.isfinite(ref) & np.isfinite(rest.hr_bpm_smooth)
+        diff = rest.hr_bpm_smooth[valid] - ref[valid]
+        aae = float(np.mean(np.abs(diff))) if len(diff) >= 2 else float("inf")
+        std = float(np.std(diff)) if len(diff) >= 2 else float("inf")
+        rmse = float(np.sqrt(np.mean(diff**2))) if len(diff) >= 2 else float("inf")
         rows.append(
-            {
-                "delay_s": float(delay_s),
-                "score_std": score_std,
-                "score_aae": score_aae,
-                "mae": mae,
-                "rmse": rmse,
-                "n_valid": n_valid,
-                "selected_score": selected_score,
-                "selected": False,
-            }
+            dict(
+                delay_s=float(delay),
+                score_aae=aae,
+                score_std=std,
+                mae=aae,
+                rmse=rmse,
+                n_valid=int(valid.sum()),
+                selected_score=aae if mode == "aae" else std,
+                selected=False,
+            )
         )
-        if n_valid >= 2 and np.isfinite(selected_score):
-            other_score = score_std if score_mode == "aae" else score_aae
-            candidate_key = (selected_score, abs(float(delay_s)), rmse, other_score)
-            if best_key is None or _tdelay_score_key_is_better(candidate_key, best_key):
-                best_key = candidate_key
-                best_score = selected_score
-                best_score_aae = score_aae
-                best_score_std = score_std
-                best_rmse = rmse
-                best_delay = float(delay_s)
-                best_rest = rest
-                best_ref = ref_hr
-
-    score_table = pd.DataFrame(
-        rows,
-        columns=["delay_s", "score_std", "score_aae", "mae", "rmse", "n_valid", "selected_score", "selected"],
-    )
-    if best_rest is None or not np.isfinite(best_score):
-        max_valid = int(score_table["n_valid"].max()) if not score_table.empty else 0
+    table = pd.DataFrame(rows)
+    finite = table[np.isfinite(table.selected_score)]
+    if finite.empty:
         raise ValueError(
-            "alignment failed: fewer than 2 comparable tracked rest windows "
-            f"(max_valid_windows={max_valid})"
+            "evaluation alignment has fewer than 2 comparable rest windows"
         )
-    selected_mask = np.isclose(score_table["delay_s"].to_numpy(dtype=float), float(best_delay), rtol=0.0, atol=1e-9)
-    if selected_mask.any():
-        score_table.loc[selected_mask, "selected"] = True
-    debug: dict[str, Any] = {
-        "alignment_TW": align_tw,
-        "alignment_step_s": float(alignment_step_s),
-        "delay_range_s": tuple(float(x) for x in delay_range_s),
-        "delay_step_s": step,
-        "alignment_score_mode": score_mode,
-    }
-    if return_debug:
-        debug["best_ref_hr_bpm"] = best_ref
+    idx = min(
+        finite.index,
+        key=lambda i: (
+            table.loc[i, "selected_score"],
+            abs(table.loc[i, "delay_s"]),
+            table.loc[i, "rmse"],
+        ),
+    )
+    table.loc[idx, "selected"] = True
+    best = table.loc[idx]
     return TDelayEstimateResult(
-        best_tdelay_s=best_delay,
-        best_score=best_score,
-        score_table=score_table,
-        rest_ppg_hr=best_rest,
-        alignment_score_mode=score_mode,
-        best_score_aae=best_score_aae,
-        best_score_std=best_score_std,
-        best_rmse=best_rmse,
-        debug=debug,
+        float(best.delay_s),
+        float(best.selected_score),
+        table,
+        rest,
+        mode,
+        float(best.score_aae),
+        float(best.score_std),
+        float(best.rmse),
+        dict(
+            evaluation_window_s=evaluation_window_s, evaluation_step_s=evaluation_step_s
+        ),
     )
 
 
-def build_aligned_training_windows(
-    ds: ProtocolDataset,
+def build_sensor_window_plan(
+    ds: SensorDataset,
     segment: SegmentInfo,
     fs: float,
-    train_TW: float,
-    best_tdelay_s: float,
-    tdelay_result: TDelayEstimateResult | None = None,
-) -> AlignedDataset:
-    """Build downstream training windows from a pre-estimated global Tdelay.
-
-    中文说明：该函数只使用 ``train_TW`` 生成 window_starts/window_centers/labels 和
-    参考 HR 半窗中心校正；它不会重新估计 Tdelay，也不会把 ``alignment_TW`` 用作
-    训练窗口长度。
-    """
+    hr_window_s: float,
+) -> SensorWindowPlan:
+    """Build full 8 s / 1 s sensor windows independently of reference HR."""
 
     if not segment.is_valid:
-        raise ValueError(f"Cannot build windows for invalid segment info: {segment.reason}")
+        raise ValueError(f"Invalid detector result: {segment.reason}")
     fs_i = int(round(float(fs)))
-    train_tw = float(train_TW)
-    shifted_dataset = _shift_dataset_by_delay(ds, best_tdelay_s, fs_i)
-    shifted_start = max(0.0, float(segment.motion_start_s) - float(best_tdelay_s))
-    shifted_end = max(shifted_start, float(segment.motion_end_s) - float(best_tdelay_s))
-
+    train_tw = float(hr_window_s)
+    if train_tw != 8.0:
+        raise ValueError("HR observation is frozen at 8 s / 1 s")
+    # Reference values are attached only by the evaluation layer after prediction.
+    duration = (
+        len(ds.source_imu.time_s) / ds.source_imu.fs
+        if ds.source_imu is not None
+        else len(ds.time_s) / fs_i
+    )
     win_len = int(round(train_tw * fs_i))
-    starts_idx = np.arange(0, len(shifted_dataset.time_s) - win_len + 1, fs_i, dtype=int)
-    starts_s = starts_idx.astype(float) / fs_i
-    centers_s = starts_s + train_tw / 2.0
-    labels = np.where(
-        centers_s < shifted_start,
-        "rest",
-        np.where(centers_s <= shifted_end, "motion", "recovery"),
+    max_start = min(
+        len(ds.time_s) - win_len, int(np.floor((duration - train_tw) * fs_i + 1e-8))
     )
-
-    ref_time_shifted = ds.ref_time_s - train_tw / 2.0
-    ref_hr = np.interp(
-        centers_s,
-        ref_time_shifted,
-        ds.ref_hr_bpm,
-        left=np.nan,
-        right=np.nan,
+    starts_idx = np.arange(0, max_start + 1, fs_i, dtype=int)
+    origin = float(ds.time_s[0]) if len(ds.time_s) else 0.0
+    starts = origin + starts_idx.astype(float) / fs_i
+    centers = starts + train_tw / 2
+    labels, _, _ = segment.states_at(centers)
+    info = AlignmentInfo(
+        best_tdelay_s=0.0,
+        std_by_delay={},
+        ref_shift_s=0.0,
+        num_windows=len(starts),
+        hr_window_s=train_tw,
+        alignment_score_mode="sensor_only",
     )
-    valid = np.isfinite(ref_hr)
-    starts_s = starts_s[valid]
-    centers_s = centers_s[valid]
-    labels = labels[valid]
-    ref_hr = ref_hr[valid]
-
-    updated_segment = replace(
+    return SensorWindowPlan(
+        ds,
         segment,
-        motion_start_s=shifted_start,
-        motion_end_s=shifted_end,
-        window_starts_s=starts_s,
-        window_centers_s=centers_s,
-        labels=labels,
+        info,
+        starts,
+        centers,
+        labels,
+        np.flatnonzero(labels == "rest"),
+        np.flatnonzero(labels == "motion"),
+        np.flatnonzero(labels == "recovery"),
     )
-    score_table = tdelay_result.score_table if tdelay_result is not None else pd.DataFrame()
-    std_by_delay = (
-        dict(zip(score_table["delay_s"].astype(float), score_table["score_std"].astype(float)))
-        if not score_table.empty and "score_std" in score_table
-        else {float(best_tdelay_s): float("nan")}
-    )
-    aae_col = "score_aae" if "score_aae" in score_table else "mae"
-    aae_by_delay = (
-        dict(zip(score_table["delay_s"].astype(float), score_table[aae_col].astype(float)))
-        if not score_table.empty and aae_col in score_table
-        else {float(best_tdelay_s): float("nan")}
-    )
-    rmse_by_delay = (
-        dict(zip(score_table["delay_s"].astype(float), score_table["rmse"].astype(float)))
-        if not score_table.empty and "rmse" in score_table
-        else {float(best_tdelay_s): float("nan")}
-    )
-    best_row = (
-        score_table.loc[score_table["delay_s"].astype(float) == float(best_tdelay_s)].head(1)
-        if not score_table.empty
-        else pd.DataFrame()
-    )
-    n_valid_score = int(best_row["n_valid"].iloc[0]) if not best_row.empty else 0
-    alignment_score_mode = (
-        str(tdelay_result.alignment_score_mode)
-        if tdelay_result is not None and getattr(tdelay_result, "alignment_score_mode", "")
-        else "aae"
-    )
-    alignment_info = AlignmentInfo(
-        best_tdelay_s=float(best_tdelay_s),
-        std_by_delay=std_by_delay,
-        ref_shift_s=train_tw / 2.0,
-        num_windows=int(starts_s.size),
-        alignment_tw_s=(
-            float(tdelay_result.debug.get("alignment_TW", DEFAULT_ALIGNMENT_TW))
-            if tdelay_result is not None and tdelay_result.debug is not None
-            else DEFAULT_ALIGNMENT_TW
-        ),
-        train_tw_s=train_tw,
-        best_score=float(tdelay_result.best_score) if tdelay_result is not None else float("nan"),
-        n_valid_score_windows=n_valid_score,
-        aae_by_delay=aae_by_delay,
-        rmse_by_delay=rmse_by_delay,
-        alignment_score_mode=alignment_score_mode,
-        best_score_aae=(
-            float(tdelay_result.best_score_aae)
-            if tdelay_result is not None and np.isfinite(getattr(tdelay_result, "best_score_aae", np.nan))
-            else (float(best_row[aae_col].iloc[0]) if not best_row.empty and aae_col in best_row else float("nan"))
-        ),
-        best_score_std=(
-            float(tdelay_result.best_score_std)
-            if tdelay_result is not None and np.isfinite(getattr(tdelay_result, "best_score_std", np.nan))
-            else (float(best_row["score_std"].iloc[0]) if not best_row.empty and "score_std" in best_row else float("nan"))
-        ),
-        best_rmse=(
-            float(tdelay_result.best_rmse)
-            if tdelay_result is not None and np.isfinite(getattr(tdelay_result, "best_rmse", np.nan))
-            else (float(best_row["rmse"].iloc[0]) if not best_row.empty and "rmse" in best_row else float("nan"))
-        ),
-    )
-    rest_idx = np.flatnonzero(labels == "rest")
-    motion_idx = np.flatnonzero(labels == "motion")
-    recovery_idx = np.flatnonzero(labels == "recovery")
-    return AlignedDataset(
-        dataset=shifted_dataset,
-        segment_info=updated_segment,
-        alignment_info=alignment_info,
-        window_starts_s=starts_s,
-        window_centers_s=centers_s,
-        segment_labels=labels,
-        ref_hr_bpm=ref_hr,
-        rest_indices=rest_idx,
-        motion_indices=motion_idx,
-        recovery_indices=recovery_idx,
-    )
-
-
-def _print_alignment_once(sample_stem: str, best_delay: float, rest_windows: int) -> None:
-    """Print one Tdelay summary per sample in the current Python process."""
-
-    key = str(sample_stem)
-    with _PRINTED_ALIGNMENT_LOCK:
-        if key in _PRINTED_ALIGNMENT_SAMPLE_STEMS:
-            return
-        _PRINTED_ALIGNMENT_SAMPLE_STEMS.add(key)
-    print(f"[alignment] {key}: best_tdelay_s={best_delay:.1f}, rest_windows={int(rest_windows)}")
-
-
-def _reference_sequence_after_half_window(
-    dataset: ProtocolDataset,
-    TW: float,
-    score_start_s: float = 0.0,
-) -> np.ndarray:
-    """Return finite reference HR values after the half-window shift."""
-
-    mask = np.asarray(dataset.ref_time_s, dtype=float) >= float(score_start_s) + TW / 2.0
-    seq = np.asarray(dataset.ref_hr_bpm, dtype=float)[mask]
-    return seq[np.isfinite(seq)]
 
 
 def _limit_hr_transition(
@@ -945,12 +814,12 @@ def _rest_spectrum_candidates_like_reference(
         ref_freq, ref_amp = _fft_peak_candidates(ref_sig, fs, hr_band_bpm, peak_percent)
         if ref_freq.size:
             penalty_freq_hz = float(ref_freq[int(np.argmax(ref_amp))])
-            mask = (np.abs(fre_hz - penalty_freq_hz) < float(spec_penalty_width_hz)) | (
-                np.abs(fre_hz - 2.0 * penalty_freq_hz) < float(spec_penalty_width_hz)
-            )
-            if mask.any():
-                amp[mask] *= float(spec_penalty_weight)
-                penalty_applied = True
+            policy = PenaltyPolicy.build(ref_freq, ref_amp, fre_hz,
+                width_hz=spec_penalty_width_hz, base_retention=spec_penalty_weight)
+            weights = policy.build_weights(fre_hz)
+            amp *= weights
+            penalty_applied = bool(np.any(weights < 1))
+
 
     if fre_hz.size:
         order = np.argsort(-amp, kind="stable")
@@ -1013,253 +882,40 @@ def _window_fft_hr_spectrum(
     return freq[mask] * 60.0, amp[mask]
 
 
-def _rest_ppg_hr_tracked_for_delay(
-    ppg_green: np.ndarray,
-    fs: int,
-    *,
-    delay_s: float,
-    motion_start_s: float,
-    score_start_s: float,
-    rest_hr_kwargs: dict[str, Any],
-    penalty_signal: np.ndarray | None = None,
-) -> RestHrResult:
-    """Shift PPG by candidate Tdelay and extract comparable tracked rest HR."""
-
-    tw_s = float(rest_hr_kwargs.get("tw_s", DEFAULT_ALIGNMENT_TW))
-    step_s = float(rest_hr_kwargs.get("step_s", DEFAULT_ALIGNMENT_STEP_S))
-    shifted = _shift_channel_for_delay(ppg_green, delay_s, fs)
-    # 中文说明：沿用旧逻辑，候选 delay 会同步改变 shifted 轴上的可用静息截止时间。
-    usable_rest_s = max(0.0, float(motion_start_s) - float(delay_s))
-    win_len = int(round(tw_s * fs))
-    max_start = min(len(shifted) - win_len, int(round((usable_rest_s - tw_s) * fs)))
-    min_start = max(0, int(round(float(score_start_s) * fs)))
-    if max_start < min_start:
-        empty = np.asarray([], dtype=float)
-        return RestHrResult(empty, empty, empty, empty, {"reason": "no comparable rest window"})
-    max_end = max_start + win_len
-    segment = shifted[min_start:max_end]
-    penalty_segment = None
-    if penalty_signal is not None:
-        shifted_penalty = _shift_channel_for_delay(penalty_signal, delay_s, fs)
-        penalty_segment = shifted_penalty[min_start:max_end]
-    kwargs = _normalise_rest_hr_extractor_kwargs(rest_hr_kwargs)
-    kwargs["tw_s"] = tw_s
-    kwargs["step_s"] = step_s
-    # 中文说明：参考实现的纯 FFT 路径使用 ACC 作为谱惩罚参考；这里传入同一
-    # 时间片的 ACC 窗口，只有 spec_penalty_enable=True 时才会压低运动频率峰。
-    if penalty_segment is not None:
-        kwargs["penalty_signal"] = penalty_segment
-    result = extract_rest_ppg_hr_tracked(segment, fs, **kwargs)
-    absolute_times = result.times_s + min_start / float(fs)
-    return RestHrResult(
-        times_s=absolute_times,
-        hr_bpm_raw=result.hr_bpm_raw,
-        hr_bpm_tracked=result.hr_bpm_tracked,
-        hr_bpm_smooth=result.hr_bpm_smooth,
-        quality=result.quality,
-    )
-
-
-def _normalise_rest_hr_extractor_kwargs(rest_hr_kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Convert plotting-friendly rest-HR keyword aliases for the core extractor."""
-
-    kwargs = dict(rest_hr_kwargs)
-    hr_band_hz = kwargs.pop("hr_band_hz", None)
-    if hr_band_hz is None:
-        return kwargs
-    values = np.asarray(hr_band_hz, dtype=float).ravel()
-    if values.size != 2 or not np.all(np.isfinite(values)) or not 0.0 < values[0] < values[1]:
-        raise ValueError("hr_band_hz must contain two finite increasing positive values")
-    converted = (float(values[0]) * 60.0, float(values[1]) * 60.0)
-    existing = kwargs.get("hr_band_bpm")
-    if existing is not None and not np.allclose(np.asarray(existing, dtype=float), converted):
-        raise ValueError("hr_band_hz and hr_band_bpm describe different frequency ranges")
-    kwargs["hr_band_bpm"] = converted
-    return kwargs
-
-
-def _reference_hr_for_alignment_times(
-    dataset: ProtocolDataset,
-    ppg_times_s: np.ndarray,
-    alignment_TW: float,
-) -> np.ndarray:
-    """Interpolate reference HR onto rest PPG-HR window-center times.
-
-    中文说明：``RestHrResult.times_s`` 已经是 ``start + alignment_TW/2`` 的窗口中心，
-    因此这里不再像旧的“窗口起点序列”那样额外平移参考时间轴；半窗中心校正已经
-    体现在 PPG HR 时间戳本身。
-    """
-
-    times = np.asarray(ppg_times_s, dtype=float)
-    if times.size == 0:
-        return np.asarray([], dtype=float)
-    ref_hr = np.asarray(dataset.ref_hr_bpm, dtype=float)
-    return np.interp(times, np.asarray(dataset.ref_time_s, dtype=float), ref_hr, left=np.nan, right=np.nan)
-
-
 def compute_rest_alignment_diagnostic_curve(
     dataset: ProtocolDataset,
     segment_info: SegmentInfo,
-    aligned: AlignedDataset,
-    TW: float,
+    aligned: SensorWindowPlan,
+    hr_window_s: float,
     fs_target: int,
+    *,
     rest_hr_kwargs: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
-    """Return comparable rest-window reference HR and PPG FFT HR curves.
-
-    中文说明：诊断曲线使用 ``aligned.alignment_info.best_tdelay_s`` 和全局对齐的
-    ``alignment_tw_s``，复用 tracked 静息段 PPG-HR 提取逻辑。参数 ``TW`` 仅为
-    旧调用的兼容 fallback；不会把训练窗口 TW 误用到 Tdelay 诊断曲线中。
-    """
-
-    delay_s = float(aligned.alignment_info.best_tdelay_s)
-    alignment_tw = float(getattr(aligned.alignment_info, "alignment_tw_s", TW) or TW)
-    score_start_s = _REST_ALIGNMENT_SCORE_START_S
-    kwargs = {"tw_s": alignment_tw, "step_s": DEFAULT_ALIGNMENT_STEP_S}
-    kwargs.update(rest_hr_kwargs or {})
-    kwargs["tw_s"] = alignment_tw
-    kwargs.setdefault("step_s", DEFAULT_ALIGNMENT_STEP_S)
-    rest = _rest_ppg_hr_tracked_for_delay(
-        dataset.ppg_green,
-        int(fs_target),
-        delay_s=delay_s,
-        motion_start_s=float(segment_info.motion_start_s),
-        score_start_s=score_start_s,
-        rest_hr_kwargs=kwargs,
-        penalty_signal=dataset.accz,
+    """Evaluate a complete sensor-center rest curve; no sensor shift or HR feedback."""
+    kwargs = dict(rest_hr_kwargs or {})
+    kwargs.update(tw_s=hr_window_s, step_s=DEFAULT_EVALUATION_STEP_S)
+    rest = extract_rest_ppg_hr_tracked(
+        dataset.ppg_green, fs_target, penalty_signal=dataset.accz, **kwargs
     )
-    ref_hr = _reference_hr_for_alignment_times(dataset, rest.times_s, alignment_tw)
-    ppg_hr = np.asarray(rest.hr_bpm_smooth, dtype=float)
-    valid = np.isfinite(ppg_hr) & np.isfinite(ref_hr)
-    if not valid.any():
-        return pd.DataFrame(columns=["time_s", "ppg_hr_bpm", "ref_hr_bpm"])
+    ref = np.interp(
+        rest.times_s + aligned.alignment_info.best_tdelay_s,
+        dataset.ref_time_s,
+        dataset.ref_hr_bpm,
+        left=np.nan,
+        right=np.nan,
+    )
+    keep = (
+        (segment_info.states_at(rest.times_s)[0] == "rest")
+        & np.isfinite(ref)
+        & np.isfinite(rest.hr_bpm_smooth)
+    )
     return pd.DataFrame(
-        {
-            "time_s": rest.times_s[valid],
-            "ppg_hr_bpm": ppg_hr[valid],
-            "ref_hr_bpm": ref_hr[valid],
-        }
+        dict(
+            time_s=rest.times_s[keep],
+            ppg_hr_bpm=rest.hr_bpm_smooth[keep],
+            ref_hr_bpm=ref[keep],
+        )
     )
-
-
-def _reference_curve_after_half_window(
-    dataset: ProtocolDataset,
-    TW: float,
-    score_start_s: float = 0.0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return finite reference HR curve after the same TW/2 correction.
-
-    中文说明：这里与全局 Tdelay 搜索的参考 HR 对齐口径一致，把参考时间减去
-    ``TW/2``，使其对应 PPG FFT 窗口的起点序列。
-    """
-
-    ref_time = np.asarray(dataset.ref_time_s, dtype=float)
-    ref_hr = np.asarray(dataset.ref_hr_bpm, dtype=float)
-    mask = ref_time >= float(score_start_s) + TW / 2.0
-    time_s = ref_time[mask] - TW / 2.0
-    values = ref_hr[mask]
-    finite = np.isfinite(values)
-    return time_s[finite].astype(float), values[finite].astype(float)
-
-
-def _shift_channel_for_delay(values: np.ndarray, delay_s: float, fs: int) -> np.ndarray:
-    """Shift one channel according to signed global Tdelay.
-
-    Convention:
-    - delay_s > 0: sensor lags reference HR; shift sensor left by trimming the head.
-    - delay_s == 0: unchanged.
-    - delay_s < 0: sensor leads reference HR; shift sensor right by padding the head
-      with the first sample arr[0] and trimming the tail.
-
-    For delay_s < 0, padding uses arr[0], not literal zero.
-    """
-    arr = np.asarray(values, dtype=float)
-
-    if arr.size == 0:
-        return arr.copy()
-
-    samples = int(round(float(delay_s) * float(fs)))
-
-    if samples == 0:
-        return arr.copy()
-
-    if samples > 0:
-        if samples >= arr.size:
-            return arr[:0].copy()
-        return arr[samples:].copy()
-
-    pad = -samples
-
-    if pad >= arr.size:
-        return np.full(arr.shape, arr[0], dtype=float)
-
-    prefix = np.full(pad, arr[0], dtype=float)
-    return np.concatenate([prefix, arr[:-pad]]).astype(float, copy=False)
-
-
-def _shift_dataset_by_delay(dataset: ProtocolDataset, delay_s: float, fs: int) -> ProtocolDataset:
-    """Apply signed global Tdelay to every protocol sensor channel.
-
-    All channels returned by dataset.channels() must be shifted by the same delay_s.
-    This keeps PPG, ACC, GYRO, HF, CF and other channels synchronized.
-    """
-    channels = {
-        name: _shift_channel_for_delay(values, delay_s, fs)
-        for name, values in dataset.channels().items()
-    }
-    return dataset.replace_channels(channels, fs)
-
-
-def _rest_ppg_hr_for_delay(
-    ppg_green: np.ndarray,
-    fs: int,
-    TW: float,
-    delay_s: float,
-    motion_start_s: float,
-    score_start_s: float = 0.0,
-) -> np.ndarray:
-    """Estimate rest-window PPG HR for one candidate delay."""
-
-    _, hr = _rest_ppg_hr_curve_for_delay(
-        ppg_green,
-        fs,
-        TW,
-        delay_s,
-        motion_start_s,
-        score_start_s,
-    )
-    return hr
-
-
-def _rest_ppg_hr_curve_for_delay(
-    ppg_green: np.ndarray,
-    fs: int,
-    TW: float,
-    delay_s: float,
-    motion_start_s: float,
-    score_start_s: float = 0.0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Estimate rest-window PPG HR and its comparable rest-window start times.
-
-    中文说明：这是 ``_rest_ppg_hr_for_delay`` 的曲线版封装，仍然调用同一个
-    Hamming + FFT HR 提取逻辑，避免诊断图和真实搜索使用两套算法。
-    """
-
-    shifted = _shift_channel_for_delay(ppg_green, delay_s, fs)
-    # Keep this as motion_start_s - delay_s for both signs: positive delay shifts
-    # the sensor left and advances the motion boundary on the shifted axis, while
-    # negative delay shifts the sensor right and delays it by abs(delay_s).
-    usable_rest_s = max(0.0, float(motion_start_s) - delay_s)
-    win_len = int(round(TW * fs))
-    max_start = min(len(shifted) - win_len, int(round((usable_rest_s - TW) * fs)))
-    min_start = max(0, int(round(float(score_start_s) * fs)))
-    if max_start < min_start:
-        return np.asarray([], dtype=float), np.asarray([], dtype=float)
-    starts = np.arange(min_start, max_start + 1, fs, dtype=int)
-    hrs = [_window_fft_hr(shifted[s : s + win_len], fs, 0.5, 2.0) for s in starts]
-    hrs_arr = np.asarray(hrs, dtype=float)
-    finite = np.isfinite(hrs_arr)
-    return starts[finite].astype(float) / float(fs), hrs_arr[finite]
 
 
 def _window_fft_hr(x: np.ndarray, fs: int, low_hz: float, high_hz: float) -> float:
@@ -1274,9 +930,3 @@ def _window_fft_hr(x: np.ndarray, fs: int, low_hz: float, high_hz: float) -> flo
         return float("nan")
     idx = np.flatnonzero(mask)[int(np.argmax(amp[mask]))]
     return float(freq[idx] * 60.0)
-
-
-def _left_shift_dataset(dataset: ProtocolDataset, delay_s: float, fs: int) -> ProtocolDataset:
-    """Compatibility wrapper for signed global Tdelay shifting."""
-
-    return _shift_dataset_by_delay(dataset, delay_s, fs)

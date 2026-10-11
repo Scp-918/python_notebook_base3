@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ppg_hr.experimental.preprocess_protocol import SourceImu
+
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +46,11 @@ def _dataset_for_plot(fs: int = 20, duration_s: float = 80.0) -> ProtocolDataset
         gyroz=zeros,
         ref_time_s=ref_time,
         ref_hr_bpm=ref_hr,
+        source_imu=SourceImu(fs,t,accx,zeros,zeros,zeros,zeros,zeros),
+
+        ppg_clean_green=ppg,
+        ppg_clean_red=0.8 * ppg,
+        ppg_clean_ir=0.6 * ppg,
     )
 
 
@@ -62,11 +69,11 @@ def test_plot_unaligned_fullfield_ppg_hr_by_motion_type_writes_png(tmp_path: Pat
         datasets={"subject_name_write_1": _dataset_for_plot()},
         output_dir=tmp_path / "allfield",
         fs_target=20,
-        TW=8,
+        hr_window_s=8,
     )
 
     assert set(paths) == {"write"}
-    assert paths["write"].name == "write_all_alignment_TW8.png"
+    assert paths["write"].name == "write_all_alignment_hr_window_s8.png"
     assert paths["write"].exists()
     assert paths["write"].stat().st_size > 0
 
@@ -87,10 +94,10 @@ def test_plot_raw_ppg_and_unaligned_hr_by_motion_type_writes_rest_dual_axis_png(
         output_dir=tmp_path / "allfield",
         fs_target=20,
         fs_origin=20,
-        TW=8,
+        hr_window_s=8,
     )
 
     assert set(paths) == {"write"}
-    assert paths["write"].name == "write_rest_raw_ppg_hr_dual_axis_TW8.png"
+    assert paths["write"].name == "write_rest_raw_ppg_hr_dual_axis_hr_window_s8.png"
     assert paths["write"].exists()
     assert paths["write"].stat().st_size > 0

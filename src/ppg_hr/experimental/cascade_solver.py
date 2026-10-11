@@ -8,24 +8,21 @@ Fmove、逐窗归一化、包络时延、级联自适应滤波、频谱惩罚提
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from ..core.find_near_biggest import find_near_biggest
-from ..params import CascadeScheme, TargetScope
-from ..preprocess.utils import smoothdata_movmedian
+from ..params import RESULT_SCHEMA_VERSION, REFERENCE_REGISTRY, ReferenceConfig, TargetScope, resolve_core_config, core_preset_metadata
 from .alignment import (
-    AlignedDataset,
+    SensorWindowPlan,
     AlignmentInfo,
-    TDelayEstimateResult,
     TimeBiasAfterResult,
-    build_aligned_training_windows,
-    estimate_global_tdelay_from_rest,
+    build_sensor_window_plan,
     search_time_bias_after,
 )
+from .penalty_policy import spectrum_peaks
 from .envelope_delay import DelayEstimate, estimate_envelope_delays
 from .enhanced_tracking import SpectrumTrackingState, track_spectrum_candidates
 from .fusion import fuse_final_hr
@@ -35,13 +32,14 @@ from .noncausal_lms import map_delay_to_lms_params, noncausal_lms_filter
 from .preprocess_protocol import (
     PROTOCOL_CHANNELS,
     ProtocolDataset,
+    SensorDataset,
     apply_ppg_input_transform,
     resample_protocol_dataset,
 )
 from .protocol_search_space import ProtocolTrialParams
 from .rff_lms import noncausal_rff_lms_filter
-from .segmentation import SegmentInfo, detect_activity_segments
-from .spectral_utils import compute_power_spectrum, dominant_frequency_in_band, sparse_spectrum_hr_candidates
+from .segmentation import SegmentInfo, apply_motion_protocol, detect_source_imu_segments
+from .spectral_utils import compute_power_spectrum, sparse_spectrum_hr_candidates
 from .volterra import noncausal_volterra_filter
 
 __all__ = [
@@ -49,7 +47,6 @@ __all__ = [
     "ProtocolRunResult",
     "aggregate_metric_arrays",
     "clear_all_caches",
-    "clear_trial_caches",
     "clear_trial_heavy_caches",
     "extract_hr_with_penalty",
     "extract_plain_fft_hr",
@@ -68,7 +65,7 @@ class ProtocolRunResult:
     success: bool
     reason: str
     target_scope: TargetScope
-    cascade_scheme: CascadeScheme
+    reference_config: ReferenceConfig
     adaptive_filter: str
     params: ProtocolTrialParams
     objective_aae_bpm: float
@@ -97,12 +94,12 @@ class ProtocolRunResult:
 
 @dataclass
 class _TrialBase:
-    """Cached trial base that depends on Fs_Target and training TW."""
+    """Cached trial base that depends on Fs_Target and training hr_window_s."""
 
-    dataset: ProtocolDataset
+    dataset: SensorDataset
     fs: int
     segment_info: SegmentInfo
-    aligned: AlignedDataset | None
+    aligned: SensorWindowPlan | None
     motion_frequency: float | None
     failure_reason: str = ""
     norm_window_cache: dict[str, Any] = field(default_factory=dict)
@@ -111,20 +108,19 @@ class _TrialBase:
 
 
 @dataclass
-class _GlobalAlignmentBase:
-    """Cached global Tdelay base that is independent of training TW."""
+class _SensorBase:
+    """Cached sensor preparation independent of reference HR and filter memory."""
 
-    dataset: ProtocolDataset
+    dataset: SensorDataset
     fs: int
     segment_info: SegmentInfo
-    tdelay_result: TDelayEstimateResult | None
     failure_reason: str = ""
     cache_hit: bool = False
 
 
 @dataclass
 class _NormalisedWindowCache:
-    """Compact normalized-window cache for one sample/Fs_Target/TW base."""
+    """Compact normalized-window cache for one sample/Fs_Target/hr_window_s base."""
 
     norm_by_channel: dict[str, np.ndarray]
     adaptive_norm_by_channel: dict[str, np.ndarray]
@@ -136,10 +132,9 @@ class _NormalisedWindowCache:
     start_s: np.ndarray
     center_s: np.ndarray
     segment_label: np.ndarray
-    ref_hr_bpm: np.ndarray
     win_len: int
     adaptive_win_len: int
-    tw_f_context_status: np.ndarray
+    prewarm_context_status: np.ndarray
 
 
 @dataclass
@@ -152,7 +147,7 @@ class _WindowRunPayload:
 
 def run_protocol_trial(
     dataset: ProtocolDataset,
-    cascade_scheme: CascadeScheme | str,
+    reference_groups_order: ReferenceConfig | tuple[str, ...],
     target_scope: TargetScope | str,
     params: ProtocolTrialParams,
     collect_frame: bool = True,
@@ -168,13 +163,15 @@ def run_protocol_trial(
     和 accuracy 与 full 模式共用同一套计算逻辑。
     """
 
-    scheme = CascadeScheme(cascade_scheme)
+    params = resolve_core_config(params)
+    preset_metadata = core_preset_metadata(params)
+    scheme = ReferenceConfig(reference_groups_order)
     scope = TargetScope(target_scope)
     adaptive_filter = str(getattr(params, "adaptive_filter", "lms"))
     empty = pd.DataFrame()
 
     try:
-        base = _get_trial_base(dataset, params)
+        base = _get_trial_base(dataset.sensor_view(), params)
         if base.failure_reason:
             return _failed(scope, scheme, params, base.failure_reason, base.segment_info)
         if base.aligned is None or base.motion_frequency is None:
@@ -190,7 +187,7 @@ def run_protocol_trial(
             collect_stages=bool(collect_stages),
         )
         arrays = payload.metric_arrays
-        if arrays.get("ref_hr_bpm", np.asarray([], dtype=float)).size == 0:
+        if arrays.get("time_s", np.asarray([], dtype=float)).size == 0:
             return _failed(
                 scope,
                 scheme,
@@ -206,21 +203,8 @@ def run_protocol_trial(
             arrays["time_s"].astype(float),
             base.aligned.segment_info,
         )
-        if not filtered_mask.any():
-            return _failed(
-                scope,
-                scheme,
-                params,
-                "target scope contains no windows",
-                base.segment_info,
-                base.aligned.alignment_info,
-            )
 
         adaptive = arrays["adaptive_hr_bpm"].astype(float, copy=True)
-        adaptive[filtered_mask] = smoothdata_movmedian(
-            adaptive[filtered_mask],
-            int(params.smooth_win_len),
-        )
         fusion = fuse_final_hr(
             time_s=arrays["time_s"].astype(float),
             baseline_hr_bpm=arrays["baseline_hr_bpm"].astype(float),
@@ -241,19 +225,34 @@ def run_protocol_trial(
             ),
             params=params,
             target_scope=scope.value,
+            baseline_estimator=arrays["baseline_estimator"],
+            motion_runs=base.segment_info.motion_runs,
         )
+        # Only evaluate reference after every candidate and final prediction is fixed.
+        ref_time = np.asarray(dataset.ref_time_s, dtype=float)
+        ref_values = np.asarray(dataset.ref_hr_bpm, dtype=float)
+        arrays["ref_hr_bpm"] = (np.interp(arrays["time_s"], ref_time, ref_values, left=np.nan, right=np.nan)
+                                if ref_time.size else np.full(adaptive.size, np.nan))
+        episodes, elapsed = base.segment_info.states_at(arrays["time_s"])[1:]
+        arrays["episode_id"] = episodes
+        arrays["recovery_elapsed_s"] = elapsed
+        if collect_frame:
+            payload.frame["ref_hr_bpm"] = arrays["ref_hr_bpm"]
+            payload.frame["episode_id"] = episodes
+            payload.frame["recovery_elapsed_s"] = elapsed
         baseline_abs_err = np.abs(arrays["baseline_hr_bpm"].astype(float) - arrays["ref_hr_bpm"].astype(float))
         adaptive_abs_err = np.abs(adaptive - arrays["ref_hr_bpm"].astype(float))
         final_abs_err = np.abs(fusion.final_hr_bpm - arrays["ref_hr_bpm"].astype(float))
         metric_arrays: MetricArrays = {
             **arrays,
             "adaptive_hr_bpm": adaptive,
+            "selected_hr_bpm": fusion.selected_hr_bpm,
             "final_hr_bpm": fusion.final_hr_bpm,
             "final_source": fusion.final_source,
             "fusion_reason": fusion.fusion_reason,
             "reset_fft_hr_bpm": fusion.reset_fft_hr_bpm,
-            "post_motion_guard_state": fusion.guard_state,
-            "post_motion_switch_reason": fusion.switch_reason,
+            "handoff_state": fusion.handoff_state,
+            "handoff_reason": fusion.handoff_reason,
             "baseline_abs_err_bpm": baseline_abs_err,
             "adaptive_abs_err_bpm": adaptive_abs_err,
             "final_abs_err_bpm": final_abs_err,
@@ -261,7 +260,7 @@ def run_protocol_trial(
         }
         time_bias_after = _attach_time_bias_after_metrics(
             metric_arrays,
-            base.dataset,
+            dataset,
             params,
             filtered_mask,
         )
@@ -279,12 +278,13 @@ def run_protocol_trial(
             frame["is_filtered_segment"] = filtered_mask
             frame["adaptive_hr_bpm"] = adaptive
             frame["baseline_hr_bpm"] = arrays["baseline_hr_bpm"].astype(float)
+            frame["selected_hr_bpm"] = fusion.selected_hr_bpm
             frame["final_hr_bpm"] = fusion.final_hr_bpm
             frame["final_source"] = fusion.final_source
             frame["fusion_reason"] = fusion.fusion_reason
             frame["reset_fft_hr_bpm"] = fusion.reset_fft_hr_bpm
-            frame["post_motion_guard_state"] = fusion.guard_state
-            frame["post_motion_switch_reason"] = fusion.switch_reason
+            frame["handoff_state"] = fusion.handoff_state
+            frame["handoff_reason"] = fusion.handoff_reason
             frame["is_recovery"] = frame["segment_label"].astype(str) == "recovery"
             frame["baseline_abs_err_bpm"] = baseline_abs_err
             frame["adaptive_abs_err_bpm"] = adaptive_abs_err
@@ -318,11 +318,16 @@ def run_protocol_trial(
                 frame["posthoc_final_aae_bpm"] = metrics.get("posthoc_final_aae_bpm", float("nan"))
                 frame["posthoc_final_acc_pct"] = metrics.get("posthoc_final_acc_pct", float("nan"))
 
+        if collect_frame and not frame.empty:
+            frame["result_schema_version"] = RESULT_SCHEMA_VERSION
+            frame["preset_name"] = preset_metadata["preset_name"]
+            frame["preset_version"] = preset_metadata["preset_version"]
+
         return ProtocolRunResult(
             success=True,
             reason="",
             target_scope=scope,
-            cascade_scheme=scheme,
+            reference_config=scheme,
             adaptive_filter=adaptive_filter,
             params=params,
             objective_aae_bpm=final_aae,
@@ -349,6 +354,20 @@ def run_protocol_trial(
             posthoc_n_valid_windows=int(metrics.get("posthoc_n_valid_windows", 0) or 0),
             time_bias_after=time_bias_after,
             metadata={
+                **preset_metadata,
+                "motion_detection": base.segment_info.to_dict(),
+                "input_source": dataset.source_metadata,
+                "reference_groups_order": scheme.reference_groups_order,
+                "reference_sequence": scheme.reference_sequence,
+                "reference_order_key": scheme.reference_order_key,
+                "prediction_status": "ok",
+                "prediction_num_windows": len(arrays["time_s"]),
+                "scoring_num_valid_windows": int(np.sum(filtered_mask & np.isfinite(arrays["ref_hr_bpm"]))),
+                "scoring_status": "ok" if np.any(filtered_mask & np.isfinite(arrays["ref_hr_bpm"])) else "no_valid_reference_windows",
+                "motion_policy": params.motion_policy,
+                "source_imu_fs": dataset.source_imu.fs,
+                "history_tap_limit": params.history_tap_limit,
+                "memory_ms": params.memory_ms,
                 "tracking_config": {
                     name: value
                     for name, value in params.to_dict().items()
@@ -367,7 +386,7 @@ def run_protocol_trial(
             success=False,
             reason=str(exc),
             target_scope=scope,
-            cascade_scheme=scheme,
+            reference_config=scheme,
             adaptive_filter=adaptive_filter,
             params=params,
             objective_aae_bpm=float("inf"),
@@ -453,29 +472,29 @@ def _attach_time_bias_after_metrics(
     return result
 
 
-def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _TrialBase:
-    """Return trial windows cached by Fs_Target and training TW.
+def _get_trial_base(dataset: SensorDataset, params: ProtocolTrialParams) -> _TrialBase:
+    """Return trial windows cached by Fs_Target and training hr_window_s.
 
-    中文说明：全局 Tdelay 先用固定 Alignment_TW 独立估计并缓存，不依赖
-    ``params.TW``；随后才用贝叶斯 trial 的 ``params.TW`` 构建训练/验证/测试窗口。
-    因此不同训练 TW 可以复用同一个 best_tdelay_s，但仍得到不同训练窗口。
+    中文说明：全局 Tdelay 先用固定 evaluation_window_s 独立估计并缓存，不依赖
+    ``params.hr_window_s``；随后才用贝叶斯 trial 的 ``params.hr_window_s`` 构建训练/验证/测试窗口。
+    因此不同训练 hr_window_s 可以复用同一个 best_tdelay_s，但仍得到不同训练窗口。
     """
 
     fs_target = int(params.Fs_Target)
-    tw = float(params.TW)
-    align_key = _global_tdelay_cache_key(dataset, params)
-    key = (fs_target, tw, align_key, "tracked_tdelay_train_windows_v2")
+    tw = float(params.hr_window_s)
+    align_key = _sensor_base_cache_key(dataset, params)
+    key = (fs_target, tw, align_key, "sensor_center_windows_v1")
     cache = getattr(dataset, "_trial_base_cache", None)
     if cache is None:
         cache = {}
         setattr(dataset, "_trial_base_cache", cache)
     if key in cache:
-        # 中文注释：小型 LRU，避免 Notebook 长时间运行后保留过多 Fs/TW 大数组。
+        # 中文注释：小型 LRU，避免 Notebook 长时间运行后保留过多 Fs/hr_window_s 大数组。
         base = cache.pop(key)
         cache[key] = base
         return base
 
-    global_base = _get_global_alignment_base(dataset, params)
+    global_base = _get_sensor_base(dataset, params)
     ds = global_base.dataset
     fs = int(global_base.fs)
     segment = global_base.segment_info
@@ -492,15 +511,11 @@ def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _T
         return base
 
     try:
-        if global_base.tdelay_result is None:
-            raise RuntimeError("global Tdelay cache is empty")
-        aligned = build_aligned_training_windows(
+        aligned = build_sensor_window_plan(
             ds,
             segment,
             fs,
-            train_TW=tw,
-            best_tdelay_s=global_base.tdelay_result.best_tdelay_s,
-            tdelay_result=global_base.tdelay_result,
+            hr_window_s=tw,
         )
     except Exception as exc:
         base = _TrialBase(
@@ -514,7 +529,7 @@ def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _T
         _store_trial_base(cache, key, base)
         return base
 
-    if aligned.ref_hr_bpm.size == 0:
+    if aligned.window_centers_s.size == 0:
         base = _TrialBase(
             dataset=ds,
             fs=fs,
@@ -538,14 +553,14 @@ def _get_trial_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _T
     return base
 
 
-def _get_global_alignment_base(dataset: ProtocolDataset, params: ProtocolTrialParams) -> _GlobalAlignmentBase:
-    """Return resampling/segmentation/global Tdelay cached independently of train_TW."""
+def _get_sensor_base(dataset: SensorDataset, params: ProtocolTrialParams) -> _SensorBase:
+    """Return resampling/segmentation/global Tdelay cached independently of hr_window_s."""
 
-    key = _global_tdelay_cache_key(dataset, params)
-    cache = getattr(dataset, "_global_tdelay_cache", None)
+    key = _sensor_base_cache_key(dataset, params)
+    cache = getattr(dataset, "_sensor_base_cache", None)
     if cache is None:
         cache = {}
-        setattr(dataset, "_global_tdelay_cache", cache)
+        setattr(dataset, "_sensor_base_cache", cache)
     if key in cache:
         cached = cache.pop(key)
         cached.cache_hit = True
@@ -554,97 +569,38 @@ def _get_global_alignment_base(dataset: ProtocolDataset, params: ProtocolTrialPa
 
     fs_target = int(params.Fs_Target)
     # 中文说明：PPG 输入策略会改变后续静息段对齐、分段窗口和最终 HR，
-    # 必须在重采样前对源 dataset 应用，并由 _global_tdelay_cache_key 隔离缓存。
+    # 必须在重采样前对源 dataset 应用，并由 _sensor_base_cache_key 隔离缓存。
     transformed_dataset = apply_ppg_input_transform(dataset, params)
     ds = resample_protocol_dataset(transformed_dataset, fs_target)
     fs = int(ds.fs)
-    alignment_tw = float(getattr(params, "Alignment_TW", 8.0))
-    # 中文说明：分段用于界定静息段和运动边界，因此也固定使用 Alignment_TW，
-    # 避免 train_TW 改变时牵连全局 Tdelay 估计。
-    segment = detect_activity_segments(ds.accx, ds.accy, ds.accz, fs, alignment_tw)
-    if not segment.is_valid:
-        base = _GlobalAlignmentBase(
-            dataset=ds,
-            fs=fs,
-            segment_info=segment,
-            tdelay_result=None,
-            failure_reason=f"segmentation failed: {segment.reason}",
-        )
-        _store_global_alignment_base(cache, key, base)
-        return base
+    segment = apply_motion_protocol(detect_source_imu_segments(dataset.source_imu), params.motion_policy)
 
-    try:
-        tdelay = estimate_global_tdelay_from_rest(
-            ds,
-            segment,
-            fs,
-            alignment_TW=alignment_tw,
-            alignment_step_s=float(getattr(params, "Alignment_Step", 1.0)),
-            delay_range_s=None,
-            delay_step_s=0.1,
-            rest_hr_kwargs=_rest_hr_kwargs_from_params(params),
-            alignment_score_mode=str(getattr(params, "Rest_Alignment_Score_Mode", "aae")),
-            return_debug=False,
-        )
-    except Exception as exc:
-        base = _GlobalAlignmentBase(
-            dataset=ds,
-            fs=fs,
-            segment_info=segment,
-            tdelay_result=None,
-            failure_reason=f"alignment failed: {exc}",
-        )
-        _store_global_alignment_base(cache, key, base)
-        return base
-
-    base = _GlobalAlignmentBase(
+    base = _SensorBase(
         dataset=ds,
         fs=fs,
         segment_info=segment,
-        tdelay_result=tdelay,
         cache_hit=False,
     )
-    _store_global_alignment_base(cache, key, base)
+    _store_sensor_base(cache, key, base)
     return base
 
 
-def _store_global_alignment_base(cache: dict[Any, _GlobalAlignmentBase], key: Any, base: _GlobalAlignmentBase) -> None:
-    """Store global Tdelay cache with a small LRU cap independent of train_TW."""
+def _store_sensor_base(cache: dict[Any, _SensorBase], key: Any, base: _SensorBase) -> None:
+    """Store global Tdelay cache with a small LRU cap independent of hr_window_s."""
 
     cache[key] = base
     while len(cache) > 9:
         cache.pop(next(iter(cache)))
 
 
-def _global_tdelay_cache_key(dataset: ProtocolDataset, params: ProtocolTrialParams) -> tuple[Any, ...]:
-    """Build a Tdelay cache key that intentionally excludes params.TW."""
+def _sensor_base_cache_key(dataset: ProtocolDataset, params: ProtocolTrialParams) -> tuple[Any, ...]:
+    """Isolate signal transformations while excluding evaluation settings."""
 
-    alignment_tw = float(getattr(params, "Alignment_TW", 8.0))
-    delay_range = (-min(5.0, alignment_tw / 2.0), 5.0)
     return (
-        str(dataset.sample_stem),
-        int(params.Fs_Target),
-        round(alignment_tw, 8),
-        round(float(getattr(params, "Alignment_Step", 1.0)), 8),
-        tuple(round(float(x), 8) for x in delay_range),
-        round(0.1, 8),
-        tuple(round(float(x), 8) for x in getattr(params, "Rest_HR_Band_BPM", (40.0, 180.0))),
-        round(float(getattr(params, "Rest_HR_Track_Band_BPM", 30.0)), 8),
-        round(float(getattr(params, "Rest_HR_Slew_Limit_BPM", 6.0)), 8),
-        round(float(getattr(params, "Rest_HR_Slew_Step_BPM", 4.0)), 8),
-        str(getattr(params, "Rest_HR_Smooth_Method", "median")).lower(),
-        int(getattr(params, "Rest_HR_Smooth_Win", 3)),
-        round(float(getattr(params, "Rest_HR_Peak_Percent", 0.3)), 8),
-        bool(getattr(params, "Rest_HR_Spec_Penalty_Enable", True)),
-        round(float(getattr(params, "Rest_HR_Spec_Penalty_Weight", 0.2)), 8),
-        round(float(getattr(params, "Rest_HR_Spec_Penalty_Width_Hz", 0.2)), 8),
-        _normalise_alignment_score_mode(getattr(params, "Rest_Alignment_Score_Mode", "aae")),
-        str(getattr(params, "ppg_input_transform", "raw_bandpass")).lower(),
-        str(getattr(params, "log_absorbance_baseline_mode", "rolling_median")).lower(),
-        round(float(getattr(params, "log_absorbance_baseline_window_s", 5.0)), 8),
-        round(float(getattr(params, "log_absorbance_eps", 1e-6)), 12),
-        tuple(round(float(x), 12) for x in getattr(params, "log_absorbance_ratio_clip", (1e-3, 1e3))),
-        "tracked_rest_hr_tdelay_v3",
+        dataset.sample_stem, params.Fs_Target, params.motion_policy,
+        params.ppg_input_transform, params.log_absorbance_baseline_mode,
+        params.log_absorbance_baseline_window_s, params.log_absorbance_eps,
+        params.log_absorbance_ratio_clip,
     )
 
 
@@ -665,77 +621,8 @@ def _rest_hr_kwargs_from_params(params: ProtocolTrialParams) -> dict[str, Any]:
     }
 
 
-def _normalise_alignment_score_mode(value: Any) -> str:
-    """Normalise the rest-alignment score mode used in cache keys and logs."""
-
-    mode = str(value).lower()
-    if mode == "mae":
-        mode = "aae"
-    if mode not in {"aae", "std"}:
-        raise ValueError("Rest_Alignment_Score_Mode must be 'aae', 'mae', or 'std'")
-    return mode
-
-
-def _log_global_alignment_once(
-    dataset: ProtocolDataset,
-    params: ProtocolTrialParams,
-    tdelay: TDelayEstimateResult,
-    *,
-    train_tw: float,
-    cache_hit: bool,
-) -> None:
-    """Print a concise Chinese global-alignment diagnostic once per train TW."""
-
-    alignment_tw = float(getattr(params, "Alignment_TW", 8.0))
-    delay_range = (-min(5.0, alignment_tw / 2.0), 5.0)
-    key = (
-        str(dataset.sample_stem),
-        int(params.Fs_Target),
-        round(alignment_tw, 3),
-        round(float(train_tw), 3),
-        _normalise_alignment_score_mode(getattr(params, "Rest_Alignment_Score_Mode", "aae")),
-        bool(cache_hit),
-    )
-    if key in _PRINTED_GLOBAL_ALIGNMENT_KEYS:
-        return
-    _PRINTED_GLOBAL_ALIGNMENT_KEYS.add(key)
-    best_row = (
-        tdelay.score_table.loc[
-            np.isclose(tdelay.score_table["delay_s"].to_numpy(dtype=float), float(tdelay.best_tdelay_s))
-        ].head(1)
-        if not tdelay.score_table.empty
-        else pd.DataFrame()
-    )
-    n_valid = int(best_row["n_valid"].iloc[0]) if not best_row.empty else 0
-    score_mode = str(getattr(tdelay, "alignment_score_mode", "aae"))
-    score_aae = float(getattr(tdelay, "best_score_aae", float("nan")))
-    score_std = float(getattr(tdelay, "best_score_std", float("nan")))
-    score_rmse = float(getattr(tdelay, "best_rmse", float("nan")))
-    print(
-        f"[全局对齐] group={dataset.sample_stem}, Fs={int(params.Fs_Target)}, "
-        f"alignment_TW={alignment_tw:.1f}s, train_TW={float(train_tw):.1f}s, "
-        f"delay_range=[{delay_range[0]:.1f}, {delay_range[1]:.1f}]s, step=0.1s, "
-        f"cache={'hit' if cache_hit else 'miss'}"
-    )
-    print(
-        f"[全局对齐] 使用静息段 tracked PPG-HR 估计 Tdelay: "
-        f"best_tdelay={tdelay.best_tdelay_s:.2f}s, score_mode={score_mode}, "
-        f"best_score={tdelay.best_score:.3f} BPM, score_aae={score_aae:.3f} BPM, "
-        f"score_std={score_std:.3f} BPM, rmse={score_rmse:.3f} BPM, n_valid={n_valid}"
-    )
-    print(
-        f"[全局对齐] 后续训练窗口使用 train_TW={float(train_tw):.1f}s，"
-        "不使用 alignment_TW 切训练窗"
-    )
-
-
 def _store_trial_base(cache: dict[Any, _TrialBase], key: Any, base: _TrialBase) -> None:
-    """Store one TrialBase with a tiny insertion-ordered LRU cap.
-
-    中文说明：每个 TrialBase 可能持有归一化窗口大数组；当前默认搜索空间通常是
-    3 个 Fs_Target × 3 个 TW，因此保留最近 9 个组合，兼顾复用率和内存上限。
-    """
-
+    """Keep a small LRU of shared sensor-window preparations."""
     cache[key] = base
     while len(cache) > 9:
         cache.pop(next(iter(cache)))
@@ -746,9 +633,14 @@ def clear_trial_heavy_caches(dataset: ProtocolDataset) -> None:
 
     This releases the heavy TrialBase objects and their normalized windows,
     per-window delay estimates, and spectra. It intentionally keeps
-    ``_global_tdelay_cache`` so LOGO folds can reuse sample/Fs/Alignment_TW
+    ``_sensor_base_cache`` so LOGO folds can reuse sample/Fs/evaluation_window_s
     alignment results.
     """
+
+    view = getattr(dataset, "_sensor_view", None)
+    if view is not None:
+        clear_trial_heavy_caches(view)
+
 
     cache = getattr(dataset, "_trial_base_cache", None)
     if isinstance(cache, dict):
@@ -758,20 +650,15 @@ def clear_trial_heavy_caches(dataset: ProtocolDataset) -> None:
 def clear_all_caches(dataset: ProtocolDataset) -> None:
     """Clear all dataset-level caches created by this module."""
 
+    view = getattr(dataset, "_sensor_view", None)
+    if view is not None:
+        clear_all_caches(view)
+
+
     clear_trial_heavy_caches(dataset)
-    align_cache = getattr(dataset, "_global_tdelay_cache", None)
+    align_cache = getattr(dataset, "_sensor_base_cache", None)
     if isinstance(align_cache, dict):
         align_cache.clear()
-
-
-def clear_trial_caches(dataset: ProtocolDataset) -> None:
-    """Backward-compatible full cache clear.
-
-    New LOGO batch code uses :func:`clear_trial_heavy_caches` after each fold
-    and :func:`clear_all_caches` at motion_type boundaries.
-    """
-
-    clear_all_caches(dataset)
 
 
 def extract_hr_with_penalty(
@@ -817,7 +704,7 @@ def extract_plain_fft_hr(
 
 def _run_windows(
     base: _TrialBase,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     scope: TargetScope,
     params: ProtocolTrialParams,
     fmove: float,
@@ -839,7 +726,6 @@ def _run_windows(
     window_idx_out: list[int] = []
     time_out: list[float] = []
     labels_out: list[str] = []
-    ref_out: list[float] = []
     baseline_out: list[float] = []
     reset_fft_out: list[float] = []
     adaptive_out: list[float] = []
@@ -853,6 +739,7 @@ def _run_windows(
     baseline_tracking_state = SpectrumTrackingState()
     adaptive_tracking_state = SpectrumTrackingState()
     reset_fft_tracking_state = SpectrumTrackingState()
+    last_phase = "rest"
     prev_reset_fft: float | None = None
     for row_idx, window_idx in enumerate(norm_cache.window_idx):
         start_idx = int(norm_cache.start_idx[row_idx])
@@ -860,11 +747,10 @@ def _run_windows(
         fft_offset_idx = int(norm_cache.fft_offset_idx[row_idx])
         center_s = float(norm_cache.center_s[row_idx])
         fft_start_s = float(norm_cache.start_s[row_idx])
-        fft_end_s = fft_start_s + float(params.TW)
-        adaptive_start_s = fft_start_s - float(getattr(params, "TW_F", 0.0))
+        fft_end_s = fft_start_s + float(params.hr_window_s)
+        adaptive_start_s = fft_start_s - float(getattr(params, "prewarm_s", 0.0))
         adaptive_source_start_s = float(adaptive_source_start_idx) / float(fs)
         label = str(norm_cache.segment_label[row_idx])
-        ref_hr = float(norm_cache.ref_hr_bpm[row_idx])
         norm = {name: values[row_idx] for name, values in norm_cache.norm_by_channel.items()}
         adaptive_norm = {name: values[row_idx] for name, values in norm_cache.adaptive_norm_by_channel.items()}
         qc_stats = _window_qc_stats(ds, start_idx, int(norm_cache.win_len))
@@ -892,16 +778,15 @@ def _run_windows(
         prev_baseline = baseline_hr if np.isfinite(baseline_hr) else prev_baseline
         reset_fft_post = dict(baseline_post)
         reset_fft_hr = baseline_hr
-        if (
-            label == "recovery"
-            and str(getattr(params, "tracker_mode", "enhanced")).lower() == "enhanced"
-            and bool(getattr(params, "enable_post_motion_protection", True))
-        ):
+        if label == "recovery":
+            if last_phase != "recovery":
+                prev_reset_fft = None
+                reset_fft_tracking_state = SpectrumTrackingState()
             reset_fft_post = _extract_hr_result(
                 norm["ppg_green"],
                 fs,
                 prev_reset_fft,
-                params,
+                replace(params, postprocess_method="fft"),
                 enable_penalty=False,
                 penalty_ref=None,
                 precomputed_spectrum=baseline_spectrum,
@@ -912,6 +797,8 @@ def _run_windows(
             reset_fft_hr = float(reset_fft_post["hr_bpm"])
             if np.isfinite(reset_fft_hr):
                 prev_reset_fft = reset_fft_hr
+
+        last_phase = label
 
         if qc_should_skip:
             adaptive_hr = float("nan") if qc_status in {"dropped", "interpolate_pending"} else baseline_hr
@@ -947,8 +834,8 @@ def _run_windows(
             )
             adaptive_hr = float(adaptive_post["hr_bpm"])
         else:
-            adaptive_hr = baseline_hr
-            adaptive_post = dict(baseline_post)
+            adaptive_hr = float("nan")
+            adaptive_post = dict(hr_bpm=float("nan"), postprocess_method="not_applied", actual_estimator="none", candidate_valid=False)
             adaptive_stages = []
 
         if np.isfinite(adaptive_hr):
@@ -957,7 +844,6 @@ def _run_windows(
         window_idx_out.append(int(window_idx))
         time_out.append(float(center_s))
         labels_out.append(str(label))
-        ref_out.append(float(ref_hr))
         baseline_out.append(float(baseline_hr))
         reset_fft_out.append(float(reset_fft_hr))
         adaptive_out.append(float(adaptive_hr))
@@ -974,26 +860,33 @@ def _run_windows(
                     "sample": ds.sample_stem,
                     "group_id": ds.sample_stem.removeprefix("multi_"),
                     "target_scope": scope.value,
-                    "cascade_scheme": scheme.value,
+                    "reference_order_key": scheme.reference_order_key,
+                    "reference_groups_order_json": json.dumps(scheme.reference_groups_order),
+                    "reference_sequence_json": json.dumps(scheme.reference_sequence),
                     "adaptive_filter": str(getattr(params, "adaptive_filter", "lms")),
                     "window_idx": int(window_idx),
                     "time_s": float(center_s),
+                    "window_start_s": float(fft_start_s),
+                    "window_center_s": float(center_s),
+                    "window_end_s": float(fft_end_s),
                     "center_s": float(center_s),
                     "fft_start_s": float(fft_start_s),
                     "fft_end_s": float(fft_end_s),
                     "adaptive_start_s": float(adaptive_start_s),
                     "adaptive_source_start_s": float(adaptive_source_start_s),
-                    "TW_F": float(getattr(params, "TW_F", 0.0)),
+                    "prewarm_s": float(getattr(params, "prewarm_s", 0.0)),
                     "fft_input_samples": int(norm_cache.win_len),
                     "adaptive_input_samples": int(norm_cache.adaptive_win_len),
                     "fft_offset_samples": int(fft_offset_idx),
-                    "tw_f_context_status": str(norm_cache.tw_f_context_status[row_idx]),
+                    "prewarm_context_status": str(norm_cache.prewarm_context_status[row_idx]),
                     "segment_label": str(label),
-                    "ref_hr_bpm": float(ref_hr),
                     "baseline_ppg_hr_bpm": float(baseline_hr),
                     "reset_fft_hr_bpm": float(reset_fft_hr),
                     "adaptive_hr_bpm": float(adaptive_hr),
                     "baseline_postprocess_method": str(baseline_post.get("postprocess_method", "")),
+                    "baseline_estimator": baseline_post["actual_estimator"],
+                    "adaptive_estimator": adaptive_post.get("actual_estimator", "none"),
+                    "reset_fft_estimator": reset_fft_post["actual_estimator"],
                     "adaptive_postprocess_method": str(adaptive_post.get("postprocess_method", "")),
                     "adaptive_postprocess_fallback": str(adaptive_post.get("postprocess_fallback", "")),
                     "adaptive_postprocess_reason": str(adaptive_post.get("postprocess_reason", "")),
@@ -1015,7 +908,6 @@ def _run_windows(
                     ),
                     "penalty_ref_channel": penalty_ref_channel,
                     "adaptive_stages_json": stages_json,
-                    "lms_stages_json": stages_json,
                     "qc_status": qc_status,
                     "qc_reason": qc_reason,
                     **qc_stats,
@@ -1039,7 +931,7 @@ def _run_windows(
         "window_idx": np.asarray(window_idx_out, dtype=int),
         "time_s": np.asarray(time_out, dtype=float),
         "segment_label": np.asarray(labels_out, dtype=object),
-        "ref_hr_bpm": np.asarray(ref_out, dtype=float),
+        "baseline_estimator": np.array([p["actual_estimator"] for p in baseline_postprocess_out], dtype=object),
         "baseline_hr_bpm": np.asarray(baseline_out, dtype=float),
         "reset_fft_hr_bpm": np.asarray(reset_fft_out, dtype=float),
         "adaptive_hr_bpm": np.asarray(adaptive_out, dtype=float),
@@ -1057,13 +949,13 @@ def _run_windows(
         ),
         "center_s": np.asarray(time_out, dtype=float),
         "fft_start_s": norm_cache.start_s.astype(float),
-        "fft_end_s": norm_cache.start_s.astype(float) + float(params.TW),
-        "adaptive_start_s": norm_cache.start_s.astype(float) - float(getattr(params, "TW_F", 0.0)),
+        "fft_end_s": norm_cache.start_s.astype(float) + float(params.hr_window_s),
+        "adaptive_start_s": norm_cache.start_s.astype(float) - float(getattr(params, "prewarm_s", 0.0)),
         "adaptive_source_start_s": norm_cache.adaptive_source_start_idx.astype(float) / float(fs),
         "fft_input_samples": np.full(len(time_out), int(norm_cache.win_len), dtype=int),
         "adaptive_input_samples": np.full(len(time_out), int(norm_cache.adaptive_win_len), dtype=int),
         "fft_offset_samples": norm_cache.fft_offset_idx.astype(int),
-        "tw_f_context_status": norm_cache.tw_f_context_status.astype(object),
+        "prewarm_context_status": norm_cache.prewarm_context_status.astype(object),
         "qc_status": np.asarray(
             ["interpolated" if s == "interpolate_pending" else s for s in qc_status_out],
             dtype=object,
@@ -1205,13 +1097,13 @@ def _max_consecutive_true(mask: np.ndarray) -> int:
 def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) -> _NormalisedWindowCache:
     """Return compact per-window min-max normalized arrays for one TrialBase.
 
-    中文说明：这个缓存只依赖样本、Fs_Target、TW 和对齐后的窗口边界；不依赖级联
+    中文说明：这个缓存只依赖样本、Fs_Target、hr_window_s 和对齐后的窗口边界；不依赖级联
     方案、滤波器类型或 Optuna 超参数，因此可以在同一 TrialBase 下安全复用。
     """
 
     mode = str(getattr(params, "normalization_mode", "minmax")).lower()
-    tw_f = max(0.0, float(getattr(params, "TW_F", 0.0)))
-    key = ("normalised_protocol_windows_v2", mode, round(tw_f, 8))
+    prewarm = max(0.0, float(getattr(params, "prewarm_s", 0.0)))
+    key = ("normalised_protocol_windows_v2", mode, round(prewarm, 8))
     cached = base.norm_window_cache.get(key)
     if isinstance(cached, _NormalisedWindowCache):
         return cached
@@ -1227,10 +1119,9 @@ def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) 
             start_s=np.empty(0, dtype=float),
             center_s=np.empty(0, dtype=float),
             segment_label=np.empty(0, dtype=object),
-            ref_hr_bpm=np.empty(0, dtype=float),
             win_len=0,
             adaptive_win_len=0,
-            tw_f_context_status=np.empty(0, dtype=object),
+            prewarm_context_status=np.empty(0, dtype=object),
         )
         base.norm_window_cache[key] = empty
         return empty
@@ -1238,9 +1129,9 @@ def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) 
     aligned = base.aligned
     ds = aligned.dataset
     fs = int(ds.fs)
-    win_len = int(round(float(params.TW) * fs))
-    tw_f_len = max(0, int(round(tw_f * fs)))
-    adaptive_win_len = win_len + tw_f_len
+    win_len = int(round(float(params.hr_window_s) * fs))
+    prewarm_len = max(0, int(round(prewarm * fs)))
+    adaptive_win_len = win_len + prewarm_len
     starts = np.rint(aligned.window_starts_s.astype(float) * fs).astype(int)
     valid = starts + win_len <= len(ds.time_s)
     valid_idx = np.flatnonzero(valid)
@@ -1249,13 +1140,13 @@ def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) 
     n_windows = int(starts.size)
     norm_by_channel = {
         name: np.zeros((n_windows, win_len), dtype=np.float32)
-        for name in PROTOCOL_CHANNELS
+        for name in channels
     }
     adaptive_norm_by_channel = {
         name: np.zeros((n_windows, adaptive_win_len), dtype=np.float32)
-        for name in PROTOCOL_CHANNELS
+        for name in channels
     }
-    adaptive_starts = starts - tw_f_len
+    adaptive_starts = starts - prewarm_len
     adaptive_source_starts = np.maximum(0, adaptive_starts)
     fft_offsets = starts - adaptive_starts
     context_status = np.where(adaptive_starts < 0, "padded_left", "full").astype(object)
@@ -1265,7 +1156,7 @@ def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) 
         adaptive_start = int(adaptive_starts[out_idx])
         source_start = int(adaptive_source_starts[out_idx])
         left_pad = max(0, -adaptive_start)
-        for name in PROTOCOL_CHANNELS:
+        for name in channels:
             arr = np.asarray(channels[name][start:end], dtype=float)
             norm_by_channel[name][out_idx] = _normalise_array(arr, mode=mode).astype(np.float32, copy=False)
             context = np.asarray(channels[name][source_start:end], dtype=float)
@@ -1291,10 +1182,9 @@ def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) 
         start_s=aligned.window_starts_s[valid].astype(float),
         center_s=aligned.window_centers_s[valid].astype(float),
         segment_label=aligned.segment_labels[valid].astype(object),
-        ref_hr_bpm=aligned.ref_hr_bpm[valid].astype(float),
         win_len=win_len,
         adaptive_win_len=adaptive_win_len,
-        tw_f_context_status=context_status,
+        prewarm_context_status=context_status,
     )
     base.norm_window_cache[key] = cache
     return cache
@@ -1302,7 +1192,7 @@ def _get_normalised_window_cache(base: _TrialBase, params: ProtocolTrialParams) 
 
 def _cascade_filter_window(
     window: dict[str, np.ndarray],
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     params: ProtocolTrialParams,
     fmove: float,
     fs: int,
@@ -1338,8 +1228,8 @@ def _cascade_filter_window(
     current = np.asarray(window["ppg_green"], dtype=float)
     stages: list[dict[str, Any]] = []
     reference_ranking = {key: list(value) for key, value in delay_est.order_by_type.items()}
-    for sensor_type, max_count in _scheme_plan(scheme):
-        for channel in delay_est.order_by_type.get(sensor_type, [])[:max_count]:
+    for sensor_type, max_count in _reference_group_plan(scheme):
+        for channel in REFERENCE_REGISTRY[sensor_type][:max_count]:
             delay = delay_est.by_channel[channel]
             design = map_delay_to_lms_params(delay, sensor_type, params, fs)
             filter_type = str(getattr(params, "adaptive_filter", "lms"))
@@ -1388,8 +1278,7 @@ def _cascade_filter_window(
                 )
             elif filter_type == "rff_lms":
                 rff_D = int(getattr(params, "rff_D", 100))
-                rff_sigma = float(getattr(params, "rff_sigma", 1.0))
-                rff_sigma_scale = getattr(params, "rff_sigma_scale", 1.0)
+                rff_sigma_scale = float(params.rff_sigma_scale)
                 rff_seed = int(getattr(params, "rff_seed", 0))
                 rff_update_mode = str(getattr(params, "rff_update_mode", "nlms"))
                 rff_nlms_eps = float(getattr(params, "rff_nlms_eps", 1e-9))
@@ -1403,7 +1292,7 @@ def _cascade_filter_window(
                     K=design.K,
                     mu=design.u,
                     D=rff_D,
-                    sigma=rff_sigma,
+                    sigma=rff_sigma_scale,  # Generic API argument; adaptive width is derived from taps.
                     sigma_scale=rff_sigma_scale,
                     rff_seed=rff_seed,
                     mu_min=float(getattr(params, "LMS_Mu_Min", 1e-6)),
@@ -1421,8 +1310,6 @@ def _cascade_filter_window(
                 stage_extra.update(
                     {
                         "D": rff_D,
-                        "sigma": rff_sigma,
-                        "rff_sigma": rff_sigma,
                         "rff_sigma_scale": rff_sigma_scale,
                         "rff_seed": rff_seed,
                         "update_mode": rff_update_mode,
@@ -1624,23 +1511,15 @@ def _compact_stage_diagnostics(diagnostics: dict[str, Any], max_points: int = 20
     return out
 
 
-def _scheme_plan(scheme: CascadeScheme) -> list[tuple[str, int]]:
-    """Return the ordered sensor groups for a cascade scheme."""
-
-    return {
-        CascadeScheme.ACC: [("ACC", 3)],
-        CascadeScheme.HF2: [("HF", 2)],
-        CascadeScheme.UD2: [("UD", 2)],
-        CascadeScheme.ACC_HF2: [("ACC", 3), ("HF", 2)],
-        CascadeScheme.HF2_CF2: [("HF", 2), ("CF", 2)],
-        CascadeScheme.ACC_UD2: [("ACC", 3), ("UD", 2)],
-    }[scheme]
+def _reference_group_plan(scheme: ReferenceConfig) -> list[tuple[str, int]]:
+    """Expand configured groups without correlation-based channel reordering."""
+    return [(group, len(REFERENCE_REGISTRY[group])) for group in scheme.reference_groups_order]
 
 
 def _penalty_reference(
     window: dict[str, np.ndarray],
     delay_est: DelayEstimate,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
 ) -> np.ndarray:
     """Choose the reference signal used for spectral motion penalties."""
 
@@ -1651,20 +1530,16 @@ def _penalty_reference(
 def _penalty_reference_with_channel(
     window: dict[str, np.ndarray],
     delay_est: DelayEstimate,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
 ) -> tuple[np.ndarray, str]:
     """Choose the spectral-penalty reference and return its channel name."""
 
-    if scheme in {CascadeScheme.ACC, CascadeScheme.ACC_HF2, CascadeScheme.ACC_UD2}:
-        channel = _best_energy_channel(window, ("accx", "accy", "accz"))
-        return window[channel], channel
-    if scheme in {CascadeScheme.HF2, CascadeScheme.HF2_CF2}:
-        channel = delay_est.primary_by_type.get("HF") or "hf1"
-        return window[channel], channel
-    if scheme == CascadeScheme.UD2:
-        channel = delay_est.primary_by_type.get("UD") or "ud1"
-        return window[channel], channel
-    return window["ppg_green"], "ppg_green"
+    if "ACC" in scheme.reference_groups_order:
+        channel = _best_energy_channel(window, REFERENCE_REGISTRY["ACC"])
+    else:
+        first_group = scheme.reference_groups_order[0]
+        channel = delay_est.primary_by_type[first_group]
+    return window[channel], channel
 
 
 def _best_energy_channel(window: dict[str, np.ndarray], names: tuple[str, ...]) -> str:
@@ -1701,93 +1576,50 @@ def _extract_hr(
 
 
 def _extract_hr_result(
-    signal: np.ndarray,
-    fs: int,
-    previous_hr: float | None,
-    params: ProtocolTrialParams,
-    *,
-    enable_penalty: bool,
-    penalty_ref: np.ndarray | None,
-    precomputed_spectrum: tuple[np.ndarray, np.ndarray] | None = None,
+    signal: np.ndarray, fs: int, previous_hr: float | None, params: ProtocolTrialParams,
+    *, enable_penalty: bool, penalty_ref: np.ndarray | None,
+    precomputed_spectrum: tuple[np.ndarray,np.ndarray] | None = None,
     tracking_state: SpectrumTrackingState | None = None,
-    window_kind: str = "rest",
-    path: str = "adaptive",
+    window_kind: str = "rest", path: str = "adaptive",
 ) -> dict[str, Any]:
-    """Extract HR and return postprocessing diagnostics."""
-
-    method = str(getattr(params, "postprocess_method", "fft") or "fft").lower()
-    fft_hr, tracking_trace = _extract_fft_hr(
-        signal,
-        fs,
-        previous_hr,
-        params,
-        enable_penalty=enable_penalty,
-        penalty_ref=penalty_ref,
-        precomputed_spectrum=precomputed_spectrum,
-        tracking_state=tracking_state,
-        window_kind=window_kind,
-        path=path,
-        return_trace=True,
-    )
-    if method == "fft":
-        return {
-            "hr_bpm": float(fft_hr),
-            "postprocess_method": "fft",
-            "postprocess_fallback": "",
-            "postprocess_reason": "",
-            "candidate_bpm": [],
-            "candidate_score": [],
-            "harmonic_adjusted": False,
-            "spectrum_tracking": tracking_trace,
-        }
-    if method != "ssr":
-        raise ValueError("postprocess_method must be 'fft' or 'ssr'")
-
-    ssr = sparse_spectrum_hr_candidates(
-        signal,
-        fs,
-        previous_hr=previous_hr,
-        hr_band_bpm=(0.5 * 60.0, 4.0 * 60.0),
-        penalty_ref=penalty_ref if enable_penalty else None,
-        penalty_width_hz=float(getattr(params, "Spec_Penalty_Width", 0.2)),
-        penalty_weight=float(getattr(params, "Spec_Penalty_Weight", 0.4)),
-        num_atoms=int(getattr(params, "SSR_Num_Atoms", 5)),
-        lambda_threshold=float(getattr(params, "SSR_Lambda", 0.15)),
-        harmonic_tol_bpm=float(getattr(params, "SSR_Harmonic_Tol_BPM", 5.0)),
-        grid_resolution_bpm=float(getattr(params, "SSR_Grid_Resolution_BPM", 1.0)),
-        slew_limit_bpm=float(getattr(params, "slew_limit_bpm", 10.0)),
-        slew_step_bpm=float(getattr(params, "slew_step_bpm", 7.0)),
-    )
-    hr = float(ssr.get("hr_bpm", float("nan")))
-    if np.isfinite(hr):
-        return {
-            **ssr,
-            "hr_bpm": hr,
-            "postprocess_method": "ssr",
-            "postprocess_fallback": "",
-            "postprocess_reason": str(ssr.get("reason", "")),
-            "spectrum_tracking": tracking_trace,
-        }
-    if bool(getattr(params, "SSR_Fallback_To_FFT", True)):
-        return {
-            **ssr,
-            "hr_bpm": float(fft_hr),
-            "postprocess_method": "ssr",
-            "postprocess_fallback": "fft",
-            "postprocess_reason": str(ssr.get("reason", "ssr failed")),
-            "spectrum_tracking": tracking_trace,
-        }
-    return {
-        **ssr,
-        "hr_bpm": float("nan"),
-        "postprocess_method": "ssr",
-        "postprocess_fallback": "",
-        "postprocess_reason": str(ssr.get("reason", "ssr failed")),
-        "spectrum_tracking": tracking_trace,
-    }
+    """Estimate one spectrum and update its path's candidate tracker exactly once."""
+    requested = params.postprocess_method
+    spectrum = precomputed_spectrum if precomputed_spectrum is not None else _spectrum(signal,fs)
+    fft_evidence = spectrum
+    actual = "fft"
+    fallback = reason = ""
+    if requested == "ssr":
+        ssr = sparse_spectrum_hr_candidates(signal,fs,hr_band_bpm=(30.0,240.0),
+            num_atoms=params.SSR_Num_Atoms,lambda_threshold=params.SSR_Lambda,
+            grid_resolution_bpm=params.SSR_Grid_Resolution_BPM)
+        if ssr["status"] == "ok":
+            spectrum = (ssr["frequencies_hz"],ssr["spectrum_score"])
+            actual = "ssr"
+        elif params.SSR_Fallback_To_FFT:
+            fallback, reason = "fft", str(ssr["reason"])
+        else:
+            return dict(hr_bpm=float("nan"),postprocess_method=requested,actual_estimator="none",
+                        postprocess_fallback="",postprocess_reason=str(ssr["reason"]),
+                        candidate_bpm=[],candidate_score=[],spectrum_tracking={},candidate_valid=False)
+    elif requested != "fft":
+        raise ValueError("postprocess_method must be fft or ssr")
+    if not np.any(np.isfinite(spectrum[1]) & (spectrum[1] > 0)):
+        return dict(hr_bpm=float("nan"),postprocess_method=requested,actual_estimator="none",
+                    postprocess_fallback=fallback,postprocess_reason="empty candidate spectrum",
+                    candidate_bpm=[],candidate_score=[],spectrum_tracking={},candidate_valid=False)
+    hr, trace = _track_candidate_spectrum(signal,fs,previous_hr,params,
+        enable_penalty=enable_penalty,penalty_ref=penalty_ref,precomputed_spectrum=spectrum,
+        tracking_state=tracking_state,window_kind=window_kind,path=path,return_trace=True,
+        penalty_evidence_spectrum=fft_evidence)
+    return dict(hr_bpm=float(hr),postprocess_method=requested,actual_estimator=actual,
+                postprocess_fallback=fallback,postprocess_reason=reason,candidate_valid=True,
+                candidate_bpm=list(trace.get("candidate_peaks_bpm",())),
+                candidate_score=list(trace.get("candidate_peak_amplitudes",())),spectrum_tracking=trace)
 
 
-def _extract_fft_hr(
+
+
+def _track_candidate_spectrum(
     signal: np.ndarray,
     fs: int,
     previous_hr: float | None,
@@ -1800,67 +1632,18 @@ def _extract_fft_hr(
     window_kind: str = "rest",
     path: str = "adaptive",
     return_trace: bool = False,
+    penalty_evidence_spectrum: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> float | tuple[float, dict[str, Any]]:
-    """Run the legacy tracker or the enhanced candidate/state tracker."""
-
-    feature_names = (
-        "enable_directional_tracking",
-        "enable_dynamic_penalty",
-        "enable_continuity_protection",
-        "enable_low_lock_recovery",
-        "enable_high_lock_recovery",
-        "enable_post_motion_protection",
-    )
-    tracker_mode = str(getattr(params, "tracker_mode", "enhanced")).lower()
-    if tracker_mode not in {"legacy", "enhanced"}:
-        raise ValueError("tracker_mode must be 'legacy' or 'enhanced'")
-    enhanced = tracker_mode == "enhanced" and any(
-        bool(getattr(params, name, False)) for name in feature_names
-    )
-    if not enhanced:
-        value = _extract_fft_hr_legacy(
-            signal,
-            fs,
-            previous_hr,
-            params,
-            enable_penalty=enable_penalty,
-            penalty_ref=penalty_ref,
-            precomputed_spectrum=precomputed_spectrum,
-        )
-        trace = {
-            "tracker_mode": "legacy",
-            "path": path,
-            "window_kind": window_kind,
-            "slew_limited_hr_bpm": float(value),
-            "low_lock_requested": bool(getattr(params, "enable_low_lock_recovery", False)),
-            "low_lock_effective": False,
-        }
-        return (float(value), trace) if return_trace else float(value)
+    """Track FFT or SSR candidates through the common candidate tracker."""
 
     freq, amp = precomputed_spectrum if precomputed_spectrum is not None else _spectrum(signal, fs)
     penalty_freqs = penalty_amps = None
     if enable_penalty and penalty_ref is not None:
-        ref_freq, ref_amp = _spectrum(penalty_ref, fs)
-        ref_band = (ref_freq >= 0.2) & (ref_freq <= 5.0)
-        ref_indices = np.flatnonzero(ref_band)
-        if ref_indices.size:
-            local = ref_indices[1:-1][
-                (ref_amp[ref_indices[1:-1]] > ref_amp[ref_indices[:-2]])
-                & (ref_amp[ref_indices[1:-1]] > ref_amp[ref_indices[2:]])
-            ]
-            if local.size == 0:
-                local = np.asarray([ref_indices[int(np.argmax(ref_amp[ref_indices]))]])
-            local_amp = np.asarray(ref_amp[local], dtype=float)
-            finite_local = np.isfinite(local_amp)
-            local = local[finite_local]
-            local_amp = local_amp[finite_local]
-            if local.size:
-                threshold_ratio = float(
-                    getattr(params, "candidate_peak_threshold_ratio", 0.30)
-                )
-                local = local[local_amp > float(np.max(local_amp)) * threshold_ratio]
-            penalty_freqs = ref_freq[local]
-            penalty_amps = ref_amp[local]
+        penalty_freqs, penalty_amps = spectrum_peaks(
+            _spectrum(penalty_ref, fs), params.candidate_peak_threshold_ratio, (0.2, 5.0))
+    evidence_peaks, _ = spectrum_peaks(
+        penalty_evidence_spectrum if penalty_evidence_spectrum is not None else (freq, amp),
+        params.full_candidate_peak_threshold_ratio, (0.5, 4.0))
     value, trace_obj = track_spectrum_candidates(
         freq,
         amp,
@@ -1872,65 +1655,11 @@ def _extract_fft_hr(
         enable_penalty=enable_penalty,
         penalty_peaks_hz=penalty_freqs,
         penalty_peak_amplitudes=penalty_amps,
+        penalty_evidence_peaks_hz=evidence_peaks,
         adaptive_filter=str(getattr(params, "adaptive_filter", "lms")),
     )
     trace = {"tracker_mode": "enhanced", **trace_obj.to_dict()}
     return (float(value), trace) if return_trace else float(value)
-
-
-def _extract_fft_hr_legacy(
-    signal: np.ndarray,
-    fs: int,
-    previous_hr: float | None,
-    params: ProtocolTrialParams,
-    *,
-    enable_penalty: bool,
-    penalty_ref: np.ndarray | None,
-    precomputed_spectrum: tuple[np.ndarray, np.ndarray] | None = None,
-) -> float:
-    """Extract HR using Hamming FFT, optional spectral penalty, and slew limit."""
-
-    freq, amp = precomputed_spectrum if precomputed_spectrum is not None else _spectrum(signal, fs)
-    band = (freq >= 0.5) & (freq <= 4.0)
-    if not band.any():
-        return float(previous_hr) if previous_hr is not None else float("nan")
-    amp_work = amp.copy()
-
-    if enable_penalty and penalty_ref is not None:
-        motion_freq = _dominant_frequency(penalty_ref, fs, 0.2, 5.0)
-        if np.isfinite(motion_freq) and motion_freq > 0:
-            width = float(params.Spec_Penalty_Width)
-            weight = float(params.Spec_Penalty_Weight)
-            mask = (np.abs(freq - motion_freq) < width) | (
-                np.abs(freq - 2.0 * motion_freq) < width
-            )
-            amp_work[mask] *= weight
-
-    candidates = np.flatnonzero(band)
-    if previous_hr is not None and np.isfinite(previous_hr) and previous_hr > 0:
-        prev_hz = float(previous_hr) / 60.0
-        restricted = candidates[np.abs(freq[candidates] - prev_hz) <= float(params.hr_range_hz)]
-        if restricted.size:
-            order = restricted[np.argsort(amp_work[restricted])[::-1]]
-            near, which = find_near_biggest(
-                freq[order],
-                prev_hz,
-                float(params.hr_range_hz),
-                -float(params.hr_range_hz),
-            )
-            chosen_hz = float(near) if which else float(freq[order[0]])
-        else:
-            chosen_hz = prev_hz
-        raw_bpm = chosen_hz * 60.0
-        diff = raw_bpm - float(previous_hr)
-        if diff > float(params.slew_limit_bpm):
-            return float(previous_hr) + float(params.slew_step_bpm)
-        if diff < -float(params.slew_limit_bpm):
-            return float(previous_hr) - float(params.slew_step_bpm)
-        return raw_bpm
-
-    idx = candidates[int(np.argmax(amp_work[candidates]))]
-    return float(freq[idx] * 60.0)
 
 
 def _json_ready_postprocess_candidates(result: dict[str, Any]) -> dict[str, Any]:
@@ -1966,18 +1695,12 @@ def _spectrum(signal: np.ndarray, fs: int) -> tuple[np.ndarray, np.ndarray]:
     return compute_power_spectrum(signal, fs, apply_hamming=True, demean=True)
 
 
-def _dominant_frequency(signal: np.ndarray, fs: int, low_hz: float, high_hz: float) -> float:
-    """Find the dominant spectral peak in a frequency band."""
-
-    return dominant_frequency_in_band(signal, fs, low_hz, high_hz)
-
-
 def _normalise_window(window: dict[str, np.ndarray], mode: str = "minmax") -> dict[str, np.ndarray]:
     """Normalize all 13 protocol channels inside one window."""
 
     out: dict[str, np.ndarray] = {}
-    for name in PROTOCOL_CHANNELS:
-        out[name] = _normalise_array(window[name], mode=mode)
+    for name, values in window.items():
+        out[name] = _normalise_array(values, mode=mode)
     return out
 
 
@@ -2039,9 +1762,10 @@ def _window_in_scope(
     if scope == TargetScope.MOTION_POST10:
         if label == "motion":
             return True
-        if segment_info is None or not np.isfinite(segment_info.motion_end_s):
+        if segment_info is None:
             return False
-        return float(segment_info.motion_end_s) < float(center_s) <= float(segment_info.motion_end_s) + 10.0
+        labels, _, elapsed = segment_info.states_at(np.array([center_s]))
+        return labels[0] == "recovery" and 0.0 <= elapsed[0] <= 10.0
     if scope == TargetScope.GLOBAL:
         return str(label) in {"rest", "motion", "recovery"}
     return _label_in_scope(label, scope)
@@ -2222,7 +1946,7 @@ def _accuracy(abs_err: np.ndarray) -> float:
 
 def _failed(
     scope: TargetScope,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
     params: ProtocolTrialParams,
     reason: str,
     segment_info: SegmentInfo | None = None,
@@ -2234,7 +1958,7 @@ def _failed(
         success=False,
         reason=reason,
         target_scope=scope,
-        cascade_scheme=scheme,
+        reference_config=scheme,
         adaptive_filter=str(getattr(params, "adaptive_filter", "lms")),
         params=params,
         objective_aae_bpm=float("inf"),

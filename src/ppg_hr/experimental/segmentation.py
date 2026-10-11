@@ -1,27 +1,21 @@
-"""Motion/rest/recovery segmentation from accelerometer magnitude.
-
-中文说明：本模块只根据三轴 ACC 合模长划分静息、运动和恢复窗口。前 30 秒
-作为校准期，阈值为校准段合模长 STD 的 3 倍；再用 TW 秒窗口、1 秒步长寻找
-“连续 6 个静息窗 -> 连续 6 个运动窗”和反向转移。
-"""
+"""Fixed source-domain six-axis IMU detection and independent bout selection."""
 
 from __future__ import annotations
-
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
-
 import numpy as np
-
-__all__ = ["SegmentInfo", "detect_activity_segments"]
-
-# 中文说明：运动起止点判定需要的连续状态窗口数。旧逻辑为 10+10，
-# 当前实验要求改为 6+6，让分段对较短或较快的状态转换更敏感。
-TRANSITION_RUN_WINDOWS = 6
+from scipy.signal import butter, sosfiltfilt
+from ..params import (
+    DEFAULT_MOTION_DETECTOR,
+    DEFAULT_MOTION_POLICY,
+    MotionDetectorParams,
+)
+from .preprocess_protocol import SourceImu
 
 
 @dataclass(frozen=True)
 class SegmentInfo:
-    """Detected activity boundaries and per-window segment labels."""
+    """Raw detector evidence, selected half-open runs, and center-based states."""
 
     status: str
     reason: str
@@ -33,21 +27,185 @@ class SegmentInfo:
     window_std: np.ndarray
     motion_flags: np.ndarray
     labels: np.ndarray
+    window_ends_s: np.ndarray = field(default_factory=lambda: np.empty(0))
+    raw_motion_flags: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=bool)
+    )
+    detected_runs: tuple[tuple[float, float], ...] = ()
+    motion_runs: tuple[tuple[float, float], ...] = ()
+    acc_scores: np.ndarray = field(default_factory=lambda: np.empty(0))
+    gyro_scores: np.ndarray = field(default_factory=lambda: np.empty(0))
+    acc_threshold: float = float("nan")
+    gyro_threshold: float = float("nan")
+    acc_baseline_std: float = float("nan")
+    gyro_baseline_std: float = float("nan")
+    policy: str = DEFAULT_MOTION_POLICY
+    episode_ids: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=int))
+    recovery_elapsed_s: np.ndarray = field(default_factory=lambda: np.empty(0))
 
     @property
     def is_valid(self) -> bool:
-        """Whether both motion start and end were detected."""
-
+        """Whether sensor windows can be generated (motion is optional)."""
         return self.status == "ok"
 
-    def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-friendly representation."""
+    def states_at(
+        self, centers: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Label centers by selected bouts and report episode and recovery age."""
+        centers = np.asarray(centers, dtype=float)
+        labels = np.full(centers.size, "rest", dtype=object)
+        episode = np.full(centers.size, -1, dtype=int)
+        elapsed = np.full(centers.size, np.nan)
+        for idx, (start, end) in enumerate(self.motion_runs):
+            active = (centers >= start) & (centers < end)
+            recovery = centers >= end
+            labels[active] = "motion"
+            episode[active] = idx
+            elapsed[active] = np.nan
+            labels[recovery] = "recovery"
+            episode[recovery] = idx
+            elapsed[recovery] = centers[recovery] - end
+        return labels, episode, elapsed
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return JSON-compatible detector and policy evidence."""
         out = asdict(self)
-        for key, value in list(out.items()):
-            if isinstance(value, np.ndarray):
-                out[key] = value.tolist()
-        return out
+        return {
+            k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in out.items()
+        }
+
+
+def _flag_runs(flags: np.ndarray, value: bool = True) -> list[tuple[int, int]]:
+    padded = np.r_[False, np.asarray(flags, dtype=bool) == value, False]
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    return list(zip(edges[::2], edges[1::2]))
+
+
+def clean_motion_flags(
+    flags: np.ndarray, params: MotionDetectorParams = DEFAULT_MOTION_DETECTOR
+) -> np.ndarray:
+    """Bridge interior false gaps, then remove short true runs."""
+    out = np.asarray(flags, dtype=bool).copy()
+    for start, end in _flag_runs(out, False):
+        if start > 0 and end < out.size and end - start <= params.bridge_gap_windows:
+            out[start:end] = True
+    for start, end in _flag_runs(out):
+        if end - start < params.minimum_run_windows:
+            out[start:end] = False
+    return out
+
+
+def select_motion_runs(
+    runs: tuple[tuple[float, float], ...], policy: str = DEFAULT_MOTION_POLICY
+) -> tuple[tuple[float, float], ...]:
+    """Select longest earliest-tied bout or retain every detector bout."""
+    if policy == "multi_bout":
+        return runs
+    if policy != "single_bout":
+        raise ValueError("motion_policy must be single_bout or multi_bout")
+    return (max(runs, key=lambda run: run[1] - run[0]),) if runs else ()
+
+
+def apply_motion_protocol(
+    segment: SegmentInfo, policy: str = DEFAULT_MOTION_POLICY
+) -> SegmentInfo:
+    """Interpret detector evidence without discarding any detected flags or runs."""
+    selected = select_motion_runs(segment.detected_runs, policy)
+    selected_segment = replace(
+        segment,
+        motion_runs=selected,
+        policy=policy,
+        motion_start_s=selected[0][0] if selected else float("nan"),
+        motion_end_s=selected[0][1] if selected else float("nan"),
+    )
+    labels, episode, elapsed = selected_segment.states_at(segment.window_centers_s)
+    return replace(
+        selected_segment, labels=labels, episode_ids=episode, recovery_elapsed_s=elapsed
+    )
+
+
+def detect_source_imu_segments(
+    source: SourceImu, *, params: MotionDetectorParams = DEFAULT_MOTION_DETECTOR
+) -> SegmentInfo:
+    """Detect activity with independently filtered ACC/Gyro magnitude STD."""
+    if source is None:
+        raise ValueError(
+            "source_imu is required; synthetic datasets must provide explicit raw IMU"
+        )
+    fs = source.fs
+    length = int(round(params.window_s * fs))
+    if len(source.time_s) < length:
+        raise ValueError("source IMU shorter than detector window")
+    starts_idx = np.arange(
+        0, len(source.time_s) - length + 1, int(round(params.step_s * fs))
+    )
+    starts = source.time_s[starts_idx].astype(float)
+    centers = starts + params.window_s / 2
+    scores = []
+    baselines = []
+    thresholds = []
+    for names, band in (
+        (("accx", "accy", "accz"), params.acc_band_hz),
+        (("gyrox", "gyroy", "gyroz"), params.gyro_band_hz),
+    ):
+        sos = butter(params.filter_order, band, btype="bandpass", fs=fs, output="sos")
+        axes = [
+            sosfiltfilt(sos, np.asarray(getattr(source, name), dtype=float))
+            for name in names
+        ]
+        magnitude = np.sqrt(np.sum(np.square(axes), axis=0))
+        baseline = float(
+            np.std(magnitude[: int(round(params.baseline_s * fs))], ddof=1)
+        )
+        score = np.array(
+            [np.std(magnitude[s : s + length], ddof=1) for s in starts_idx]
+        )
+        scores.append(score)
+        baselines.append(baseline)
+        thresholds.append(
+            max(
+                params.baseline_multiplier * baseline,
+                params.peak_fraction * float(score.max()),
+            )
+        )
+    raw = (scores[0] > thresholds[0]) | (scores[1] > thresholds[1])
+    clean = clean_motion_flags(raw, params)
+    runs = tuple(
+        (
+            float(centers[start]),
+            float(centers[end])
+            if end < centers.size
+            else float(centers[-1] + params.step_s),
+        )
+        for start, end in _flag_runs(clean)
+    )
+    segment = SegmentInfo(
+        status="ok",
+        reason="",
+        motion_start_s=runs[0][0] if runs else float("nan"),
+        motion_end_s=runs[0][1] if runs else float("nan"),
+        motion_threshold=thresholds[0],
+        window_starts_s=starts,
+        window_centers_s=centers,
+        window_std=scores[0],
+        motion_flags=clean,
+        labels=np.empty(0, dtype=object),
+        window_ends_s=starts + params.window_s,
+        raw_motion_flags=raw,
+        detected_runs=runs,
+        motion_runs=runs,
+        acc_scores=scores[0],
+        gyro_scores=scores[1],
+        acc_threshold=thresholds[0],
+        gyro_threshold=thresholds[1],
+        acc_baseline_std=baselines[0],
+        gyro_baseline_std=baselines[1],
+        policy="detected_all",
+    )
+    labels, episode, elapsed = segment.states_at(centers)
+    return replace(
+        segment, labels=labels, episode_ids=episode, recovery_elapsed_s=elapsed
+    )
 
 
 def detect_activity_segments(
@@ -55,132 +213,14 @@ def detect_activity_segments(
     accy: np.ndarray,
     accz: np.ndarray,
     fs: int,
-    TW: int | float,
-) -> SegmentInfo:
-    """Detect rest-motion-recovery boundaries using sliding ACC magnitude STD.
-
-    中文说明：输入为三轴加速度、采样率和窗口长度；输出为运动起止时间以及每个
-    滑动窗口的标签。若无法找到完整转移，返回 ``status='error'`` 而不是抛异常。
-    """
-
-    fs = int(fs)
-    win_s = float(TW)
-    win_len = int(round(win_s * fs))
-    if fs <= 0 or win_len <= 1:
-        return _error("invalid fs/TW")
-
-    acc_mag = np.sqrt(
-        np.asarray(accx, dtype=float) ** 2
-        + np.asarray(accy, dtype=float) ** 2
-        + np.asarray(accz, dtype=float) ** 2
-    )
-    if acc_mag.size < win_len:
-        return _error("signal shorter than one TW window")
-
-    calib_len = min(int(round(30 * fs)), acc_mag.size)
-    if calib_len < 2:
-        return _error("not enough samples for 30 s calibration")
-    baseline_std = float(np.std(acc_mag[:calib_len], ddof=1))
-    motion_threshold = 3.0 * baseline_std
-
-    starts = np.arange(0, acc_mag.size - win_len + 1, fs, dtype=int)
-    min_windows = 2 * TRANSITION_RUN_WINDOWS
-    if starts.size < min_windows:
-        return _error(f"fewer than {min_windows} sliding windows")
-    window_std = np.array(
-        [np.std(acc_mag[s : s + win_len], ddof=1) for s in starts],
-        dtype=float,
-    )
-    motion_flags = window_std > motion_threshold
-
-    start_idx = _find_transition(motion_flags, before=False, after=True, start_at=0)
-    if start_idx is None:
-        return _error(
-            f"cannot find {TRANSITION_RUN_WINDOWS} rest windows followed by {TRANSITION_RUN_WINDOWS} motion windows",
-            motion_threshold,
-            starts,
-            win_s,
-            window_std,
-            motion_flags,
-        )
-
-    end_idx = _find_transition(motion_flags, before=True, after=False, start_at=start_idx)
-    if end_idx is None:
-        return _error(
-            f"cannot find {TRANSITION_RUN_WINDOWS} motion windows followed by {TRANSITION_RUN_WINDOWS} rest windows",
-            motion_threshold,
-            starts,
-            win_s,
-            window_std,
-            motion_flags,
-        )
-
-    motion_start_s = float(starts[start_idx] / fs)
-    motion_end_s = float(starts[end_idx] / fs)
-    window_starts_s = starts.astype(float) / fs
-    centers_s = window_starts_s + win_s / 2.0
-    labels = np.where(
-        centers_s < motion_start_s,
-        "rest",
-        np.where(centers_s <= motion_end_s, "motion", "recovery"),
-    )
-    return SegmentInfo(
-        status="ok",
-        reason="",
-        motion_start_s=motion_start_s,
-        motion_end_s=motion_end_s,
-        motion_threshold=motion_threshold,
-        window_starts_s=window_starts_s,
-        window_centers_s=centers_s,
-        window_std=window_std,
-        motion_flags=motion_flags,
-        labels=labels,
-    )
-
-
-def _find_transition(
-    flags: np.ndarray,
     *,
-    before: bool,
-    after: bool,
-    start_at: int,
-) -> int | None:
-    """Find the first configured consecutive-window state transition.
-
-    中文说明：返回新状态开始的窗口索引，即 6 个 before 窗之后的第一个 after 窗。
-    """
-
-    run_len = TRANSITION_RUN_WINDOWS
-    for i in range(max(0, int(start_at)), len(flags) - (2 * run_len) + 1):
-        if np.all(flags[i : i + run_len] == before) and np.all(flags[i + run_len : i + 2 * run_len] == after):
-            return i + run_len
-    return None
-
-
-def _error(
-    reason: str,
-    motion_threshold: float = float("nan"),
-    starts: np.ndarray | None = None,
-    win_s: float = 0.0,
-    window_std: np.ndarray | None = None,
-    motion_flags: np.ndarray | None = None,
+    gyrox: np.ndarray,
+    gyroy: np.ndarray,
+    gyroz: np.ndarray,
+    policy: str = DEFAULT_MOTION_POLICY,
 ) -> SegmentInfo:
-    """Build an invalid ``SegmentInfo`` with enough diagnostics for CSV/JSON."""
-
-    starts = np.asarray([] if starts is None else starts, dtype=float)
-    centers = starts + win_s / 2.0 if starts.size else starts
-    window_std = np.asarray([] if window_std is None else window_std, dtype=float)
-    motion_flags = np.asarray([] if motion_flags is None else motion_flags, dtype=bool)
-    labels = np.asarray(["unknown"] * starts.size, dtype=object)
-    return SegmentInfo(
-        status="error",
-        reason=reason,
-        motion_start_s=float("nan"),
-        motion_end_s=float("nan"),
-        motion_threshold=float(motion_threshold),
-        window_starts_s=starts,
-        window_centers_s=centers,
-        window_std=window_std,
-        motion_flags=motion_flags,
-        labels=labels,
+    """Detect explicit original six-axis arrays and apply an explicit protocol policy."""
+    source = SourceImu(
+        fs, np.arange(len(accx)) / fs, accx, accy, accz, gyrox, gyroy, gyroz
     )
+    return apply_motion_protocol(detect_source_imu_segments(source), policy)

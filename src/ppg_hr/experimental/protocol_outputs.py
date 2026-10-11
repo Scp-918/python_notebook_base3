@@ -17,10 +17,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ..params import CascadeScheme, MotionType, TargetScope
+from ..params import DEFAULT_REFERENCE_CONFIGS, ReferenceConfig, MotionType, TargetScope
 from ..preprocess.calibration import CalibrationCoefficients
 from .alignment import (
-    align_ppg_to_ref_hr,
+    evaluate_rest_alignment,
     compute_rest_alignment_diagnostic_curve,
     extract_rest_ppg_hr_tracked,
 )
@@ -121,9 +121,9 @@ def plot_rest_alignment_diagnostics_by_motion_type(
     datasets: dict[str, ProtocolDataset],
     output_dir: str | Path,
     fs_target: int = 100,
-    TW: int = 8,
-    alignment_TW: float | None = None,
-    alignment_step_s: float = 1.0,
+    hr_window_s: int = 8,
+    evaluation_window_s: float | None = None,
+    evaluation_step_s: float = 1.0,
     rest_hr_kwargs: dict[str, Any] | None = None,
     alignment_score_mode: str = "aae",
 ) -> dict[str, Path]:
@@ -159,17 +159,17 @@ def plot_rest_alignment_diagnostics_by_motion_type(
             title = pair.motion_id
             try:
                 ds = resample_protocol_dataset(datasets[pair.motion_id], int(fs_target))
-                segment = _detect_segments_for_alignment_plot(ds, TW)
+                segment = _detect_segments_for_alignment_plot(ds, hr_window_s)
                 if not segment.is_valid:
                     raise RuntimeError(segment.reason)
-                align_tw = float(TW) if alignment_TW is None else float(alignment_TW)
-                aligned = align_ppg_to_ref_hr(
+                align_tw = float(hr_window_s) if evaluation_window_s is None else float(evaluation_window_s)
+                aligned = evaluate_rest_alignment(
                     ds,
                     segment,
-                    TW,
+                    hr_window_s,
                     int(fs_target),
-                    alignment_TW=align_tw,
-                    alignment_step_s=float(alignment_step_s),
+                    evaluation_window_s=align_tw,
+                    evaluation_step_s=float(evaluation_step_s),
                     rest_hr_kwargs=rest_hr_kwargs,
                     alignment_score_mode=alignment_score_mode,
                 )
@@ -211,11 +211,11 @@ def plot_rest_alignment_diagnostics_by_motion_type(
             ax.set_title(title)
 
         fig.suptitle(
-            f"{motion_type} Rest alignment diagnostics, TW={int(TW)}, score_mode={alignment_score_mode}",
+            f"{motion_type} Rest alignment diagnostics, hr_window_s={int(hr_window_s)}, score_mode={alignment_score_mode}",
             fontsize=14,
         )
         fig.tight_layout(rect=(0, 0, 1, 0.95))
-        path = out / f"{motion_type}_rest_alignment_TW{int(TW)}.png"
+        path = out / f"{motion_type}_rest_evaluation_window_s{int(hr_window_s)}.png"
         fig.savefig(path, dpi=150)
         plt.close(fig)
         paths[motion_type] = path
@@ -227,7 +227,7 @@ def plot_unaligned_fullfield_ppg_hr_by_motion_type(
     datasets: dict[str, ProtocolDataset],
     output_dir: str | Path,
     fs_target: int = 100,
-    TW: int | float = 8,
+    hr_window_s: int | float = 8,
     step_s: float = 1.0,
     hr_band_hz: tuple[float, float] = ( (40.0 / 60.0, 180.0 / 60.0)),
     track_band_bpm: float = 30.0,
@@ -243,7 +243,7 @@ def plot_unaligned_fullfield_ppg_hr_by_motion_type(
     """按运动类型绘制原始 PPG 全段未对齐 HR 测试图。
 
     中文说明：该图只用于测试和人工检查，不参与 Tdelay 搜索、Optuna objective 或
-    自适应滤波训练。PPG_Green 不做全局对齐，直接在原始时间轴上按 ``TW`` 秒滑窗，
+    自适应滤波训练。PPG_Green 不做全局对齐，直接在原始时间轴上按 ``hr_window_s`` 秒滑窗，
     每 1 秒一步，用 Hamming+FFT 提取 2/3-3 Hz 主频，再做上一 HR 邻域追踪、
     slew limit/step 防跳峰和 moving median 平滑。背景色按同一未对齐时间轴上的
     静息、运动、运动恢复三段标注。
@@ -258,7 +258,7 @@ def plot_unaligned_fullfield_ppg_hr_by_motion_type(
             grouped.setdefault(pair.motion_type, []).append(pair)
 
     paths: dict[str, Path] = {}
-    tw_value = float(TW)
+    tw_value = float(hr_window_s)
     hr_band_bpm = (float(hr_band_hz[0]) * 60.0, float(hr_band_hz[1]) * 60.0)
     for motion_type, members in _ordered_motion_groups(grouped):
         members = sorted(members, key=lambda p: (p.motion_index, p.motion_id))
@@ -364,7 +364,7 @@ def plot_raw_ppg_and_unaligned_hr_by_motion_type(
     output_dir: str | Path,
     fs_target: int = 100,
     fs_origin: int = 100,
-    TW: int | float = 8,
+    hr_window_s: int | float = 8,
     step_s: float = 1.0,
     hr_band_hz: tuple[float, float] = (40.0 / 60.0, 180.0 / 60.0),
     track_band_bpm: float = 30.0,
@@ -394,7 +394,7 @@ def plot_raw_ppg_and_unaligned_hr_by_motion_type(
             grouped.setdefault(pair.motion_type, []).append(pair)
 
     paths: dict[str, Path] = {}
-    tw_value = float(TW)
+    tw_value = float(hr_window_s)
     hr_band_bpm = (float(hr_band_hz[0]) * 60.0, float(hr_band_hz[1]) * 60.0)
     for motion_type, members in _ordered_motion_groups(grouped):
         members = sorted(members, key=lambda p: (p.motion_index, p.motion_id))
@@ -416,7 +416,7 @@ def plot_raw_ppg_and_unaligned_hr_by_motion_type(
                 segment = _detect_segments_for_alignment_plot(ds, tw_value)
                 if not segment.is_valid:
                     raise RuntimeError(segment.reason)
-                raw_time, raw_ppg = _load_raw_ppg_green_for_pair(pair, ds, int(fs_origin))
+                raw_time, raw_ppg = _load_acquired_ppg_green_for_pair(pair, ds, int(fs_origin))
                 raw_time, raw_ppg = _slice_time_range(raw_time, raw_ppg, 0.0, float(segment.motion_start_s))
                 rest_end_idx = int(round(float(segment.motion_start_s) * int(ds.fs)))
                 rest_ppg = np.asarray(ds.ppg_green[: max(0, rest_end_idx)], dtype=float)
@@ -482,25 +482,24 @@ def plot_raw_ppg_and_unaligned_hr_by_motion_type(
 
 
 def _tw_label(value: float) -> str:
-    """返回文件名安全的 TW 标签，例如 TW8 或 TW8p5。"""
+    """返回文件名安全的 hr_window_s 标签，例如 TW8 或 TW8p5。"""
 
     if float(value).is_integer():
-        return f"TW{int(value)}"
-    return f"TW{str(float(value)).replace('.', 'p')}"
+        return f"hr_window_s{int(value)}"
+    return f"hr_window_s{str(float(value)).replace('.', 'p')}"
 
 
-def _load_raw_ppg_green_for_pair(
+def _load_acquired_ppg_green_for_pair(
     pair: SamplePair,
     fallback_dataset: ProtocolDataset,
     fs_origin: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """优先读取传感器 CSV 中的原始 PPG_Green；失败时回退到已预处理数据。"""
-
-    try:
+    """Return actual acquired green values on their original source grid."""
+    source = fallback_dataset.ppg_acquired_raw
+    if source is None:
         raw_frame, _ = load_protocol_raw_clean_frames(pair.sensor_csv, fs_origin=fs_origin)
         return raw_frame["time_s"].to_numpy(dtype=float), raw_frame["ppg_green"].to_numpy(dtype=float)
-    except Exception:
-        return fallback_dataset.time_s.astype(float), fallback_dataset.ppg_green.astype(float)
+    return source.time_s, source.green
 
 
 def _slice_time_range(
@@ -539,12 +538,12 @@ def _set_combined_legend(plt_ax: Any, line_handles: list[Any]) -> None:
         plt_ax.legend(dedup.values(), dedup.keys(), loc="best", fontsize=8)
 
 
-def _detect_segments_for_alignment_plot(dataset: ProtocolDataset, TW: int | float) -> SegmentInfo:
+def _detect_segments_for_alignment_plot(dataset: ProtocolDataset, hr_window_s: int | float) -> SegmentInfo:
     """Detect segments for the standalone alignment diagnostic plot."""
 
-    from .segmentation import detect_activity_segments
+    from .segmentation import apply_motion_protocol, detect_source_imu_segments
 
-    return detect_activity_segments(dataset.accx, dataset.accy, dataset.accz, dataset.fs, TW=TW)
+    return apply_motion_protocol(detect_source_imu_segments(dataset.source_imu))
 
 
 def plot_signal_figures(
@@ -562,7 +561,7 @@ def plot_signal_figures(
 ) -> dict[str, Path]:
     """Plot full raw/cleaned signals and motion-segment bandpassed signals.
 
-    中文说明：两张图使用 HF2、HF2comp、CF2、UD2、PPG、ACC、Gyro 子图。每个子图都有
+    中文说明：两张图使用 HF、HFcomp、CF2、UD、PPG、ACC、Gyro 子图。每个子图都有
     title、xlabel、ylabel、legend 和 grid，文件名包含 group_id 与 motion_type。
     """
 
@@ -671,8 +670,8 @@ def write_metric_matrix_tables(
     paths: dict[str, Path] = {}
     for key, (scope, attr, filename) in specs.items():
         rows: list[dict[str, Any]] = []
-        for scheme in CascadeScheme:
-            row: dict[str, Any] = {"cascade_scheme": scheme.value}
+        for scheme in DEFAULT_REFERENCE_CONFIGS:
+            row: dict[str, Any] = {"reference_order_key": scheme.reference_order_key}
             for sample_name, group_id in zip(sample_names, group_ids, strict=True):
                 result = _find_mode_result(results_by_sample.get(sample_name, []), scope, scheme)
                 row[group_id] = float(getattr(result, attr)) if result is not None else np.nan
@@ -749,10 +748,10 @@ def _plot_motion_bandpass(
 
 def _plot_groups() -> list[tuple[str, str, list[str]]]:
     return [
-        ("HF2", "Amplitude (mV)", ["hf1", "hf2"]),
-        ("HF2comp", "Amplitude (mV)", ["hfcomp1", "hfcomp2"]),
+        ("HF", "Amplitude (mV)", ["hf1", "hf2"]),
+        ("HFcomp", "Amplitude (mV)", ["hfcomp1", "hfcomp2"]),
         ("CF2", "Amplitude (mV)", ["cf1", "cf2"]),
-        ("UD2", "Normalized amplitude", ["ud1", "ud2"]),
+        ("UD", "Normalized amplitude", ["ud1", "ud2"]),
         ("PPG channels", "Amplitude (a.u.)", ["ppg_green", "ppg_red", "ppg_ir"]),
         ("ACC channels", "Amplitude (g)", ["accx", "accy", "accz"]),
         ("Gyro channels", "Amplitude (dps)", ["gyrox", "gyroy", "gyroz"]),
@@ -769,7 +768,7 @@ def _mode_payload(result: ProtocolModeResult) -> dict[str, Any]:
     run = result.best_run
     return {
         "target_scope": result.target_scope.value,
-        "cascade_scheme": result.cascade_scheme.value,
+        "reference_order_key": result.reference_config.reference_order_key,
         "adaptive_filter": result.adaptive_filter,
         "runtime_config": {
             "n_trials": int(result.n_trials),
@@ -800,10 +799,10 @@ def _mode_payload(result: ProtocolModeResult) -> dict[str, Any]:
 def _find_mode_result(
     results: list[ProtocolModeResult],
     scope: TargetScope,
-    scheme: CascadeScheme,
+    scheme: ReferenceConfig,
 ) -> ProtocolModeResult | None:
     for result in results:
-        if result.target_scope == scope and result.cascade_scheme == scheme:
+        if result.target_scope == scope and result.reference_config == scheme:
             return result
     return None
 
@@ -811,7 +810,7 @@ def _find_mode_result(
 def _adaptive_stage_summary(frame: pd.DataFrame) -> list[dict[str, Any]]:
     if frame is None or frame.empty:
         return []
-    column = "adaptive_stages_json" if "adaptive_stages_json" in frame.columns else "lms_stages_json"
+    column = "adaptive_stages_json"
     if column not in frame.columns:
         return []
     out: list[dict[str, Any]] = []
@@ -874,7 +873,7 @@ def _empty_result_frame() -> pd.DataFrame:
             "sample",
             "group_id",
             "target_scope",
-            "cascade_scheme",
+            "reference_order_key",
             "adaptive_filter",
             "window_idx",
             "time_s",
@@ -883,7 +882,6 @@ def _empty_result_frame() -> pd.DataFrame:
             "baseline_ppg_hr_bpm",
             "adaptive_hr_bpm",
             "adaptive_stages_json",
-            "lms_stages_json",
             "is_filtered_segment",
             "baseline_abs_err_bpm",
             "adaptive_abs_err_bpm",

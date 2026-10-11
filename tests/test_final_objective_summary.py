@@ -6,14 +6,14 @@ import pandas as pd
 
 from ppg_hr.experimental import run_batch_protocol as rbp
 from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams
-from ppg_hr.params import CascadeScheme, TargetScope
+from ppg_hr.params import ReferenceConfig, TargetScope
 
 
 def _mode_result_for_summary() -> rbp._ModeOptimisation:
     return rbp._ModeOptimisation(
         motion_type="walk",
         target_scope=TargetScope.GLOBAL,
-        cascade_scheme=CascadeScheme.ACC3,
+        reference_config=ReferenceConfig(('ACC',)),
         adaptive_filter="lms",
         objective_mode="aae",
         data_split_mode="all_train",

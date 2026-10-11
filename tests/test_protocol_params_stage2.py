@@ -5,12 +5,12 @@ import numpy as np
 from ppg_hr.experimental.cascade_solver import _normalise_array
 from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams, decode_protocol_search_space
 from ppg_hr.experimental.run_batch_protocol import _VALID_FILTERS, build_output_run_name
-from ppg_hr.params import CascadeScheme, ProtocolSearchParams, TargetScope
+from ppg_hr.params import ReferenceConfig, ProtocolSearchParams, TargetScope
 
 
 def test_fixed_trial_params_roundtrip_and_stay_out_of_search_space() -> None:
     params = ProtocolTrialParams(
-        TW_F=2.5,
+        prewarm_s=2.5,
         normalization_mode="zscore",
         qc_policy="drop",
         rff_update_mode="nlms",
@@ -19,12 +19,12 @@ def test_fixed_trial_params_roundtrip_and_stay_out_of_search_space() -> None:
     clone = ProtocolTrialParams(**params.to_dict())
     space = ProtocolSearchParams()
 
-    assert clone.TW_F == 2.5
+    assert clone.prewarm_s == 2.5
     assert clone.normalization_mode == "zscore"
     assert clone.qc_policy == "drop"
     assert clone.rff_update_mode == "nlms"
     assert clone.klms_center_prune_policy == "freeze_new_centers"
-    assert "TW_F" not in space.names_for_filter("lms")
+    assert "prewarm_s" not in space.names_for_filter("lms")
     assert "normalization_mode" not in space.names_for_filter("volterra")
     assert "qc_policy" not in space.names_for_filter("rff_lms")
     for fixed_name in (
@@ -38,23 +38,20 @@ def test_fixed_trial_params_roundtrip_and_stay_out_of_search_space() -> None:
         assert fixed_name not in space.names_for_filter("lms")
 
 
-def test_stage1_search_space_uses_stabilized_candidate_lists() -> None:
+def test_core_search_has_only_four_coordinates_and_frozen_other_parameters() -> None:
     space = ProtocolSearchParams()
-
+    for filter_name in ("lms", "volterra", "rff_lms", "klms"):
+        names = space.names_for_filter(filter_name)
+        assert len(names) == 4
+        assert names == ["Fs_Target", "memory_ms", "klms_step_size" if filter_name == "klms" else "LMS_Mu_Base", "Spec_Penalty_Width"]
+        decoded = decode_protocol_search_space(space, {name: 0 for name in names}, adaptive_filter=filter_name)
+        assert decoded.memory_ms == 40
+        assert decoded.M_base == 2 and decoded.C_scale == 1.2 and decoded.K_max == 12
+        assert decoded.hr_window_s == 8 and decoded.hr_step_s == 1
+        assert decoded.Spec_Penalty_Weight == 0.2
     assert space.options("Fs_Target") == [25, 50]
-    assert space.options("LMS_Mu_Base") == [0.004, 0.006, 0.008]
-    assert space.options("alpha_u") == [0.005, 0.01, 0.03, 0.05, 0.1]
-    assert space.options("M2") == [2, 3]
-    assert space.options("RFF_LMS_Mu_Base") == [0.001, 0.002, 0.004, 0.006]
-    assert space.options("rff_D") == [50, 100, 200]
-    assert space.options("rff_sigma_scale") == [0.5, 1.0, 2.0, 4.0]
-    assert "rff_sigma" not in space.names_for_filter("rff_lms")
-    assert space.options("klms_step_size") == [0.005, 0.01, 0.02, 0.05]
-    assert space.options("klms_sigma") == [0.5, 1.0, 2.0, 5.0]
-    assert space.options("klms_epsilon") == [0.005, 0.01, 0.02, 0.05, 0.1]
-    assert space.options("Rest_HR_Track_Band_BPM") == [20.0, 30.0, 60.0, 80.0]
-    assert space.options("Rest_HR_Slew_Limit_BPM") == [1.0, 3.0, 6.0, 8.0]
-    assert space.options("Rest_HR_Slew_Step_BPM") == [0.5, 2.0, 4.0]
+    assert space.options("memory_ms") == [40, 80, 120, 160, 200]
+    assert space.options("LMS_Mu_Base", adaptive_filter="rff_lms") == [0.001, 0.002, 0.004, 0.006]
 
 
 def test_stage1_fixed_rest_params_remain_overrideable() -> None:
@@ -91,7 +88,8 @@ def test_klms_has_independent_search_parameters_and_is_batch_selectable() -> Non
     names = space.names_for_filter("klms")
 
     assert "klms" in _VALID_FILTERS
-    assert {"klms_step_size", "klms_sigma", "klms_epsilon"}.issubset(names)
+    assert "klms_step_size" in names
+    assert "klms_sigma" not in names and "klms_epsilon" not in names
     assert "LMS_Mu_Base" not in names
     assert "RFF_LMS_Mu_Base" not in names
     assert "rff_D" not in names
@@ -99,77 +97,73 @@ def test_klms_has_independent_search_parameters_and_is_batch_selectable() -> Non
     assert "rff_sigma_scale" not in names
     assert "alpha_u" not in names
     assert "M2" not in names
-    assert space.options("klms_step_size") == [0.005, 0.01, 0.02, 0.05]
-    assert space.options("klms_sigma") == [0.5, 1.0, 2.0, 5.0]
-    assert space.options("klms_epsilon") == [0.005, 0.01, 0.02, 0.05, 0.1]
+    assert space.options("klms_step_size", adaptive_filter="klms") == [0.005, 0.01, 0.02, 0.05]
 
 
 def test_decode_klms_search_space_writes_filter_specific_values() -> None:
     space = ProtocolSearchParams()
     idx_map = {name: 0 for name in space.names_for_filter("klms")}
-    idx_map.update({"klms_step_size": 2, "klms_sigma": 3, "klms_epsilon": 1})
+    idx_map["klms_step_size"] = 2
 
     params = decode_protocol_search_space(space, idx_map, adaptive_filter="klms", objective_mode="accuracy")
 
     assert params.adaptive_filter == "klms"
     assert params.objective_mode == "accuracy"
     assert params.klms_step_size == 0.02
-    assert params.klms_sigma == 5.0
-    assert params.klms_epsilon == 0.01
+    assert params.klms_sigma == 1.0
+    assert params.klms_epsilon == 0.1
 
 
 def test_target_scope_global_aliases_use_canonical_global_value() -> None:
     assert TargetScope("global") is TargetScope.GLOBAL
-    assert TargetScope("all") is TargetScope.GLOBAL
-    assert TargetScope("global_all") is TargetScope.GLOBAL
     assert TargetScope.GLOBAL.value == "global"
 
 
-def test_output_run_name_contains_tw_f_label() -> None:
+def test_output_run_name_contains_prewarm_label() -> None:
     name0 = build_output_run_name(
         [TargetScope.MOTION_ONLY],
-        [CascadeScheme.ACC3],
+        [ReferenceConfig(('ACC',))],
         ["lms"],
         "aae",
         "all_train",
-        tw_f_s=0.0,
+        prewarm_s=0.0,
     )
     name25 = build_output_run_name(
-        ["all"],
-        ["ACC3"],
+        ["global"],
+        [('ACC',)],
         ["lms"],
         "accuracy",
         "split",
-        tw_f_s=2.5,
+        prewarm_s=2.5,
     )
 
-    assert name0.endswith("__TW_F0s__hr_fft")
-    assert "global__ACC__lms__accuracy__split__TW_F2p5s__hr_fft" == name25
+    assert name0.endswith("__prewarm_s0s__hr_fft")
+    assert "global__ACC__lms__accuracy__split__prewarm_s2p5s__hr_fft" == name25
 
 
 def test_output_run_name_is_isolated_by_postprocess_method() -> None:
     fft_name = build_output_run_name(
         [TargetScope.MOTION_ONLY],
-        [CascadeScheme.ACC3],
+        [ReferenceConfig(('ACC',))],
         ["lms"],
         "aae",
         "split",
-        tw_f_s=0.0,
+        prewarm_s=0.0,
         postprocess_method="fft",
     )
     ssr_name = build_output_run_name(
         [TargetScope.MOTION_ONLY],
-        [CascadeScheme.ACC3],
+        [ReferenceConfig(('ACC',))],
         ["lms"],
         "aae",
         "split",
-        tw_f_s=0.0,
+        prewarm_s=0.0,
         postprocess_method="ssr",
     )
 
     assert fft_name != ssr_name
-    assert fft_name.endswith("__TW_F0s__hr_fft")
-    assert ssr_name.endswith("__TW_F0s__hr_ssr")
+    assert fft_name.endswith("__prewarm_s0s__hr_fft")
+    assert ssr_name.endswith("__prewarm_s0s__hr_ssr")
 
 
 def test_normalisation_modes_keep_minmax_default_and_support_zscore_none() -> None:

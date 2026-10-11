@@ -20,7 +20,7 @@ from ppg_hr.experimental.run_batch_protocol import (
 )
 from ppg_hr.experimental.protocol_search_space import ProtocolTrialParams
 from ppg_hr.experimental.protocol_search_space import default_protocol_search_space
-from ppg_hr.params import CascadeScheme, MotionType, ProtocolParams, TargetScope
+from ppg_hr.params import ReferenceConfig, MotionType, ProtocolParams, TargetScope
 
 
 def _pair(motion: str, index: int) -> SamplePair:
@@ -77,7 +77,7 @@ def test_all_train_uses_every_index_once_per_motion_and_canonical_order() -> Non
 
 def test_motion_is_part_of_mode_identity_sampler_seed_and_rff_seed_namespace() -> None:
     identities = {
-        _mode_key_for(motion.value, TargetScope.MOTION_POST10, CascadeScheme.ACC, "lms")
+        _mode_key_for(motion.value, TargetScope.MOTION_POST10, ReferenceConfig(('ACC',)), "lms")
         for motion in MotionType
     }
     seeds = {
@@ -85,7 +85,7 @@ def test_motion_is_part_of_mode_identity_sampler_seed_and_rff_seed_namespace() -
             random_state=42,
             motion_type=motion.value,
             scope=TargetScope.MOTION_POST10,
-            scheme=CascadeScheme.ACC,
+            scheme=ReferenceConfig(('ACC',)),
             adaptive_filter="lms",
             repeat_idx=0,
         )
@@ -98,7 +98,7 @@ def test_motion_is_part_of_mode_identity_sampler_seed_and_rff_seed_namespace() -
             random_state=42,
             motion_type=motion.value,
             scope=TargetScope.MOTION_POST10,
-            scheme=CascadeScheme.ACC,
+            scheme=ReferenceConfig(('ACC',)),
             adaptive_filter="lms",
             repeat_idx=0,
         )
@@ -112,7 +112,7 @@ def test_motion_is_part_of_mode_identity_sampler_seed_and_rff_seed_namespace() -
         adaptive_filter="rff_lms",
         objective_mode="posthoc_aae",
         delay_estimation_mode="envelope",
-        mode_key=_mode_key_for("write", TargetScope.MOTION_POST10, CascadeScheme.ACC, "rff_lms"),
+        mode_key=_mode_key_for("write", TargetScope.MOTION_POST10, ReferenceConfig(('ACC',)), "rff_lms"),
         repeat_idx=0,
         random_state=42,
     )
@@ -122,7 +122,7 @@ def test_motion_is_part_of_mode_identity_sampler_seed_and_rff_seed_namespace() -
         adaptive_filter="rff_lms",
         objective_mode="posthoc_aae",
         delay_estimation_mode="envelope",
-        mode_key=_mode_key_for("run", TargetScope.MOTION_POST10, CascadeScheme.ACC, "rff_lms"),
+        mode_key=_mode_key_for("run", TargetScope.MOTION_POST10, ReferenceConfig(('ACC',)), "rff_lms"),
         repeat_idx=0,
         random_state=42,
     )
@@ -133,7 +133,7 @@ def test_mode_checkpoint_fingerprint_covers_inputs_calibration_space_and_budget(
     base = _build_mode_fingerprint(
         motion_type="write",
         scope=TargetScope.MOTION_POST10,
-        scheme=CascadeScheme.ACC,
+        scheme=ReferenceConfig(('ACC',)),
         adaptive_filter="lms",
         objective_mode="posthoc_aae",
         data_split_mode="all_train",
@@ -148,7 +148,7 @@ def test_mode_checkpoint_fingerprint_covers_inputs_calibration_space_and_budget(
     assert base != _build_mode_fingerprint(
         motion_type="run",
         scope=TargetScope.MOTION_POST10,
-        scheme=CascadeScheme.ACC,
+        scheme=ReferenceConfig(('ACC',)),
         adaptive_filter="lms",
         objective_mode="posthoc_aae",
         data_split_mode="all_train",
@@ -171,10 +171,10 @@ def test_ud_preprocessing_marker_only_invalidates_ud_modes() -> None:
     }
 
     kwargs = {"mode": "smoothed", "window_s": 0.1, "window_samples": 10}
-    assert rbp._ud_preprocessing_fingerprint_fields(CascadeScheme.UD2, **kwargs) == marker
-    assert rbp._ud_preprocessing_fingerprint_fields(CascadeScheme.ACC_UD2, **kwargs) == marker
-    assert rbp._ud_preprocessing_fingerprint_fields(CascadeScheme.ACC, **kwargs) == {}
-    assert rbp._ud_preprocessing_fingerprint_fields(CascadeScheme.HF2, **kwargs) == {}
+    assert rbp._ud_preprocessing_fingerprint_fields(ReferenceConfig(('UD',)), **kwargs) == marker
+    assert rbp._ud_preprocessing_fingerprint_fields(ReferenceConfig(('ACC', 'UD')), **kwargs) == marker
+    assert rbp._ud_preprocessing_fingerprint_fields(ReferenceConfig(('ACC',)), **kwargs) == {}
+    assert rbp._ud_preprocessing_fingerprint_fields(ReferenceConfig(('HF',)), **kwargs) == {}
 
 
 def test_one_all_train_objective_receives_all_indices_of_one_motion(monkeypatch) -> None:
@@ -201,7 +201,7 @@ def test_one_all_train_objective_receives_all_indices_of_one_motion(monkeypatch)
         val_sets={},
         test_sets=datasets,
         scope=TargetScope.MOTION_POST10,
-        scheme=CascadeScheme.ACC,
+        scheme=ReferenceConfig(('ACC',)),
         adaptive_filter="lms",
         objective_mode="posthoc_aae",
         data_split_mode="all_train",
@@ -244,7 +244,7 @@ def test_batch_creates_one_independent_all_train_mode_per_motion(tmp_path, monke
         "load_and_preprocess_protocol",
         lambda sensor, *a, **k: datasets[next(pair.motion_id for pair in pairs if pair.sensor_csv == sensor)],
     )
-    monkeypatch.setattr(rbp, "detect_activity_segments", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(rbp, "detect_source_imu_segments", lambda *a, **k: SimpleNamespace())
     monkeypatch.setattr(rbp, "plot_signal_figures", lambda *a, **k: {})
 
     def fake_optimise(**kwargs):
@@ -261,7 +261,7 @@ def test_batch_creates_one_independent_all_train_mode_per_motion(tmp_path, monke
         return rbp._ModeOptimisation(
             motion_type=kwargs["motion_type"],
             target_scope=kwargs["scope"],
-            cascade_scheme=kwargs["scheme"],
+            reference_config=kwargs["scheme"],
             adaptive_filter=kwargs["adaptive_filter"],
             objective_mode=kwargs["objective_mode"],
             data_split_mode=kwargs["data_split_mode"],
@@ -294,7 +294,7 @@ def test_batch_creates_one_independent_all_train_mode_per_motion(tmp_path, monke
     result = run_batch_adaptive_protocol(
         subject_dir=subject_dir,
         output_root=tmp_path / "outputs" / "four_motion",
-        cascade_schemes=[CascadeScheme.ACC],
+        reference_group_orders=[ReferenceConfig(('ACC',))],
         verbose=False,
     )
 

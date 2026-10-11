@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .calibration import CalibrationCoefficients, load_subject_calibration
-from .data_loader import SENSOR_COLUMNS, ProcessedDataset, load_dataset
+from .data_loader import PydisplaySensorData, SequenceRepairReport, load_hrdata_csv, load_pydisplay_sensor_csv
 from .utils import (
     fillmissing_linear,
     fillmissing_nearest,
@@ -13,10 +13,11 @@ from .utils import (
 )
 
 __all__ = [
-    "ProcessedDataset",
+    "PydisplaySensorData",
+    "SequenceRepairReport",
     "CalibrationCoefficients",
-    "SENSOR_COLUMNS",
-    "load_dataset",
+    "load_hrdata_csv",
+    "load_pydisplay_sensor_csv",
     "load_subject_calibration",
     "fillmissing_linear",
     "fillmissing_nearest",

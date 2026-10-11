@@ -6,7 +6,7 @@ import pytest
 
 from ppg_hr.experimental import run_batch_protocol as rbp
 from ppg_hr.experimental.run_batch_protocol import build_subject_output_dir
-from ppg_hr.params import CascadeScheme, TargetScope
+from ppg_hr.params import ReferenceConfig, TargetScope
 
 
 def test_subject_output_dir_lives_beside_subject_and_contains_subject_name(tmp_path: Path) -> None:
@@ -16,18 +16,18 @@ def test_subject_output_dir_lives_beside_subject_and_contains_subject_name(tmp_p
     output_dir = build_subject_output_dir(
         subject_dir=subject_dir,
         target_scopes=[TargetScope.MOTION_POST10],
-        cascade_schemes=[CascadeScheme.ACC, CascadeScheme.HF2],
+        reference_group_orders=[ReferenceConfig(('ACC',)), ReferenceConfig(('HF',))],
         adaptive_filters=["lms"],
         objective_mode="posthoc_aae",
         data_split_mode="all_train",
-        tw_f_s=0.0,
+        prewarm_s=0.0,
         postprocess_method="fft",
     )
 
     assert output_dir.parent == subject_dir.parent.resolve() / "outputs"
     assert output_dir.name.startswith("subject_name_with_underscores__")
     assert "motion_post10" in output_dir.name
-    assert "ACC-HF2" in output_dir.name
+    assert "ACC-HF" in output_dir.name
     assert "lms" in output_dir.name
 
 
@@ -37,11 +37,11 @@ def test_subject_output_dir_is_deterministic_for_checkpoint_resume(tmp_path: Pat
     kwargs = {
         "subject_dir": subject_dir,
         "target_scopes": ["motion_post10"],
-        "cascade_schemes": ["ACC"],
+        "reference_group_orders": [('ACC',)],
         "adaptive_filters": ["lms"],
         "objective_mode": "posthoc_aae",
         "data_split_mode": "all_train",
-        "tw_f_s": 0.0,
+        "prewarm_s": 0.0,
         "postprocess_method": "fft",
     }
 
