@@ -46,14 +46,15 @@ def search_fields(adaptive_filter: str) -> set[str]:
             'klms_step_size' if adaptive_filter == 'klms' else 'LMS_Mu_Base'}
 
 
-def build_fixed_config(params: ProtocolTrialParams) -> dict[str, Any]:
+def build_fixed_config(params: ProtocolTrialParams, *, preprocessing=DEFAULT_PREPROCESSING,
+                       motion_detector=DEFAULT_MOTION_DETECTOR, settings=PHYSICAL4D_SETTINGS) -> dict[str, Any]:
     """Expand every fixed field, including inactive filters and mechanisms."""
     trial = {k: v for k, v in params.to_dict().items() if k not in search_fields(params.adaptive_filter)}
-    settings = {k: v for k, v in asdict(PHYSICAL4D_SETTINGS).items()
+    settings = {k: v for k, v in asdict(settings).items()
                 if k not in {'sampling_rates', 'memories_ms', 'penalty_widths_bpm',
                              'lms_steps', 'volterra_steps', 'rff_lms_steps', 'klms_steps'}}
     return json.loads(canonical_json(dict(schema_version=SCHEMA_VERSION, trial=trial,
-        preprocessing=asdict(DEFAULT_PREPROCESSING), motion_detector=asdict(DEFAULT_MOTION_DETECTOR),
+        preprocessing=asdict(preprocessing), motion_detector=asdict(motion_detector),
         evaluation=settings)))
 
 

@@ -8,6 +8,10 @@ CF 计算、分类型带通滤波和 ``resample_poly`` 重采样。
 from __future__ import annotations
 
 import math
+from contextvars import ContextVar
+from functools import wraps
+from dataclasses import asdict
+from ..params import DEFAULT_PREPROCESSING, PreprocessingParams
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
@@ -23,6 +27,29 @@ from ..preprocess.utils import (
     filloutliers_movmedian_linear,
     smoothdata_movmedian,
 )
+
+_PREPROCESSING = ContextVar('ppg_preprocessing', default=DEFAULT_PREPROCESSING)
+
+
+def _with_preprocessing(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        explicit = kwargs.pop('preprocessing', None)
+        if explicit is None and args and isinstance(args[0], SensorDataset):
+            stored = args[0].source_metadata.get('preprocessing_parameters')
+            explicit = PreprocessingParams(**stored) if stored else None
+        configuration = explicit or DEFAULT_PREPROCESSING
+        token = _PREPROCESSING.set(configuration)
+        try:
+            result = function(*args, **kwargs)
+            if isinstance(result, SensorDataset):
+                result.source_metadata = dict(result.source_metadata,
+                    preprocessing_parameters=asdict(configuration))
+            return result
+        finally:
+            _PREPROCESSING.reset(token)
+    return wrapped
+
 
 __all__ = [
     "PROTOCOL_CHANNELS",
@@ -225,6 +252,7 @@ class ProtocolDataset(SensorDataset):
         return view
 
 
+@_with_preprocessing
 def load_and_preprocess_protocol(
     sensor_csv: str | Path,
     ref_csv: str | Path,
@@ -242,6 +270,9 @@ def load_and_preprocess_protocol(
     QC/插值后的公式值，供 UD/ACC+UD 在自适应窗口内直接归一化。
     """
 
+    configuration = _PREPROCESSING.get()
+    ud_calculation_mode = configuration.ud_calculation_mode if ud_calculation_mode == 'smoothed' else ud_calculation_mode
+    ud_smoothing_window_s = configuration.ud_smoothing_window_s if ud_smoothing_window_s == 0.1 else ud_smoothing_window_s
     sensor_path = Path(sensor_csv)
     calibration = calibration or load_subject_calibration(sensor_path.parent)
     ud_mode, ud_window_samples = _validate_ud_calculation_config(
@@ -263,23 +294,23 @@ def load_and_preprocess_protocol(
     ppg_clean_green = clean_frame["ppg_green"].to_numpy(dtype=float)
     ppg_clean_red = clean_frame["ppg_red"].to_numpy(dtype=float)
     ppg_clean_ir = clean_frame["ppg_ir"].to_numpy(dtype=float)
-    ppg_green = _safe_bandpass(ppg_clean_green, fs, 0.5, 5.0)
-    ppg_red = _safe_bandpass(ppg_clean_red, fs, 0.5, 5.0)
-    ppg_ir = _safe_bandpass(ppg_clean_ir, fs, 0.5, 5.0)
-    hf1 = _safe_bandpass(clean_frame["hf1"].to_numpy(dtype=float), fs, 0.1, 5.0)
-    hf2 = _safe_bandpass(clean_frame["hf2"].to_numpy(dtype=float), fs, 0.1, 5.0)
-    cf1 = _safe_bandpass(clean_frame["cf1"].to_numpy(dtype=float), fs, 0.1, 5.0)
-    cf2 = _safe_bandpass(clean_frame["cf2"].to_numpy(dtype=float), fs, 0.1, 5.0)
-    hfcomp1 = _safe_bandpass(clean_frame["hfcomp1"].to_numpy(dtype=float), fs, 0.1, 5.0)
-    hfcomp2 = _safe_bandpass(clean_frame["hfcomp2"].to_numpy(dtype=float), fs, 0.1, 5.0)
+    ppg_green = _safe_bandpass(ppg_clean_green, fs, *_PREPROCESSING.get().ppg_band_hz)
+    ppg_red = _safe_bandpass(ppg_clean_red, fs, *_PREPROCESSING.get().ppg_band_hz)
+    ppg_ir = _safe_bandpass(ppg_clean_ir, fs, *_PREPROCESSING.get().ppg_band_hz)
+    hf1 = _safe_bandpass(clean_frame["hf1"].to_numpy(dtype=float), fs, *_PREPROCESSING.get().thermal_band_hz)
+    hf2 = _safe_bandpass(clean_frame["hf2"].to_numpy(dtype=float), fs, *_PREPROCESSING.get().thermal_band_hz)
+    cf1 = _safe_bandpass(clean_frame["cf1"].to_numpy(dtype=float), fs, *_PREPROCESSING.get().thermal_band_hz)
+    cf2 = _safe_bandpass(clean_frame["cf2"].to_numpy(dtype=float), fs, *_PREPROCESSING.get().thermal_band_hz)
+    hfcomp1 = _safe_bandpass(clean_frame["hfcomp1"].to_numpy(dtype=float), fs, *_PREPROCESSING.get().thermal_band_hz)
+    hfcomp2 = _safe_bandpass(clean_frame["hfcomp2"].to_numpy(dtype=float), fs, *_PREPROCESSING.get().thermal_band_hz)
     ud1 = clean_frame["ud1"].to_numpy(dtype=float).copy()
     ud2 = clean_frame["ud2"].to_numpy(dtype=float).copy()
-    accx = _safe_bandpass(clean_frame["accx"].to_numpy(dtype=float), fs, 0.5, 10.0)
-    accy = _safe_bandpass(clean_frame["accy"].to_numpy(dtype=float), fs, 0.5, 10.0)
-    accz = _safe_bandpass(clean_frame["accz"].to_numpy(dtype=float), fs, 0.5, 10.0)
-    gyrox = _safe_bandpass(clean_frame["gyrox"].to_numpy(dtype=float), fs, 0.5, 10.0)
-    gyroy = _safe_bandpass(clean_frame["gyroy"].to_numpy(dtype=float), fs, 0.5, 10.0)
-    gyroz = _safe_bandpass(clean_frame["gyroz"].to_numpy(dtype=float), fs, 0.5, 10.0)
+    accx = _safe_bandpass(clean_frame["accx"].to_numpy(dtype=float), fs, *_PREPROCESSING.get().imu_band_hz)
+    accy = _safe_bandpass(clean_frame["accy"].to_numpy(dtype=float), fs, *_PREPROCESSING.get().imu_band_hz)
+    accz = _safe_bandpass(clean_frame["accz"].to_numpy(dtype=float), fs, *_PREPROCESSING.get().imu_band_hz)
+    gyrox = _safe_bandpass(clean_frame["gyrox"].to_numpy(dtype=float), fs, *_PREPROCESSING.get().imu_band_hz)
+    gyroy = _safe_bandpass(clean_frame["gyroy"].to_numpy(dtype=float), fs, *_PREPROCESSING.get().imu_band_hz)
+    gyroz = _safe_bandpass(clean_frame["gyroz"].to_numpy(dtype=float), fs, *_PREPROCESSING.get().imu_band_hz)
 
     source_time = loaded.frame["Time_s"].to_numpy(dtype=float).copy()
     acquired = PpgSource(fs, source_time,
@@ -350,6 +381,7 @@ def load_and_preprocess_protocol(
     )
 
 
+@_with_preprocessing
 def apply_ppg_input_transform(dataset: ProtocolDataset, params: object) -> ProtocolDataset:
     """Return ``dataset`` with the trial-selected PPG input transform applied.
 
@@ -364,7 +396,7 @@ def apply_ppg_input_transform(dataset: ProtocolDataset, params: object) -> Proto
         raise ValueError("ppg_input_transform must be 'raw_bandpass' or 'log_absorbance'")
     fs = int(dataset.source_imu.fs if dataset.source_imu is not None else dataset.fs)
     if mode == "raw_bandpass":
-        transformed = {name: _safe_bandpass(_clean_ppg_source(dataset, name), fs, 0.5, 5.0)
+        transformed = {name: _safe_bandpass(_clean_ppg_source(dataset, name), fs, *_PREPROCESSING.get().ppg_band_hz)
                        for name in ("ppg_green", "ppg_red", "ppg_ir")}
         return _replace_algorithm_ppg(dataset, transformed, fs)
     baseline_mode = str(getattr(params, "log_absorbance_baseline_mode", "rolling_median")).lower()
@@ -508,8 +540,8 @@ def _derive_protocol_frame(
     }
     raw_den2 = float(calibration.c2) - values["Uc2"]
     raw_den3 = float(calibration.c3) - values["Uc3"]
-    raw_near2 = np.isfinite(raw_den2) & (np.abs(raw_den2) <= 1e-9)
-    raw_near3 = np.isfinite(raw_den3) & (np.abs(raw_den3) <= 1e-9)
+    raw_near2 = np.isfinite(raw_den2) & (np.abs(raw_den2) <= _PREPROCESSING.get().ud_denominator_eps)
+    raw_near3 = np.isfinite(raw_den3) & (np.abs(raw_den3) <= _PREPROCESSING.get().ud_denominator_eps)
     ud_inputs = {name: values[name] for name in ("Uh2", "Uh3", "Uc2", "Uc3")}
     if ud_calculation_mode == "smoothed":
         ud_inputs = {
@@ -520,8 +552,8 @@ def _derive_protocol_frame(
         raise ValueError("ud_calculation_mode must be 'raw' or 'smoothed'")
     den2 = float(calibration.c2) - ud_inputs["Uc2"]
     den3 = float(calibration.c3) - ud_inputs["Uc3"]
-    near2 = np.isfinite(den2) & (np.abs(den2) <= 1e-9)
-    near3 = np.isfinite(den3) & (np.abs(den3) <= 1e-9)
+    near2 = np.isfinite(den2) & (np.abs(den2) <= _PREPROCESSING.get().ud_denominator_eps)
+    near3 = np.isfinite(den3) & (np.abs(den3) <= _PREPROCESSING.get().ud_denominator_eps)
     qc_near = raw_near2 | raw_near3 | near2 | near3
     safe_den2 = den2.copy()
     safe_den3 = den3.copy()
@@ -531,12 +563,12 @@ def _derive_protocol_frame(
         "ppg_green": values["PPG_G"],
         "ppg_red": values["PPG_R"],
         "ppg_ir": values["PPG_IR"],
-        "cf1": values["Uh1"] * 1000.0,
-        "cf2": values["Uh4"] * 1000.0,
-        "hf1": (values["Uh2"] - float(calibration.k2) * values["Uh1"]) * 1000.0,
-        "hf2": (values["Uh3"] - float(calibration.k3) * values["Uh4"]) * 1000.0,
-        "hfcomp1": values["Uh2"] * 1000.0,
-        "hfcomp2": values["Uh3"] * 1000.0,
+        "cf1": values["Uh1"] * _PREPROCESSING.get().thermal_voltage_scale,
+        "cf2": values["Uh4"] * _PREPROCESSING.get().thermal_voltage_scale,
+        "hf1": (values["Uh2"] - float(calibration.k2) * values["Uh1"]) * _PREPROCESSING.get().thermal_voltage_scale,
+        "hf2": (values["Uh3"] - float(calibration.k3) * values["Uh4"]) * _PREPROCESSING.get().thermal_voltage_scale,
+        "hfcomp1": values["Uh2"] * _PREPROCESSING.get().thermal_voltage_scale,
+        "hfcomp2": values["Uh3"] * _PREPROCESSING.get().thermal_voltage_scale,
         "ud1": (ud_inputs["Uh2"] - ud_inputs["Uc2"]) / safe_den2,
         "ud2": (ud_inputs["Uh3"] - ud_inputs["Uc3"]) / safe_den3,
         "accx": values["ACC_X"],
@@ -668,7 +700,7 @@ def _clean_ppg(values: pd.Series | np.ndarray, fs: int) -> np.ndarray:
     """Clean PPG missing values and short spikes with existing utilities."""
 
     arr = _clean_numeric(values)
-    window = max(3, int(fs))
+    window = max(3, round(fs * _PREPROCESSING.get().outlier_window_s))
     return filloutliers_movmedian_linear(arr, window=window)
 
 
@@ -760,15 +792,15 @@ def _safe_bandpass(x: np.ndarray, fs: int, low_hz: float, high_hz: float) -> np.
     """Apply a fourth-order Butterworth bandpass with safe fallbacks."""
 
     arr = np.asarray(x, dtype=float)
-    if arr.size < 8:
+    if arr.size < _PREPROCESSING.get().minimum_bandpass_samples:
         return arr - np.nanmean(arr)
     nyq = fs / 2.0
-    high = min(float(high_hz), 0.45 * fs)
-    low = max(float(low_hz), 1e-3)
+    high = min(float(high_hz), _PREPROCESSING.get().cutoff_nyquist_fraction * fs)
+    low = max(float(low_hz), _PREPROCESSING.get().minimum_cutoff_hz)
     if not (0 < low < high < nyq):
         return arr - np.nanmean(arr)
-    b, a = butter(4, [low / nyq, high / nyq], btype="bandpass")
-    padlen = 3 * max(len(a), len(b))
+    b, a = butter(_PREPROCESSING.get().filter_order, [low / nyq, high / nyq], btype="bandpass")
+    padlen = _PREPROCESSING.get().bandpass_pad_multiplier * max(len(a), len(b))
     if arr.size <= padlen:
         return arr - np.nanmean(arr)
     try:

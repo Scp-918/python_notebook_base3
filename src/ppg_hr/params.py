@@ -77,7 +77,13 @@ class PreprocessingParams:
     cutoff_nyquist_fraction: float = 0.45
     outlier_window_s: float = 1.0
     missing_repair: str = "linear_interpolation_edge_hold"
-    ud_mode: str = "hf_minus_cf"
+    ud_calculation_mode: str = "smoothed"
+    ud_smoothing_window_s: float = 0.1
+    ud_denominator_eps: float = 1e-9
+    thermal_voltage_scale: float = 1000.0
+    minimum_bandpass_samples: int = 8
+    minimum_cutoff_hz: float = 1e-3
+    bandpass_pad_multiplier: int = 3
 
 
 PHYSICAL4D_SETTINGS = Physical4DSettings()

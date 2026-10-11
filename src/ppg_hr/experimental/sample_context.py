@@ -67,10 +67,14 @@ def search_sample_tdelay(times, predicted, ref_times, ref_hr, settings=PHYSICAL4
     return min(eligible)[1], curve, 'ok', ''
 
 
-def prepare_sample_context(dataset, params: ProtocolTrialParams, input_identity=None) -> SampleContext:
+def prepare_sample_context(dataset, params: ProtocolTrialParams, input_identity=None, fixed_config=None) -> SampleContext:
     """Detect once and truncate before the first detected bout, before HR extraction."""
     from .physical4d import identity, build_fixed_config
-    segment = apply_motion_protocol(detect_source_imu_segments(dataset.source_imu), params.motion_policy)
+    from ppg_hr.params import MotionDetectorParams
+    from types import SimpleNamespace
+    config = fixed_config or build_fixed_config(params)
+    segment = apply_motion_protocol(detect_source_imu_segments(dataset.source_imu,
+        params=MotionDetectorParams(**config['motion_detector'])), params.motion_policy)
     rest_end = min((run[0] for run in segment.detected_runs), default=float('inf'))
     transformed = apply_ppg_input_transform(dataset.sensor_view(), params)
     count = int(np.searchsorted(transformed.time_s, rest_end, side='left'))
@@ -83,8 +87,8 @@ def prepare_sample_context(dataset, params: ProtocolTrialParams, input_identity=
         spec_penalty_weight=params.Rest_HR_Spec_Penalty_Weight,
         spec_penalty_width_hz=params.Rest_HR_Spec_Penalty_Width_Hz)
     times = result.times_s + (float(dataset.time_s[0]) if len(dataset.time_s) else 0.)
-    delay, curve, status, reason = search_sample_tdelay(times, result.hr_bpm_smooth, dataset.ref_time_s, dataset.ref_hr_bpm)
-    config = build_fixed_config(params)
+    delay, curve, status, reason = search_sample_tdelay(times, result.hr_bpm_smooth, dataset.ref_time_s,
+        dataset.ref_hr_bpm, settings=SimpleNamespace(**config['evaluation']))
     preparation = dict(preprocessing=config['preprocessing'], detector=config['motion_detector'],
                        motion_policy=params.motion_policy,
                        alignment={k: v for k, v in config['trial'].items() if k.startswith(('Rest_', 'evaluation_', 'log_absorbance', 'ppg_input'))},
