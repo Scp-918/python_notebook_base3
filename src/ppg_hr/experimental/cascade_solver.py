@@ -40,6 +40,8 @@ from .protocol_search_space import ProtocolTrialParams
 from .rff_lms import noncausal_rff_lms_filter
 from .segmentation import SegmentInfo, apply_motion_protocol, detect_source_imu_segments
 from .spectral_utils import compute_power_spectrum, sparse_spectrum_hr_candidates
+from .reference_parity import rank_references, parity_design
+from .sample_context import SampleContext
 from .volterra import noncausal_volterra_filter
 
 __all__ = [
@@ -152,6 +154,11 @@ def run_protocol_trial(
     params: ProtocolTrialParams,
     collect_frame: bool = True,
     collect_stages: bool = True,
+    *,
+    sample_context: SampleContext | None = None,
+    posthoc_mode: str = "search",
+    saved_posthoc_bias_s: float | None = None,
+    diagnostic_window_indices: set[int] | None = None,
 ) -> ProtocolRunResult:
     """Run one concrete protocol trial and return AAE/accuracy metrics.
 
@@ -169,9 +176,17 @@ def run_protocol_trial(
     scope = TargetScope(target_scope)
     adaptive_filter = str(getattr(params, "adaptive_filter", "lms"))
     empty = pd.DataFrame()
+    if posthoc_mode not in {"search", "saved", "disabled"}:
+        raise ValueError("Unknown posthoc mode")
+    sensor = dataset.sensor_view()
+    if sample_context is not None:
+        if sample_context.sample_id != dataset.sample_stem:
+            raise ValueError("Sample context identity differs")
+        sensor._sample_context = sample_context
+    tdelay = sample_context.Tdelay_s if sample_context is not None else 0.0
 
     try:
-        base = _get_trial_base(dataset.sensor_view(), params)
+        base = _get_trial_base(sensor, params)
         if base.failure_reason:
             return _failed(scope, scheme, params, base.failure_reason, base.segment_info)
         if base.aligned is None or base.motion_frequency is None:
@@ -185,6 +200,7 @@ def run_protocol_trial(
             base.motion_frequency,
             collect_frame=bool(collect_frame),
             collect_stages=bool(collect_stages),
+            diagnostic_window_indices=diagnostic_window_indices,
         )
         arrays = payload.metric_arrays
         if arrays.get("time_s", np.asarray([], dtype=float)).size == 0:
@@ -231,7 +247,7 @@ def run_protocol_trial(
         # Only evaluate reference after every candidate and final prediction is fixed.
         ref_time = np.asarray(dataset.ref_time_s, dtype=float)
         ref_values = np.asarray(dataset.ref_hr_bpm, dtype=float)
-        arrays["ref_hr_bpm"] = (np.interp(arrays["time_s"], ref_time, ref_values, left=np.nan, right=np.nan)
+        arrays["ref_hr_bpm"] = (np.interp(arrays["time_s"] + tdelay, ref_time, ref_values, left=np.nan, right=np.nan)
                                 if ref_time.size else np.full(adaptive.size, np.nan))
         episodes, elapsed = base.segment_info.states_at(arrays["time_s"])[1:]
         arrays["episode_id"] = episodes
@@ -263,6 +279,9 @@ def run_protocol_trial(
             dataset,
             params,
             filtered_mask,
+            tdelay_s=tdelay,
+            posthoc_mode=posthoc_mode,
+            saved_bias_s=saved_posthoc_bias_s,
         )
 
         metrics = aggregate_metric_arrays(metric_arrays, split_name="")
@@ -409,6 +428,7 @@ def _attach_time_bias_after_metrics(
     dataset: ProtocolDataset,
     params: ProtocolTrialParams,
     filtered_mask: np.ndarray,
+    *, tdelay_s: float = 0.0, posthoc_mode: str = "search", saved_bias_s: float | None = None,
 ) -> TimeBiasAfterResult | None:
     """Attach post-hoc curve-level alignment arrays to one completed run.
 
@@ -418,7 +438,7 @@ def _attach_time_bias_after_metrics(
     后对齐指标（如 posthoc_final_aae_bpm）可通过 OPTIMIZATION_OBJECTIVE="posthoc_aae" 参与贝叶斯优化。
     """
 
-    if not bool(getattr(params, "Enable_Time_Bias_After", True)):
+    if posthoc_mode == "disabled" or not params.Enable_Time_Bias_After:
         return None
     time_s = np.asarray(metric_arrays.get("time_s", []), dtype=float)
     adaptive = np.asarray(metric_arrays.get("adaptive_hr_bpm", []), dtype=float)
@@ -436,8 +456,19 @@ def _attach_time_bias_after_metrics(
     search_range = tuple(float(x) for x in getattr(params, "Time_Bias_After_Range_S", (-5.0, 5.0)))
     if len(search_range) != 2:
         raise ValueError("Time_Bias_After_Range_S must contain exactly two values")
-    result = search_time_bias_after(
-        time_s[mask],
+    if posthoc_mode == "saved":
+        bias = float(saved_bias_s) if saved_bias_s is not None else float("nan")
+        sampled = np.interp(time_s[mask] + tdelay_s + bias, dataset.ref_time_s, dataset.ref_hr_bpm,
+                            left=np.nan, right=np.nan) if len(dataset.ref_time_s) else np.full(mask.sum(), np.nan)
+        errors = final[mask] - sampled
+        errors = errors[np.isfinite(errors)]
+        result = TimeBiasAfterResult(bias, _mean(np.abs(errors)), float(np.std(errors)) if errors.size else float("nan"),
+            float(np.sqrt(np.mean(errors ** 2))) if errors.size else float("nan"), len(errors), pd.DataFrame(), sampled,
+            status="ok" if errors.size else "unscored", mode="saved", search_range_s=search_range,
+            search_step_s=params.Time_Bias_After_Step_S)
+    else:
+        result = search_time_bias_after(
+        time_s[mask] + tdelay_s,
         final[mask],
         np.asarray(dataset.ref_time_s, dtype=float),
         np.asarray(dataset.ref_hr_bpm, dtype=float),
@@ -448,7 +479,7 @@ def _attach_time_bias_after_metrics(
     )
     bias = float(result.time_bias_after_s)
     ref_after = np.interp(
-        time_s + bias,
+        time_s + tdelay_s + bias,
         np.asarray(dataset.ref_time_s, dtype=float),
         np.asarray(dataset.ref_hr_bpm, dtype=float),
         left=np.nan,
@@ -541,6 +572,11 @@ def _get_trial_base(dataset: SensorDataset, params: ProtocolTrialParams) -> _Tri
         _store_trial_base(cache, key, base)
         return base
 
+    context = getattr(dataset, '_sample_context', None)
+    if context is not None:
+        aligned = replace(aligned, alignment_info=replace(aligned.alignment_info,
+            best_tdelay_s=context.Tdelay_s, ref_shift_s=context.Tdelay_s,
+            status=context.alignment_status, reason=context.alignment_reason))
     fmove = estimate_motion_frequency(ds.accx, ds.accy, ds.accz, aligned.segment_info, fs)
     base = _TrialBase(
         dataset=ds,
@@ -573,7 +609,9 @@ def _get_sensor_base(dataset: SensorDataset, params: ProtocolTrialParams) -> _Se
     transformed_dataset = apply_ppg_input_transform(dataset, params)
     ds = resample_protocol_dataset(transformed_dataset, fs_target)
     fs = int(ds.fs)
-    segment = apply_motion_protocol(detect_source_imu_segments(dataset.source_imu), params.motion_policy)
+    context = getattr(dataset, '_sample_context', None)
+    segment = context.segmentation if context is not None else apply_motion_protocol(
+        detect_source_imu_segments(dataset.source_imu), params.motion_policy)
 
     base = _SensorBase(
         dataset=ds,
@@ -711,6 +749,7 @@ def _run_windows(
     *,
     collect_frame: bool,
     collect_stages: bool,
+    diagnostic_window_indices: set[int] | None = None,
 ) -> _WindowRunPayload:
     """Run baseline/adaptive HR extraction with optional frame/stage collection."""
 
@@ -813,7 +852,9 @@ def _run_windows(
                 fs,
                 delay_cache=base.delay_estimate_cache,
                 window_idx=int(window_idx),
-                collect_stages=collect_stages,
+                collect_stages=collect_stages and (diagnostic_window_indices is None or int(window_idx) in diagnostic_window_indices),
+                full_reference_signals=ds.channels(),
+                reference_start_idx=adaptive_source_start_idx,
                 adaptive_input_samples=int(norm_cache.adaptive_win_len),
                 fft_offset_samples=fft_offset_idx,
                 fft_input_samples=int(norm_cache.win_len),
@@ -1203,35 +1244,35 @@ def _cascade_filter_window(
     adaptive_input_samples: int | None = None,
     fft_offset_samples: int = 0,
     fft_input_samples: int | None = None,
+    full_reference_signals: dict[str, np.ndarray] | None = None,
+    reference_start_idx: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]], str]:
     """Run the configured adaptive-filter cascade on one normalized window."""
 
-    delay_mode = str(getattr(params, "delay_estimation_mode", "envelope"))
-    delay_key = (
-        int(window_idx) if window_idx is not None else -1,
-        round(float(params.Kstop), 8),
-        round(float(fmove), 8),
-        delay_mode,
-    )
-    delay_est = delay_cache.get(delay_key) if delay_cache is not None else None
-    if delay_est is None:
-        delay_est = estimate_envelope_delays(
-            window,
-            fmove,
-            params.Kstop,
-            fs,
-            mode=delay_mode,
-        )
-        if delay_cache is not None:
-            # 中文注释：只缓存 DelayEstimate 小对象，不保存包络/相关数组，避免内存放大。
-            delay_cache[delay_key] = delay_est
-    current = np.asarray(window["ppg_green"], dtype=float)
+    delay_mode = params.delay_estimation_mode
+    parity = params.cascade_mode == 'reference_parity'
+    if parity:
+        ranking = rank_references(window, scheme, fs, params,
+            full_signals=full_reference_signals, start_idx=reference_start_idx)
+        reference_ranking = {'global': [item.channel for item in ranking]}
+        channel_plan = [(item.sensor_type, item.channel, item) for item in ranking]
+        delay_est = None
+    else:
+        delay_key = (int(window_idx) if window_idx is not None else -1,
+                     params.Kstop, fmove, delay_mode)
+        delay_est = delay_cache.get(delay_key) if delay_cache is not None else None
+        if delay_est is None:
+            delay_est = estimate_envelope_delays(window, fmove, params.Kstop, fs, mode=delay_mode)
+            if delay_cache is not None:
+                delay_cache[delay_key] = delay_est
+        reference_ranking = {key: list(value) for key, value in delay_est.order_by_type.items()}
+        channel_plan = [(group, channel, delay_est.by_channel[channel])
+                        for group, count in _reference_group_plan(scheme)
+                        for channel in REFERENCE_REGISTRY[group][:count]]
+    current = np.asarray(window['ppg_green'], dtype=float)
     stages: list[dict[str, Any]] = []
-    reference_ranking = {key: list(value) for key, value in delay_est.order_by_type.items()}
-    for sensor_type, max_count in _reference_group_plan(scheme):
-        for channel in REFERENCE_REGISTRY[sensor_type][:max_count]:
-            delay = delay_est.by_channel[channel]
-            design = map_delay_to_lms_params(delay, sensor_type, params, fs)
+    for sensor_type, channel, delay in channel_plan:
+            design = parity_design(ranking[0], delay, sensor_type, params, fs) if parity else map_delay_to_lms_params(delay, sensor_type, params, fs)
             filter_type = str(getattr(params, "adaptive_filter", "lms"))
             stage_extra: dict[str, Any] = {}
             stage_diagnostics: dict[str, Any] = {}
@@ -1328,13 +1369,13 @@ def _cascade_filter_window(
                 klms_distance_mode = str(getattr(params, "klms_distance_mode", "normalized"))
                 klms_normalized_update = bool(getattr(params, "klms_normalized_update", True))
                 klms_nlms_eps = float(getattr(params, "klms_nlms_eps", 1e-6))
-                stage_mu = klms_step_size
+                stage_mu = design.u if parity else klms_step_size
                 klms_result = noncausal_klms_filter(
                     window[channel],
                     current,
                     M=design.M,
                     K=design.K,
-                    step_size=klms_step_size,
+                    step_size=stage_mu,
                     sigma=klms_sigma,
                     epsilon=klms_epsilon,
                     max_dictionary_size=klms_max_dictionary_size,
@@ -1378,6 +1419,7 @@ def _cascade_filter_window(
                         "channel": channel,
                         "selected_channel": channel,
                         "D_opt_samples": int(delay.D_opt_samples),
+                        "shared_delay_samples": int(ranking[0].D_opt_samples) if parity else None,
                         "D_opt_seconds": float(delay.D_opt_seconds),
                         "R_max": float(delay.R_max),
                         "abs_corr": float(abs(delay.R_max)),
@@ -1400,7 +1442,11 @@ def _cascade_filter_window(
                         **stage_extra,
                     }
                 )
-    penalty_ref, penalty_ref_channel = _penalty_reference_with_channel(window, delay_est, scheme)
+    if parity:
+        penalty_ref_channel = ranking[0].channel
+        penalty_ref = window[penalty_ref_channel]
+    else:
+        penalty_ref, penalty_ref_channel = _penalty_reference_with_channel(window, delay_est, scheme)
     if collect_stages:
         for stage in stages:
             stage["penalty_ref_channel"] = penalty_ref_channel

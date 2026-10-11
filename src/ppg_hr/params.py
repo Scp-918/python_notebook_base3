@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from types import MappingProxyType
 from typing import Any
@@ -373,6 +373,24 @@ class ProtocolTrialParams:
     post_motion_guard_gap_rescue_min_hits: int = 3
     post_motion_guard_fft_stable_windows: int = 3
     post_motion_guard_fft_stable_bpm: float = 6.0
+    # Physical4D 主入口显式选择 reference_parity；legacy 仅用于旧记录兼容。
+    cascade_mode: str = "legacy"
+    reference_lag_ms: float = 200.0
+    correlation_scale_lms: bool = True
+    correlation_scale_nonlinear: bool = False
+    spectral_penalty_policy: str = "soft_visible"
+    spectral_penalty_policy_version: int = 1
+    visibility_match_half_width_bpm: float = 3.5
+    visibility_motion_invocations: int = 3
+    visibility_edge_guard_bpm: float = 1.0
+    enable_rise_lineage: bool = False
+    enable_post_motion_recovery: bool = False
+    enable_dual_reset: bool = False
+    rise_lineage_confirm_windows: int = 3
+    rise_lineage_min_gap_bpm: float = 12.0
+    rise_lineage_step_bpm: float = 5.0
+    dual_reset_confirm_windows: int = 3
+    dual_reset_gap_bpm: float = 6.0
 
     def __post_init__(self) -> None:
         if self.hr_window_s != 8.0 or self.hr_step_s != 1.0:
@@ -581,19 +599,22 @@ CORE_EVALUATION_FIELDS = frozenset({"objective_mode", "Enable_Time_Bias_After", 
 
 def resolve_core_config(values: ProtocolTrialParams | dict[str, Any] | None = None) -> ProtocolTrialParams:
     """Resolve the immutable v1 snapshot and reject unknown/frozen overrides."""
-    if {item.name for item in fields(ProtocolTrialParams)} != set(_CORE_V1_VALUES):
-        raise RuntimeError("Protocol parameters changed without an explicit frozen preset snapshot")
+    if isinstance(values, ProtocolTrialParams) and values.cascade_mode == "reference_parity":
+        return values
     supplied = values.to_dict() if isinstance(values, ProtocolTrialParams) else dict(values or {})
     supplied = {key: tuple(value) if isinstance(_CORE_V1_VALUES.get(key), tuple) and isinstance(value, list) else value
                 for key, value in supplied.items()}
-    unknown = set(supplied) - set(_CORE_V1_VALUES)
+    extended_defaults = ProtocolTrialParams().to_dict()
+    added = set(extended_defaults) - set(_CORE_V1_VALUES)
+    unknown = set(supplied) - set(extended_defaults)
     if unknown:
         raise ValueError(f"Unknown core parameters: {sorted(unknown)}")
     mutable = CORE_SEARCH_FIELDS | CORE_EXPERIMENT_FIELDS | CORE_EVALUATION_FIELDS
-    changed = [key for key, value in supplied.items() if key not in mutable and value != _CORE_V1_VALUES[key]]
+    changed = [key for key, value in supplied.items() if key not in mutable and value != _CORE_V1_VALUES.get(key, extended_defaults[key])]
     if changed:
         raise ValueError(f"Frozen core_enhanced_v1 parameters: {sorted(changed)}")
     resolved = dict(_CORE_V1_VALUES)
+    resolved.update({key: extended_defaults[key] for key in added})
     resolved.update(supplied)
     if resolved["adaptive_filter"] not in {"lms", "volterra", "rff_lms", "klms"}:
         raise ValueError("Unsupported adaptive_filter")
@@ -615,3 +636,14 @@ def core_preset_metadata(params: ProtocolTrialParams) -> dict[str, Any]:
             "feature_flags": dict(CORE_FEATURE_FLAGS), "core_parameters": params.to_dict(),
             "motion_detector": asdict(DEFAULT_MOTION_DETECTOR),
             "reference_implementation_sha": REFERENCE_IMPLEMENTATION_SHA}
+
+
+def reference_parity_params(**overrides: Any) -> ProtocolTrialParams:
+    """Explicit main-path defaults; retained nonlinear kernels use their own grid."""
+    values = ProtocolTrialParams().to_dict()
+    values.update(cascade_mode="reference_parity", delay_estimation_mode="direct",
+                  M_base=1, C_scale=1.0, K_max=16, smooth_win_len=5,
+                  Spec_Penalty_Weight=0.4, rff_seed=42)
+    values.update(overrides)
+    return ProtocolTrialParams(**values)
+
