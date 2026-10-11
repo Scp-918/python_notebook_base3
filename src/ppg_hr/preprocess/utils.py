@@ -73,7 +73,7 @@ def _rolling_median_centered(values: pd.Series, window: int) -> pd.Series:
 
 
 def filloutliers_movmedian_linear(
-    x: np.ndarray, window: int, threshold: float = 3.0
+    x: np.ndarray, window: int, threshold: float = 3.0, mad_scale: float = 1.4826
 ) -> np.ndarray:
     """Detect outliers via local 3 × scaled MAD over moving median, fill with linear interp.
 
@@ -87,7 +87,7 @@ def filloutliers_movmedian_linear(
     s = pd.Series(arr)
     med = _rolling_median_centered(s, window).to_numpy()
     abs_dev = pd.Series(np.abs(arr - med))
-    mad = _rolling_median_centered(abs_dev, window).to_numpy() * 1.4826
+    mad = _rolling_median_centered(abs_dev, window).to_numpy() * mad_scale
     is_outlier = np.zeros(n, dtype=bool)
     valid_scale = mad > 0
     is_outlier[valid_scale] = np.abs(arr[valid_scale] - med[valid_scale]) > (

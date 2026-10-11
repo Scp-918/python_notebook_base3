@@ -6,6 +6,7 @@
 """
 
 from __future__ import annotations
+from .numerical_config import NUMERICS
 
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -134,7 +135,7 @@ def noncausal_lms_filter(
     span = X.shape[1]
     w = np.zeros(span, dtype=float)
     mu = float(mu)
-    eps = 1e-9
+    eps = NUMERICS.get().lms_nlms_eps
     weight_norm_t: list[float] = []
     max_abs_weight_t: list[float] = []
     # 中文注释：tap 矩阵已一次性构造；权重更新仍按时间递推，保持 NLMS 语义不变。
@@ -167,6 +168,6 @@ def _zscore(x: np.ndarray) -> np.ndarray:
     arr = arr.copy()
     arr[~np.isfinite(arr)] = 0.0
     sd = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
-    if not np.isfinite(sd) or sd <= 1e-12:
+    if not np.isfinite(sd) or sd <= NUMERICS.get().input_zscore_std_eps:
         return arr - float(np.mean(arr))
     return (arr - float(np.mean(arr))) / sd

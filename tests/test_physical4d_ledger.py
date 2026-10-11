@@ -23,6 +23,11 @@ def test_three_hundred_transactional_cells_and_missing_only_resume(tmp_path):
     assert len(calls) == 301
     assert len(ledger.connection.execute('select * from attempt_events').fetchall()) == 1
     assert len(coordinates('lms')) == 300
+    import json
+    audit = json.loads(ledger.cells('S01_run_1')[0]['parameters_json'])
+    assert audit['fixed_config'] == ledger.config
+    assert audit['coordinate'] == coordinates('lms')[0]
+    assert audit['effective_trial']['Fs_Target'] == 25
     from ppg_hr.experimental.physical4d_export import export_sample_grid, rebuild_summaries
     import pandas as pd
     path = export_sample_grid(ledger, 'S01_run_1')

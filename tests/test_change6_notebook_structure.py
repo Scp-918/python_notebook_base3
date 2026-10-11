@@ -1,268 +1,56 @@
-from __future__ import annotations
-
-import importlib.util
-import re
 from pathlib import Path
-
+import importlib.util
 import nbformat
-import pytest
-
 
 NOTEBOOK_PATH = Path("notebooks/run_batch_adaptive_protocol.ipynb")
 
 
-def _notebook() -> nbformat.NotebookNode:
-    return nbformat.read(NOTEBOOK_PATH, as_version=4)
-
-
-def _sources(kind: str) -> list[str]:
-    return [str(cell.source) for cell in _notebook().cells if cell.cell_type == kind]
-
-
-def test_notebook_restores_sections_zero_through_nine() -> None:
-    markdown = _sources("markdown")
-    headings = [line for source in markdown for line in source.splitlines() if line.startswith("## ")]
-
-    for section in range(10):
-        assert any(line.startswith(f"## {section}.") for line in headings), section
-
-    joined = "\n".join(_sources("code"))
-    for call in (
-        "plot_rest_alignment_diagnostics_by_motion_type(",
-        "plot_unaligned_fullfield_ppg_hr_by_motion_type(",
-        "plot_raw_ppg_and_unaligned_hr_by_motion_type(",
-        "run_batch_adaptive_protocol(",
-    ):
+def test_physical4d_sections_and_snapshot_replay_contract():
+    notebook = nbformat.read(NOTEBOOK_PATH, as_version=4)
+    headings = [str(c.source).splitlines()[0] for c in notebook.cells if c.cell_type == "markdown"]
+    for number in range(17):
+        assert any(h.startswith(f"## {number}.") for h in headings)
+    joined = "\n".join(str(c.source) for c in notebook.cells if c.cell_type == "code")
+    for call in ("run_physical4d(","resolve_replay_spec(","replay_sample(","replay_batch(",
+                 "rebuild_summaries(","replay_reference_experiment(","replay_reference_batch("):
         assert call in joined
-    assert "84 \u6a21\u5f0f" not in joined
+    assert "run_batch_adaptive_protocol(" not in joined
+    assert "reference_parity_params(" in joined
+    assert "REPLAY_EFFECTIVE_PARAMS = REPLAY_SPEC.params" in joined
+    assert "DIAGNOSTIC_PARAMS = REPLAY_SPEC.params" in joined
+    assert "selection_callback=" in joined
 
 
-def test_notebook_has_layered_protocol_configuration() -> None:
-    code = _sources("code")
-    first = code[0]
-    joined = "\n".join(code)
-
-    assert "build_subject_output_dir(" in first
-    assert "OUTPUT_ROOT = SUBJECT_DIR.parent / \"outputs\"" in first
-    assert "RUN_OUTPUT_DIR = build_subject_output_dir(" in first
-    assert 'UD_CALCULATION_MODE = "smoothed"' in first
-    assert "UD_SMOOTHING_WINDOW_S = 0.1" in first
-    for name in (
-        "FS_ORIGIN",
-        "prewarm_s",
-        "NORMALIZATION_MODE",
-        "QC_POLICY",
-        "DELAY_ESTIMATION_MODE",
-        "EVALUATION_WINDOW_S",
-        "PPG_INPUT_TRANSFORM",
-        "TRAIN_HR_POSTPROCESS_METHOD",
-        "SEARCH_SPACE",
-        "TRIAL_PARAM_OVERRIDES",
-        "CLEAN_OUTPUTS",
-    ):
-        assert name in joined
-
-    for flag in (
-        "RUN_ALIGNMENT_DIAGNOSTICS",
-        "RUN_FULLFIELD_PLOT",
-        "RUN_RAW_PPG_PLOT",
-        "RUN_ALL_TRAIN",
-        "RUN_CONNECTIVITY_CHECK",
-    ):
-        assert f"{flag} = False" in joined
-
-
-def test_trial_overrides_do_not_freeze_optuna_search_fields() -> None:
-    override_cell = next(source for source in _sources("code") if "TRIAL_PARAM_OVERRIDES =" in source)
-    for searched_name in (
-        "Fs_Target",
-        "LMS_Mu_Base",
-        "Rest_HR_Track_Band_BPM",
-        "Rest_HR_Slew_Limit_BPM",
-        "Rest_HR_Slew_Step_BPM",
-        "alpha_u",
-        "M2",
-        "rff_D",
-        "rff_sigma_scale",
-        "klms_step_size",
-        "klms_sigma",
-        "klms_epsilon",
-    ):
-        assert f'"{searched_name}":' not in override_cell
-
-
-def test_notebook_documents_cell_risk_and_compiles_zero_through_nine() -> None:
-    notebook = _notebook()
-    code_cells = [cell for cell in notebook.cells if cell.cell_type == "code"]
-    joined = "\n".join(str(cell.source) for cell in code_cells)
-
-    assert joined.count("# \u7528\u9014：") >= 10
-    assert "# \u662f\u5426\u5199\u6587\u4ef6：" in joined
-    assert "# \u8017\u65f6\u98ce\u9669：" in joined
-    assert "multi_tiaosheng" not in joined
-    assert "D:\\" not in joined
-    for index, cell in enumerate(code_cells):
-        compile(str(cell.source), f"{NOTEBOOK_PATH.name}:cell-{index}", "exec")
-
-
-def test_notebook_restores_replay_diagnostics_sections_ten_through_fifteen() -> None:
-    markdown = _sources("markdown")
-    headings = [line for source in markdown for line in source.splitlines() if line.startswith("## ")]
-    joined = "\n".join(_sources("code"))
-
-    for section in range(10, 16):
-        assert any(line.startswith(f"## {section}.") for line in headings), section
-    assert joined.count("replay_best_record_hr_curves(") >= 2
-    assert joined.count("plot_window_diagnostics_from_records(") >= 2
-    assert "build_cross_motion_summary_table(" in joined
-    assert "run_batch_reference_compare(" in joined
-
-
-def test_notebook_adds_subject_batch_target_redraw_section_and_mode_progress() -> None:
-    markdown = _sources("markdown")
-    headings = [line for source in markdown for line in source.splitlines() if line.startswith("## ")]
-    joined = "\n".join(_sources("code"))
-
-    assert any(line.startswith("## 16.") for line in headings)
-    assert "redraw_subject_target_hr_curves(" in joined
-    assert "progress_callback=notebook_progress" in joined
-    assert "ud_calculation_mode=UD_CALCULATION_MODE" in joined
-    assert "ud_smoothing_window_s=UD_SMOOTHING_WINDOW_S" in joined
-    assert 'info.get("stage") != "optimization_mode_completed"' in joined
-    assert "posthoc_final_aae_bpm" in joined
-    assert "acc_compare_posthoc_aae_bpm" in joined
-    assert 'RUN_BATCH_TARGET_HR_REDRAW = False' in joined
-    assert "BATCH_TARGET_REFERENCE_ORDER_KEY = ReferenceConfig(('ACC',)).reference_order_key" in joined
-    assert 'BATCH_TARGET_OUTPUT_DIR = Path(RESULTS_ROOT) / "batch_target_hr_curves"' in joined
-
-
-def test_replay_uses_subject_pair_selectors_and_run_subdirectories() -> None:
-    joined = "\n".join(_sources("code"))
-
-    assert "def select_subject_pair(" in joined
-    assert 'REPLAY_MOTION_TYPE = "write"' in joined
-    assert "REPLAY_MOTION_INDEX = 1" in joined
-    assert "REPLAY_SIGNAL_CSV" not in joined
-    assert "REPLAY_REF_CSV" not in joined
-    for assignment in (
-        'REPLAY_OUTPUT_DIR = Path(RESULTS_ROOT) / "replay"',
-        'DIAGNOSTIC_OUTPUT_DIR = Path(RESULTS_ROOT) / "window_diagnostics"',
-        'SUMMARY_TABLE_OUTPUT_DIR = Path(RESULTS_ROOT) / "summary_tables"',
-        'CROSS_OUTPUT_DIR = Path(RESULTS_ROOT) / "cross_replay"',
-        'CROSS_DIAGNOSTIC_OUTPUT_DIR = Path(RESULTS_ROOT) / "cross_window_diagnostics"',
-        'REFERENCE_COMPARE_OUTPUT_DIR = Path(RESULTS_ROOT) / "batch_reference_compare"',
-        'BATCH_TARGET_OUTPUT_DIR = Path(RESULTS_ROOT) / "batch_target_hr_curves"',
-    ):
-        assert assignment in joined
-
-    for flag in (
-        "RUN_STAGE7_REPLAY",
-        "RUN_WINDOW_DIAGNOSTICS",
-        "RUN_CROSS_MOTION_SUMMARY",
-        "RUN_CROSS_STAGE7_REPLAY",
-        "RUN_CROSS_WINDOW_DIAGNOSTICS",
-        "RUN_BATCH_REFERENCE_COMPARE",
-        "RUN_BATCH_TARGET_HR_REDRAW",
-    ):
-        assert f"{flag} = False" in joined
-
-
-def test_notebook_generator_matches_tracked_sources() -> None:
-    script_path = Path("scripts/update_change6_notebook.py")
-    spec = importlib.util.spec_from_file_location("update_change6_notebook", script_path)
-    assert spec is not None and spec.loader is not None
+def test_generator_matches_and_cells_are_clean():
+    spec = importlib.util.spec_from_file_location("generator", "scripts/update_change6_notebook.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-
     generated = module.build_notebook()
-    tracked = _notebook()
-    assert generated.metadata == tracked.metadata
-    assert [(cell.cell_type, str(cell.source)) for cell in generated.cells] == [
-        (cell.cell_type, str(cell.source)) for cell in tracked.cells
-    ]
-
-
-def test_section_two_documents_every_preview_parameter() -> None:
-    notebook = _notebook()
-    heading_index = next(
-        index
-        for index, cell in enumerate(notebook.cells)
-        if cell.cell_type == "markdown" and str(cell.source).startswith("## 2.")
-    )
-    markdown_source = str(notebook.cells[heading_index].source)
-    code_source = str(notebook.cells[heading_index + 1].source)
-
-    for name in (
-        "RUN_PREPROCESS_PREVIEW",
-        "PREVIEW_MOTION_TYPE",
-        "PREVIEW_MOTION_INDEX",
-        "FS_ORIGIN",
-        "hr_window_s",
-        "SUBJECT_DIR",
-        "calibration",
-    ):
-        assert f"`{name}`" in markdown_source
-        assert f"# {name}:" in code_source
-    assert "write/gripper/run/rope" in markdown_source
-    assert "100 Hz" in markdown_source
-    assert "Optuna" in markdown_source
-
-
-def test_layered_config_cells_two_three_four_have_inline_parameter_comments() -> None:
-    config_cells = _sources("code")[1:4]
-    configurable_line = re.compile(
-        r'^\s*(?:[A-Z][A-Z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?\s*=|"[A-Za-z_][A-Za-z0-9_]*"\s*:)'
-    )
-
-    missing: list[str] = []
-    for cell_number, source in enumerate(config_cells, start=2):
-        for line_number, line in enumerate(source.splitlines(), start=1):
-            if configurable_line.match(line) and "#" not in line:
-                missing.append(f"cell {cell_number}, line {line_number}: {line.strip()}")
-
-    assert not missing, "\n".join(missing)
-
-
-def test_notebook_uses_frozen_preset_and_four_dimensional_grid() -> None:
-    joined = "\n".join(_sources("code"))
-    assert "resolve_core_config(" in joined
-    assert "PRESET_METADATA = core_preset_metadata(" in joined
-    assert "SEARCH_SPACE = default_protocol_search_space()" in joined
-    assert "ENABLE_LOW_LOCK_RECOVERY = True" not in joined
-    assert "ENABLE_HIGH_LOCK_RECOVERY = True" not in joined
-    assert "SEARCH_SPACE.Rest_HR_Track_Band_BPM" not in joined
-
-
-def test_readme_documents_scope_and_frozen_handoff() -> None:
-    readme = Path("notebooks/readme.md").read_text(encoding="utf-8")
-
-    assert "core_enhanced_v1" in readme
-    assert "motion_post10" in readme
-    assert "reset-FFT" in readme
-
-
-def test_notebook_safe_defaults_execute_without_creating_outputs(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    missing_subject = tmp_path / "total_data" / "subject_not_present"
-    monkeypatch.setenv("PPG_SUBJECT_DIR", str(missing_subject))
-    namespace: dict[str, object] = {"__name__": "__notebook_smoke__"}
-
-    for index, cell in enumerate(_notebook().cells):
+    tracked = nbformat.read(NOTEBOOK_PATH, as_version=4)
+    assert [(c.cell_type,c.source) for c in generated.cells] == [(c.cell_type,c.source) for c in tracked.cells]
+    for i, cell in enumerate(tracked.cells):
         if cell.cell_type == "code":
-            exec(compile(str(cell.source), f"safe-smoke-cell-{index}", "exec"), namespace)
+            assert not cell.outputs and cell.execution_count is None
+            compile(cell.source, f"cell-{i}", "exec")
+            assert "D:\\" not in cell.source
 
-    assert not (missing_subject.parent / "outputs").exists()
-    for name in (
-        "RUN_ALL_TRAIN",
-        "RUN_CONNECTIVITY_CHECK",
-        "RUN_STAGE7_REPLAY",
-        "RUN_WINDOW_DIAGNOSTICS",
-        "RUN_CROSS_MOTION_SUMMARY",
-        "RUN_CROSS_STAGE7_REPLAY",
-        "RUN_CROSS_WINDOW_DIAGNOSTICS",
-        "RUN_BATCH_REFERENCE_COMPARE",
-        "RUN_BATCH_TARGET_HR_REDRAW",
-    ):
-        assert namespace[name] is False
+
+def test_all_disabled_notebook_executes_without_results_or_subject(tmp_path, monkeypatch):
+    absent = tmp_path / "absent" / "S01"
+    monkeypatch.setenv("PPG_SUBJECT_DIR", str(absent))
+    namespace = {"__name__":"__notebook_smoke__"}
+    for i, cell in enumerate(nbformat.read(NOTEBOOK_PATH,as_version=4).cells):
+        if cell.cell_type == "code":
+            exec(compile(cell.source,f"cell-{i}","exec"),namespace)
+    assert all(value is False for key,value in namespace.items() if key.startswith("RUN_"))
+    assert not absent.parent.exists()
+
+
+def test_fixed_parameters_have_catalog_and_policy_explanation():
+    notebook = nbformat.read(NOTEBOOK_PATH,as_version=4)
+    markdown = "\n".join(c.source for c in notebook.cells if c.cell_type == "markdown")
+    for text in ("fixed_hyperparameters.json", "suppressed_protected_continuous_visibility",
+                 "soft_visible", "Tdelay_s", "posthoc_bias_s", "1e-6", "rff_seed", "启用条件"):
+        assert text in markdown
+    readme = Path("notebooks/readme.md").read_text(encoding="utf-8")
+    assert "motion_post10" in readme and "SQLite" in readme and "reset-FFT" in readme

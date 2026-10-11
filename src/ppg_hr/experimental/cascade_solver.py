@@ -6,6 +6,7 @@ Fmove、逐窗归一化、包络时延、级联自适应滤波、频谱惩罚提
 """
 
 from __future__ import annotations
+from .numerical_config import NUMERICS, with_numerics
 
 import json
 from dataclasses import dataclass, field, replace
@@ -147,6 +148,7 @@ class _WindowRunPayload:
     metric_arrays: MetricArrays
 
 
+@with_numerics
 def run_protocol_trial(
     dataset: ProtocolDataset,
     reference_groups_order: ReferenceConfig | tuple[str, ...],
@@ -183,6 +185,8 @@ def run_protocol_trial(
         if sample_context.sample_id != dataset.sample_stem:
             raise ValueError("Sample context identity differs")
         sensor._sample_context = sample_context
+    else:
+        sensor._sample_context = None
     tdelay = sample_context.Tdelay_s if sample_context is not None else 0.0
 
     try:
@@ -475,7 +479,7 @@ def _attach_time_bias_after_metrics(
         np.asarray(dataset.ref_hr_bpm, dtype=float),
         search_range_s=(float(search_range[0]), float(search_range[1])),
         search_step_s=float(getattr(params, "Time_Bias_After_Step_S", 1.0)),
-        min_valid=2,
+        min_valid=NUMERICS.get().posthoc_min_valid_windows,
         mode=str(getattr(params, "Time_Bias_After_Mode", "posthoc_oracle_alignment")),
     )
     bias = float(result.time_bias_after_s)
@@ -643,6 +647,7 @@ def _sensor_base_cache_key(dataset: ProtocolDataset, params: ProtocolTrialParams
         params.log_absorbance_baseline_window_s, params.log_absorbance_eps,
         params.log_absorbance_ratio_clip,
         getattr(getattr(dataset, "_sample_context", None), "preparation_identity", None),
+        tuple(vars(NUMERICS.get()).items()),
     )
 
 
@@ -691,6 +696,8 @@ def clear_trial_heavy_caches(dataset: ProtocolDataset) -> None:
 
 def clear_all_caches(dataset: ProtocolDataset) -> None:
     """Clear all dataset-level caches created by this module."""
+    from .rff_lms import get_rff_weights
+    get_rff_weights.cache_clear()
 
     view = getattr(dataset, "_sensor_view", None)
     if view is not None:
@@ -791,6 +798,7 @@ def _run_windows(
         fft_offset_idx = int(norm_cache.fft_offset_idx[row_idx])
         center_s = float(norm_cache.center_s[row_idx])
         fft_start_s = float(norm_cache.start_s[row_idx])
+        collect_this_window = collect_stages and (diagnostic_window_indices is None or int(window_idx) in diagnostic_window_indices)
         fft_end_s = fft_start_s + float(params.hr_window_s)
         adaptive_start_s = fft_start_s - float(getattr(params, "prewarm_s", 0.0))
         adaptive_source_start_s = float(adaptive_source_start_idx) / float(fs)
@@ -821,6 +829,7 @@ def _run_windows(
             tracking_state=baseline_tracking_state,
             window_kind=label,
             path="baseline",
+            collect_spectrum=collect_this_window,
         )
         baseline_hr = float(baseline_post["hr_bpm"])
         if params.enable_dual_reset:
@@ -829,6 +838,8 @@ def _run_windows(
             from scipy.signal import find_peaks
             peaks, _ = find_peaks(amp)
             peaks = peaks[amp[peaks] > np.max(amp) * params.full_candidate_peak_threshold_ratio] if amp.size else peaks
+            lo, hi = NUMERICS.get().dual_reset_raw_band_hz
+            peaks = peaks[(freq[peaks] >= lo) & (freq[peaks] <= hi)]
             raw_candidates.append(RawFftCandidateFrame(freq, amp, peaks,
                                   peaks[np.argsort(-amp[peaks], kind="stable")]))
         prev_baseline = baseline_hr if np.isfinite(baseline_hr) else prev_baseline
@@ -852,6 +863,7 @@ def _run_windows(
                 tracking_state=reset_fft_tracking_state,
                 window_kind=label,
                 path="fft_post_motion_reset",
+                collect_spectrum=collect_this_window,
             )
             reset_fft_hr = float(reset_fft_post["hr_bpm"])
             if np.isfinite(reset_fft_hr):
@@ -892,6 +904,7 @@ def _run_windows(
                 tracking_state=adaptive_tracking_state,
                 window_kind=label,
                 path="adaptive",
+                collect_spectrum=collect_this_window,
             )
             adaptive_hr = float(adaptive_post["hr_bpm"])
         else:
@@ -1304,176 +1317,176 @@ def _cascade_filter_window(
     current = np.asarray(window['ppg_green'], dtype=float)
     stages: list[dict[str, Any]] = []
     for sensor_type, channel, delay in channel_plan:
-            design = parity_design(ranking[0], delay, sensor_type, params, fs) if parity else map_delay_to_lms_params(delay, sensor_type, params, fs)
-            filter_type = str(getattr(params, "adaptive_filter", "lms"))
-            stage_extra: dict[str, Any] = {}
-            stage_diagnostics: dict[str, Any] = {}
-            stage_mu = float(design.u)
-            before_stage = np.asarray(current, dtype=float).copy()
-            if filter_type == "lms":
-                lms_result = noncausal_lms_filter(
-                    window[channel],
-                    current,
-                    M=design.M,
-                    K=design.K,
-                    mu=design.u,
-                    return_diagnostics=bool(collect_stages),
-                )
-                if collect_stages:
-                    current, stage_diagnostics = lms_result
-                else:
-                    current = lms_result
-            elif filter_type == "volterra":
-                alpha_u = float(getattr(params, "alpha_u", 0.1))
-                M2 = int(getattr(params, "M2", 3))
-                volterra_result = noncausal_volterra_filter(
-                    window[channel],
-                    current,
-                    M=design.M,
-                    K=design.K,
-                    mu1=design.u,
-                    alpha_u=alpha_u,
-                    M2=M2,
-                    mu_min=float(getattr(params, "LMS_Mu_Min", 1e-6)),
-                    return_diagnostics=bool(collect_stages),
-                )
-                if collect_stages:
-                    current, stage_diagnostics = volterra_result
-                else:
-                    current = volterra_result
-                stage_extra.update(
-                    {
-                        "alpha_u": alpha_u,
-                        "M2": M2,
-                        "mu1": float(design.u),
-                        "mu2": float(alpha_u * design.u),
-                    }
-                )
-            elif filter_type == "rff_lms":
-                rff_D = int(getattr(params, "rff_D", 100))
-                rff_sigma_scale = float(params.rff_sigma_scale)
-                rff_seed = int(getattr(params, "rff_seed", 0))
-                rff_update_mode = str(getattr(params, "rff_update_mode", "nlms"))
-                rff_nlms_eps = float(getattr(params, "rff_nlms_eps", 1e-9))
-                rff_leakage = float(getattr(params, "rff_leakage", 0.0))
-                rff_err_clip = getattr(params, "rff_err_clip", None)
-                rff_theta_norm_guard = getattr(params, "rff_theta_norm_guard", None)
-                rff_result = noncausal_rff_lms_filter(
-                    window[channel],
-                    current,
-                    M=design.M,
-                    K=design.K,
-                    mu=design.u,
-                    D=rff_D,
-                    sigma=rff_sigma_scale,  # Generic API argument; adaptive width is derived from taps.
-                    sigma_scale=rff_sigma_scale,
-                    rff_seed=rff_seed,
-                    mu_min=float(getattr(params, "LMS_Mu_Min", 1e-6)),
-                    update_mode=rff_update_mode,
-                    nlms_eps=rff_nlms_eps,
-                    leakage=rff_leakage,
-                    err_clip=rff_err_clip,
-                    theta_norm_guard=rff_theta_norm_guard,
-                    return_diagnostics=bool(collect_stages),
-                )
-                if collect_stages:
-                    current, stage_diagnostics = rff_result
-                else:
-                    current = rff_result
-                stage_extra.update(
-                    {
-                        "D": rff_D,
-                        "rff_sigma_scale": rff_sigma_scale,
-                        "rff_seed": rff_seed,
-                        "update_mode": rff_update_mode,
-                        "nlms_eps": rff_nlms_eps,
-                        "leakage": rff_leakage,
-                        "err_clip": rff_err_clip,
-                        "theta_norm_guard": rff_theta_norm_guard,
-                    }
-                )
-            elif filter_type == "klms":
-                klms_step_size = float(getattr(params, "klms_step_size", 0.05))
-                klms_sigma = float(getattr(params, "klms_sigma", 1.0))
-                klms_epsilon = float(getattr(params, "klms_epsilon", 0.1))
-                klms_max_dictionary_size = int(getattr(params, "klms_max_dictionary_size", 300))
-                klms_center_prune_policy = str(getattr(params, "klms_center_prune_policy", "freeze_new_centers"))
-                klms_distance_mode = str(getattr(params, "klms_distance_mode", "normalized"))
-                klms_normalized_update = bool(getattr(params, "klms_normalized_update", True))
-                klms_nlms_eps = float(getattr(params, "klms_nlms_eps", 1e-6))
-                stage_mu = design.u if parity else klms_step_size
-                klms_result = noncausal_klms_filter(
-                    window[channel],
-                    current,
-                    M=design.M,
-                    K=design.K,
-                    step_size=stage_mu,
-                    sigma=klms_sigma,
-                    epsilon=klms_epsilon,
-                    max_dictionary_size=klms_max_dictionary_size,
-                    center_prune_policy=klms_center_prune_policy,
-                    distance_mode=klms_distance_mode,
-                    normalized_update=klms_normalized_update,
-                    nlms_eps=klms_nlms_eps,
-                    return_diagnostics=bool(collect_stages),
-                )
-                if collect_stages:
-                    current, stage_diagnostics = klms_result
-                else:
-                    current = klms_result
-                stage_extra.update(
-                    {
-                        "klms_step_size": klms_step_size,
-                        "sigma": klms_sigma,
-                        "epsilon": klms_epsilon,
-                        "max_dictionary_size": klms_max_dictionary_size,
-                        "center_prune_policy": klms_center_prune_policy,
-                        "distance_mode": klms_distance_mode,
-                        "normalized_update": klms_normalized_update,
-                        "nlms_eps": klms_nlms_eps,
-                    }
-                )
+        design = parity_design(ranking[0], delay, sensor_type, params, fs) if parity else map_delay_to_lms_params(delay, sensor_type, params, fs)
+        filter_type = str(getattr(params, "adaptive_filter", "lms"))
+        stage_extra: dict[str, Any] = {}
+        stage_diagnostics: dict[str, Any] = {}
+        stage_mu = float(design.u)
+        before_stage = np.asarray(current, dtype=float).copy()
+        if filter_type == "lms":
+            lms_result = noncausal_lms_filter(
+                window[channel],
+                current,
+                M=design.M,
+                K=design.K,
+                mu=design.u,
+                return_diagnostics=bool(collect_stages),
+            )
+            if collect_stages:
+                current, stage_diagnostics = lms_result
             else:
-                raise ValueError(f"Unsupported adaptive_filter: {filter_type}")
-
-            full_stage_output = np.asarray(current, dtype=float).copy()
-            current, guard_record = _evaluate_cascade_rms_guard(before_stage, current, params)
-            stage_extra.update(guard_record)
+                current = lms_result
+        elif filter_type == "volterra":
+            alpha_u = float(getattr(params, "alpha_u", 0.1))
+            M2 = int(getattr(params, "M2", 3))
+            volterra_result = noncausal_volterra_filter(
+                window[channel],
+                current,
+                M=design.M,
+                K=design.K,
+                mu1=design.u,
+                alpha_u=alpha_u,
+                M2=M2,
+                mu_min=float(getattr(params, "LMS_Mu_Min", 1e-6)),
+                return_diagnostics=bool(collect_stages),
+            )
             if collect_stages:
-                stage_extra.update(_compact_stage_diagnostics(stage_diagnostics))
-                stage_extra["cascade_full_output_signal"] = full_stage_output.round(8).tolist()
-                stage_extra["cascade_guarded_output_signal"] = np.asarray(current, dtype=float).round(8).tolist()
-
+                current, stage_diagnostics = volterra_result
+            else:
+                current = volterra_result
+            stage_extra.update(
+                {
+                    "alpha_u": alpha_u,
+                    "M2": M2,
+                    "mu1": float(design.u),
+                    "mu2": float(alpha_u * design.u),
+                }
+            )
+        elif filter_type == "rff_lms":
+            rff_D = int(getattr(params, "rff_D", 100))
+            rff_sigma_scale = float(params.rff_sigma_scale)
+            rff_seed = int(getattr(params, "rff_seed", 0))
+            rff_update_mode = str(getattr(params, "rff_update_mode", "nlms"))
+            rff_nlms_eps = float(getattr(params, "rff_nlms_eps", 1e-9))
+            rff_leakage = float(getattr(params, "rff_leakage", 0.0))
+            rff_err_clip = getattr(params, "rff_err_clip", None)
+            rff_theta_norm_guard = getattr(params, "rff_theta_norm_guard", None)
+            rff_result = noncausal_rff_lms_filter(
+                window[channel],
+                current,
+                M=design.M,
+                K=design.K,
+                mu=design.u,
+                D=rff_D,
+                sigma=rff_sigma_scale,  # Generic API argument; adaptive width is derived from taps.
+                sigma_scale=rff_sigma_scale,
+                rff_seed=rff_seed,
+                mu_min=float(getattr(params, "LMS_Mu_Min", 1e-6)),
+                update_mode=rff_update_mode,
+                nlms_eps=rff_nlms_eps,
+                leakage=rff_leakage,
+                err_clip=rff_err_clip,
+                theta_norm_guard=rff_theta_norm_guard,
+                return_diagnostics=bool(collect_stages),
+            )
             if collect_stages:
-                stages.append(
-                    {
-                        "sensor_type": sensor_type,
-                        "channel": channel,
-                        "selected_channel": channel,
-                        "D_opt_samples": int(delay.D_opt_samples),
-                        "shared_delay_samples": int(ranking[0].D_opt_samples) if parity else None,
-                        "D_opt_seconds": float(delay.D_opt_seconds),
-                        "R_max": float(delay.R_max),
-                        "abs_corr": float(abs(delay.R_max)),
-                        "curr_corr": float(design.curr_corr),
-                        "M": int(design.M),
-                        "K": int(design.K),
-                        "mu": stage_mu,
-                        "filter_type": filter_type,
-                        "mode": design.mode,
-                        "delay_estimation_mode": delay_mode,
-                        "reference_channel_ranking": reference_ranking,
-                        "adaptive_input_samples": int(
-                            adaptive_input_samples if adaptive_input_samples is not None else len(current)
-                        ),
-                        "fft_offset_samples": int(fft_offset_samples),
-                        "fft_input_samples": int(fft_input_samples if fft_input_samples is not None else len(current)),
-                        # 中文说明：collect_stages=True 只用于回放/诊断等完整输出场景；保存
-                        # 每级输出可直接重画某窗口的级联波形，默认批量 Optuna 不收集该字段。
-                        "output_signal": np.asarray(current, dtype=float).round(8).tolist(),
-                        **stage_extra,
-                    }
-                )
+                current, stage_diagnostics = rff_result
+            else:
+                current = rff_result
+            stage_extra.update(
+                {
+                    "D": rff_D,
+                    "rff_sigma_scale": rff_sigma_scale,
+                    "rff_seed": rff_seed,
+                    "update_mode": rff_update_mode,
+                    "nlms_eps": rff_nlms_eps,
+                    "leakage": rff_leakage,
+                    "err_clip": rff_err_clip,
+                    "theta_norm_guard": rff_theta_norm_guard,
+                }
+            )
+        elif filter_type == "klms":
+            klms_step_size = float(getattr(params, "klms_step_size", 0.05))
+            klms_sigma = float(getattr(params, "klms_sigma", 1.0))
+            klms_epsilon = float(getattr(params, "klms_epsilon", 0.1))
+            klms_max_dictionary_size = int(getattr(params, "klms_max_dictionary_size", 300))
+            klms_center_prune_policy = str(getattr(params, "klms_center_prune_policy", "freeze_new_centers"))
+            klms_distance_mode = str(getattr(params, "klms_distance_mode", "normalized"))
+            klms_normalized_update = bool(getattr(params, "klms_normalized_update", True))
+            klms_nlms_eps = float(getattr(params, "klms_nlms_eps", 1e-6))
+            stage_mu = design.u if parity else klms_step_size
+            klms_result = noncausal_klms_filter(
+                window[channel],
+                current,
+                M=design.M,
+                K=design.K,
+                step_size=stage_mu,
+                sigma=klms_sigma,
+                epsilon=klms_epsilon,
+                max_dictionary_size=klms_max_dictionary_size,
+                center_prune_policy=klms_center_prune_policy,
+                distance_mode=klms_distance_mode,
+                normalized_update=klms_normalized_update,
+                nlms_eps=klms_nlms_eps,
+                return_diagnostics=bool(collect_stages),
+            )
+            if collect_stages:
+                current, stage_diagnostics = klms_result
+            else:
+                current = klms_result
+            stage_extra.update(
+                {
+                    "klms_step_size": klms_step_size,
+                    "sigma": klms_sigma,
+                    "epsilon": klms_epsilon,
+                    "max_dictionary_size": klms_max_dictionary_size,
+                    "center_prune_policy": klms_center_prune_policy,
+                    "distance_mode": klms_distance_mode,
+                    "normalized_update": klms_normalized_update,
+                    "nlms_eps": klms_nlms_eps,
+                }
+            )
+        else:
+            raise ValueError(f"Unsupported adaptive_filter: {filter_type}")
+
+        full_stage_output = np.asarray(current, dtype=float).copy()
+        current, guard_record = _evaluate_cascade_rms_guard(before_stage, current, params)
+        stage_extra.update(guard_record)
+        if collect_stages:
+            stage_extra.update(_compact_stage_diagnostics(stage_diagnostics, max_points=len(current) if parity else 200))
+            stage_extra["cascade_full_output_signal"] = full_stage_output.round(8).tolist()
+            stage_extra["cascade_guarded_output_signal"] = np.asarray(current, dtype=float).round(8).tolist()
+
+        if collect_stages:
+            stages.append(
+                {
+                    "sensor_type": sensor_type,
+                    "channel": channel,
+                    "selected_channel": channel,
+                    "D_opt_samples": int(delay.D_opt_samples),
+                    "shared_delay_samples": int(ranking[0].D_opt_samples) if parity else None,
+                    "D_opt_seconds": float(delay.D_opt_seconds),
+                    "R_max": float(delay.R_max),
+                    "abs_corr": float(abs(delay.R_max)),
+                    "curr_corr": float(design.curr_corr),
+                    "M": int(design.M),
+                    "K": int(design.K),
+                    "mu": stage_mu,
+                    "filter_type": filter_type,
+                    "mode": design.mode,
+                    "delay_estimation_mode": delay_mode,
+                    "reference_channel_ranking": reference_ranking,
+                    "adaptive_input_samples": int(
+                        adaptive_input_samples if adaptive_input_samples is not None else len(current)
+                    ),
+                    "fft_offset_samples": int(fft_offset_samples),
+                    "fft_input_samples": int(fft_input_samples if fft_input_samples is not None else len(current)),
+                    # 中文说明：collect_stages=True 只用于回放/诊断等完整输出场景；保存
+                    # 每级输出可直接重画某窗口的级联波形，默认批量 Optuna 不收集该字段。
+                    "output_signal": np.asarray(current, dtype=float).round(8).tolist(),
+                    **stage_extra,
+                }
+            )
     if parity:
         penalty_ref_channel = ranking[0].channel
         penalty_ref = window[penalty_ref_channel]
@@ -1659,6 +1672,7 @@ def _extract_hr_result(
     precomputed_spectrum: tuple[np.ndarray,np.ndarray] | None = None,
     tracking_state: SpectrumTrackingState | None = None,
     window_kind: str = "rest", path: str = "adaptive",
+    collect_spectrum: bool = False,
 ) -> dict[str, Any]:
     """Estimate one spectrum and update its path's candidate tracker exactly once."""
     requested = params.postprocess_method
@@ -1688,7 +1702,7 @@ def _extract_hr_result(
     hr, trace = _track_candidate_spectrum(signal,fs,previous_hr,params,
         enable_penalty=enable_penalty,penalty_ref=penalty_ref,precomputed_spectrum=spectrum,
         tracking_state=tracking_state,window_kind=window_kind,path=path,return_trace=True,
-        penalty_evidence_spectrum=fft_evidence)
+        penalty_evidence_spectrum=fft_evidence, collect_spectrum=collect_spectrum)
     return dict(hr_bpm=float(hr),postprocess_method=requested,actual_estimator=actual,
                 postprocess_fallback=fallback,postprocess_reason=reason,candidate_valid=True,
                 candidate_bpm=list(trace.get("candidate_peaks_bpm",())),
@@ -1711,6 +1725,7 @@ def _track_candidate_spectrum(
     path: str = "adaptive",
     return_trace: bool = False,
     penalty_evidence_spectrum: tuple[np.ndarray, np.ndarray] | None = None,
+    collect_spectrum: bool = False,
 ) -> float | tuple[float, dict[str, Any]]:
     """Track FFT or SSR candidates through the common candidate tracker."""
 
@@ -1718,10 +1733,10 @@ def _track_candidate_spectrum(
     penalty_freqs = penalty_amps = None
     if enable_penalty and penalty_ref is not None:
         penalty_freqs, penalty_amps = spectrum_peaks(
-            _spectrum(penalty_ref, fs), params.candidate_peak_threshold_ratio, (0.2, 5.0))
+            _spectrum(penalty_ref, fs), params.candidate_peak_threshold_ratio, NUMERICS.get().penalty_reference_band_hz)
     evidence_peaks, _ = spectrum_peaks(
         penalty_evidence_spectrum if penalty_evidence_spectrum is not None else (freq, amp),
-        params.full_candidate_peak_threshold_ratio, (0.5, 4.0))
+        params.full_candidate_peak_threshold_ratio, NUMERICS.get().candidate_band_hz)
     value, trace_obj = track_spectrum_candidates(
         freq,
         amp,
@@ -1735,8 +1750,12 @@ def _track_candidate_spectrum(
         penalty_peak_amplitudes=penalty_amps,
         penalty_evidence_peaks_hz=evidence_peaks,
         adaptive_filter=str(getattr(params, "adaptive_filter", "lms")),
+        collect_spectrum=collect_spectrum,
     )
     trace = {"tracker_mode": "enhanced", **trace_obj.to_dict()}
+    if collect_spectrum and penalty_ref is not None:
+        ref_freq, ref_amp = _spectrum(penalty_ref, fs)
+        trace["penalty_reference_spectrum"] = dict(frequency_hz=ref_freq.tolist(), amplitude=ref_amp.tolist())
     return (float(value), trace) if return_trace else float(value)
 
 
@@ -1804,12 +1823,12 @@ def _normalise_array(values: np.ndarray, mode: str = "minmax") -> np.ndarray:
         mu = float(np.nanmean(arr))
         sd = float(np.nanstd(arr))
         arr[~finite] = mu
-        if not np.isfinite(sd) or sd <= 1e-12:
+        if not np.isfinite(sd) or sd <= NUMERICS.get().window_normalization_eps:
             return arr - mu
         return (arr - mu) / sd
     mn = float(np.nanmin(arr))
     mx = float(np.nanmax(arr))
-    if mx - mn <= 1e-12:
+    if mx - mn <= NUMERICS.get().window_normalization_eps:
         return np.zeros_like(arr, dtype=float)
     arr[~finite] = mn
     return (arr - mn) / (mx - mn)

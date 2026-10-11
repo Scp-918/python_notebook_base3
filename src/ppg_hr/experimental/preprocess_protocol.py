@@ -700,8 +700,10 @@ def _clean_ppg(values: pd.Series | np.ndarray, fs: int) -> np.ndarray:
     """Clean PPG missing values and short spikes with existing utilities."""
 
     arr = _clean_numeric(values)
-    window = max(3, round(fs * _PREPROCESSING.get().outlier_window_s))
-    return filloutliers_movmedian_linear(arr, window=window)
+    controls = _PREPROCESSING.get()
+    window = max(controls.outlier_minimum_samples, round(fs * controls.outlier_window_s))
+    return filloutliers_movmedian_linear(arr, window=window,
+        threshold=controls.outlier_threshold, mad_scale=controls.outlier_mad_scale)
 
 
 def _clean_ppg_source(dataset: ProtocolDataset, field: str) -> np.ndarray:
@@ -743,7 +745,7 @@ def _log_absorbance_bandpass(
     ratio = np.clip(arr / baseline, lo, hi)
     log_abs = -np.log(ratio)
     log_abs[~np.isfinite(log_abs)] = 0.0
-    return _safe_bandpass(log_abs, int(fs), 0.5, 5.0)
+    return _safe_bandpass(log_abs, int(fs), *_PREPROCESSING.get().ppg_band_hz)
 
 
 def _estimate_log_absorbance_baseline(

@@ -8,7 +8,7 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 from ppg_hr.params import ProtocolTrialParams, PreprocessingParams
-from .physical4d import canonical_json, identity, trial_from_snapshot
+from .physical4d import canonical_json, identity, trial_from_snapshot, effective_parameter_audit
 from .physical4d_run import RunLedger, file_identity, json_safe, result_metrics
 from .physical4d_export import best_cell
 from .sample_context import SampleContext
@@ -73,7 +73,7 @@ def resolve_replay_spec(root: Path, sample_id: str, coordinate_id: str = 'best_p
         if coordinate != canonical:
             raise ValueError('SQLite coordinate differs from manifest')
         params = trial_from_snapshot(ledger.config, coordinate)
-        if canonical_json(params.to_dict()) != cell['parameters_json']:
+        if canonical_json(effective_parameter_audit(ledger.config, coordinate)) != cell['parameters_json']:
             raise ValueError('Effective parameters differ from cell audit snapshot')
         if cell['fixed_config_hash'] != ledger.manifest['fixed_config_hash']:
             raise ValueError('Cell fixed configuration hash differs')
@@ -147,13 +147,15 @@ def compare_metrics(expected: dict, actual: dict, tolerance: float) -> dict[str,
     return differences
 
 
-def _valid_receipt(spec: ReplaySpec, directory: Path) -> dict | None:
+def _valid_receipt(spec: ReplaySpec, directory: Path, plot_range_s=None) -> dict | None:
     path = directory / 'receipt.json'
     if not path.is_file():
         return None
     try:
         receipt = json.loads(path.read_text(encoding='utf-8'))
         if receipt.get('identity') != spec.identity or receipt.get('status') != 'verified':
+            return None
+        if receipt.get('plot_range_s') != (list(plot_range_s) if plot_range_s is not None else None):
             return None
         required = {'hr.png', 'windows.csv', 'metrics.json'}
         if set(receipt.get('files', {})) != required:
@@ -172,10 +174,13 @@ def _write_hr_plot(path: Path, result, spec: ReplaySpec, *, plot_range_s=None):
     import matplotlib.pyplot as plt
     arrays = result.metric_arrays
     time = arrays['time_s']
+    metrics = result_metrics(result, spec.fixed_config)
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
     for ax, ref_key, aae, acc, title in (
-        (axes[0], 'ref_hr_bpm', result.final_aae_bpm, result.final_acc_pct, 'Tdelay'),
-        (axes[1], 'ref_hr_after_bpm', result.posthoc_final_aae_bpm, result.posthoc_final_acc_pct, 'saved posthoc')):
+        (axes[0], 'ref_hr_bpm', metrics['tdelay_aae_bpm'], metrics['tdelay_accuracy_pct'], 'Tdelay'),
+        (axes[1], 'ref_hr_after_bpm', metrics['posthoc_aae_bpm'], metrics['posthoc_accuracy_pct'], 'posthoc')):
+        aae = float('nan') if aae is None else aae
+        acc = float('nan') if acc is None else acc
         ax.plot(time, arrays['final_hr_bpm'], label='Final')
         ax.plot(time, arrays['baseline_hr_bpm'], label='Baseline', alpha=.5)
         if ref_key in arrays:
@@ -208,7 +213,9 @@ def execute_replay(spec: ReplaySpec, dataset, *, diagnostic_start_s: float | Non
     result = run_protocol_trial(dataset, references or spec.references, spec.scope, spec.params,
         collect_frame=True, collect_stages=selected is not None, sample_context=spec.context,
         posthoc_mode=posthoc_mode, saved_posthoc_bias_s=spec.posthoc_bias_s,
-        diagnostic_window_indices=selected)
+        diagnostic_window_indices=selected, numerical_config=spec.fixed_config['numerical'])
+    if not result.success:
+        raise RuntimeError(result.reason)
     return result, actual_start
 
 
@@ -222,7 +229,7 @@ def replay_sample(spec: ReplaySpec, *, directory_mapping=None, dataset_loader: C
     dataset = None
     try:
         verify_inputs(spec, directory_mapping)
-        cached = _valid_receipt(spec, directory) if use_cache and diagnostic_start_s is None else None
+        cached = _valid_receipt(spec, directory, plot_range_s) if use_cache and diagnostic_start_s is None else None
         if cached:
             return dict(sample_id=spec.sample_id, coordinate_id=spec.coordinate['coordinate_id'], status='cached_verified',
                         **cached['actual_metrics'])
@@ -247,6 +254,7 @@ def replay_sample(spec: ReplaySpec, *, directory_mapping=None, dataset_loader: C
                 Tdelay_s=spec.context.Tdelay_s, posthoc_bias_s=spec.posthoc_bias_s,
                 parameters=spec.params.to_dict(), actual_metrics=actual, differences=differences,
                 actual_diagnostic_start_s=actual_start,
+                plot_range_s=list(plot_range_s) if plot_range_s is not None else None,
                 files={name: file_identity(directory / name)['sha256'] for name in ('hr.png','windows.csv','metrics.json')})
             (directory / 'receipt.json').write_text(canonical_json(receipt), encoding='utf-8')
             return dict(sample_id=spec.sample_id, coordinate_id=spec.coordinate['coordinate_id'], status=status, **actual)
@@ -265,7 +273,7 @@ def replay_sample(spec: ReplaySpec, *, directory_mapping=None, dataset_loader: C
 
 
 def replay_batch(root, *, subjects=None, motions=None, sample_ids=None, coordinate_id='best_posthoc',
-                 directory_mapping=None, dataset_loader=None, use_cache=True) -> pd.DataFrame:
+                 directory_mapping=None, dataset_loader=None, use_cache=True, selection_callback=None) -> pd.DataFrame:
     """Freeze all sample-specific coordinate choices, then run serially with receipt resume."""
     def accepts(value, selection):
         return selection is None or value in ([selection] if isinstance(selection, str) else selection)
@@ -289,6 +297,8 @@ def replay_batch(root, *, subjects=None, motions=None, sample_ids=None, coordina
     directory = Path(root) / 'replay/batches' / selection_hash
     directory.mkdir(parents=True, exist_ok=True)
     (directory / 'selection.json').write_text(canonical_json(choices), encoding='utf-8')
+    if selection_callback:
+        selection_callback(choices)
     for spec in specs:
         records.append(replay_sample(spec, directory_mapping=directory_mapping, dataset_loader=dataset_loader,
                                      use_cache=use_cache))
@@ -307,19 +317,32 @@ def replay_batch(root, *, subjects=None, motions=None, sample_ids=None, coordina
 def replay_reference_experiment(spec: ReplaySpec, references: tuple[str, ...], *, oracle_search=False,
                                 diagnostic_start_s=None, directory_mapping=None):
     """Cross-reference experiment preserves source coordinates/segmentation and never overwrites replay."""
-    experiment_identity = identity(dict(source=spec.identity, references=references, oracle_search=oracle_search))
-    experiment = replace(spec, references=references, identity=experiment_identity)
+    from ppg_hr.params import ReferenceConfig
+    ReferenceConfig(references)
+    experiment_config = dict(spec.fixed_config,
+        execution=dict(spec.fixed_config['execution'], reference_groups_order=list(references)))
+    experiment_hash = identity(experiment_config)
+    experiment_identity = identity(dict(source=spec.identity, experiment_config_hash=experiment_hash,
+        references=references, oracle_search=oracle_search, diagnostic_start_s=diagnostic_start_s))
+    experiment = replace(spec, references=references, identity=experiment_identity,
+                         fixed_config=experiment_config, fixed_config_hash=experiment_hash)
     directory = spec.root / 'experiments' / (spec.sample_id + '__' + experiment_identity)
     directory.mkdir(parents=True, exist_ok=True)
+    (directory / 'fixed_hyperparameters.json').write_text(canonical_json(experiment_config), encoding='utf-8')
     dataset = load_replay_dataset(spec, directory_mapping)
     try:
         result, actual = execute_replay(experiment, dataset, references=references,
             posthoc_mode='search' if oracle_search else 'saved', diagnostic_start_s=diagnostic_start_s)
         metrics = result_metrics(result, spec.fixed_config)
         result.frame.to_csv(directory / 'windows.csv', index=False)
+        (directory / 'metrics.json').write_text(canonical_json(metrics), encoding='utf-8')
+        if actual is not None:
+            selected = result.frame.iloc[int(round(actual / spec.params.hr_step_s))].to_dict()
+            selected.update(requested_start_s=diagnostic_start_s, actual_start_s=actual)
+            (directory / 'window_diagnostic.json').write_text(canonical_json(json_safe(selected)), encoding='utf-8')
         _write_hr_plot(directory / 'hr.png', result, experiment)
         receipt = dict(identity=experiment_identity, source_identity=spec.identity,
-            fixed_config_hash=spec.fixed_config_hash, references=references,
+            source_fixed_config_hash=spec.fixed_config_hash, fixed_config_hash=experiment_hash, references=references,
             source_posthoc_bias_s=spec.posthoc_bias_s, experiment_posthoc_bias_s=metrics['posthoc_bias_s'],
             oracle_search=oracle_search, coordinate=spec.coordinate, metrics=metrics,
             actual_diagnostic_start_s=actual)
@@ -329,3 +352,47 @@ def replay_reference_experiment(spec: ReplaySpec, references: tuple[str, ...], *
         clear_all_caches(dataset)
         del dataset
         gc.collect()
+
+
+def replay_reference_batch(root, references, *, subjects=None, motions=None, sample_ids=None,
+                           coordinate_id='best_posthoc', oracle_search=False, directory_mapping=None,
+                           selection_callback=None):
+    """Freeze each sample's own source cell before serial independent experiments."""
+    def selected(value, selection):
+        return selection is None or value in ([selection] if isinstance(selection, str) else selection)
+    ledger = RunLedger(root, readonly=True)
+    try:
+        samples = [dict(row) for row in ledger.connection.execute('SELECT * FROM samples ORDER BY sample_id')
+            if selected(row['subject'], subjects) and selected(row['motion'], motions) and selected(row['sample_id'], sample_ids)]
+    finally:
+        ledger.close()
+    records, specs, choices = [], [], []
+    for sample in samples:
+        try:
+            spec = resolve_replay_spec(root, sample['sample_id'], coordinate_id)
+            specs.append(spec)
+            choices.append(spec.preview())
+        except Exception as exc:
+            status = 'skipped' if coordinate_id == 'best_posthoc' and (not sample['sample_complete'] or 'finite posthoc' in str(exc)) else 'failed'
+            record = dict(sample_id=sample['sample_id'], status=status, error=str(exc))
+            records.append(record)
+            choices.append(record)
+    target = Path(root) / 'experiments/batches' / identity(dict(choices=choices,
+        references=references, oracle_search=oracle_search))
+    target.mkdir(parents=True, exist_ok=True)
+    (target / 'selection.json').write_text(canonical_json(choices), encoding='utf-8')
+    if selection_callback:
+        selection_callback(choices)
+    for spec in specs:
+        for refs in references:
+            try:
+                receipt = replay_reference_experiment(spec, tuple(refs), oracle_search=oracle_search,
+                                                      directory_mapping=directory_mapping)
+                records.append(dict(sample_id=spec.sample_id, coordinate_id=spec.coordinate['coordinate_id'],
+                    references='+'.join(refs), status='experiment_completed', **receipt['metrics']))
+            except Exception as exc:
+                records.append(dict(sample_id=spec.sample_id, references='+'.join(refs), status='failed', error=str(exc)))
+            pd.DataFrame(records).to_csv(target / 'progress.csv', index=False)
+    frame = pd.DataFrame(records)
+    frame.to_excel(target / 'reference_comparison.xlsx', index=False)
+    return frame

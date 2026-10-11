@@ -1,5 +1,6 @@
 """Sample-level frozen motion segmentation and reference-only delay alignment."""
 from __future__ import annotations
+from .numerical_config import with_numerics
 from dataclasses import dataclass
 from typing import Any
 from pathlib import Path
@@ -71,6 +72,7 @@ def search_sample_tdelay(times, predicted, ref_times, ref_hr, settings=PHYSICAL4
     return min(eligible)[1], curve, 'ok', ''
 
 
+@with_numerics
 def prepare_sample_context(dataset, params: ProtocolTrialParams, input_identity=None, fixed_config=None) -> SampleContext:
     """Detect once and truncate before the first detected bout, before HR extraction."""
     from .physical4d import identity, build_fixed_config
@@ -96,7 +98,7 @@ def prepare_sample_context(dataset, params: ProtocolTrialParams, input_identity=
     preparation = dict(preprocessing=config['preprocessing'], detector=config['motion_detector'],
                        motion_policy=params.motion_policy,
                        alignment={k: v for k, v in config['trial'].items() if k.startswith(('Rest_', 'evaluation_', 'log_absorbance', 'ppg_input'))},
-                       evaluation=config['evaluation'])
+                       evaluation=config['evaluation'], numerical=config['numerical'])
     return SampleContext(dataset.sample_stem, input_identity or {}, identity(preparation), segment,
                          delay, status, reason, curve, times, result.hr_bpm_smooth)
 
@@ -107,13 +109,18 @@ def save_sample_diagnostics(root: Path, subject: str, dataset, context: SampleCo
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     from ppg_hr.params import ReferenceConfig
-    from ppg_hr.preprocess.utils import fillmissing_linear
+    from ppg_hr.preprocess.utils import fillmissing_linear, fillmissing_nearest
     base = Path(root) / subject
     for name in ('align', 'signal'):
         (base / name).mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(3, 1, figsize=(11, 9))
     axes[0].plot([x['Tdelay_s'] for x in context.search_curve], [x['aae_bpm'] for x in context.search_curve])
     axes[0].axvline(context.Tdelay_s, color='red')
+    selected = min(context.search_curve, key=lambda item: abs(item['Tdelay_s'] - context.Tdelay_s))
+    if selected['aae_bpm'] is not None:
+        axes[0].scatter([context.Tdelay_s], [selected['aae_bpm']], color='red',
+                        label=f"selected {context.Tdelay_s:g}s; n_valid={selected['n_valid']}")
+        axes[0].legend()
     axes[0].set(xlabel='Tdelay (s)', ylabel='Rest AAE (bpm)', title=f'{context.sample_id}: {context.alignment_status}; {context.alignment_reason}')
     for ax, offset in zip(axes[1:], (0., context.Tdelay_s)):
         ax.plot(context.rest_time_s, context.rest_hr_bpm, label=f'PPG HR ({len(context.rest_time_s)} windows)')
@@ -132,14 +139,15 @@ def save_sample_diagnostics(root: Path, subject: str, dataset, context: SampleCo
     groups = [channels[:1], channels[1:-2], channels[-2:]]
     for row, group in enumerate(groups):
         for name, signal in group:
-            repaired = fillmissing_linear(np.asarray(signal, dtype=float))
+            repaired = fillmissing_nearest(fillmissing_linear(np.asarray(signal, dtype=float)))
             times = np.arange(len(repaired)) / dataset.fs
             axes[row, 0].plot(times, signal, label=name)
             frequency = np.fft.rfftfreq(len(repaired), 1 / dataset.fs)
             axes[row, 1].plot(frequency, abs(np.fft.rfft(repaired - np.mean(repaired))), label=name)
         axes[row, 0].legend()
         axes[row, 1].legend()
-        axes[row, 1].set(xlim=(0, 10), xlabel='Hz', title='Missing-repaired source spectrum')
+        state = 'source-domain reference after configured preprocessing' if row == 1 else 'missing-repaired raw acquisition'
+        axes[row, 1].set(xlim=(0, 10), xlabel='Hz', title=state)
     fig.suptitle(context.sample_id)
     fig.tight_layout()
     fig.savefig(base / 'signal' / (context.sample_id + '__fft_signal.png'))

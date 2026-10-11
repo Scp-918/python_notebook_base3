@@ -1,6 +1,7 @@
 """Stateful spectrum tracking adapted from the reference v2 implementation."""
 
 from __future__ import annotations
+from .numerical_config import NUMERICS
 
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -13,8 +14,6 @@ from .visibility import ShadowOwner, advance_owner
 
 __all__ = ["SpectrumTrackingState", "SpectrumTrackingTrace", "track_spectrum_candidates"]
 
-_EDGE_GUARD_BPM = 1.0
-_CHALLENGER_MIN_AMP_RATIO = 0.45
 
 
 @dataclass(frozen=True)
@@ -88,6 +87,7 @@ class SpectrumTrackingTrace:
     removed_candidate_bins: tuple[int, ...] = ()
     visibility_owner: dict[str, Any] = field(default_factory=dict)
     rise_lineage: dict[str, Any] = field(default_factory=dict)
+    spectrum_evidence: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -107,12 +107,13 @@ def track_spectrum_candidates(
     penalty_peak_amplitudes: np.ndarray | None = None,
     adaptive_filter: str = "lms",
     penalty_evidence_peaks_hz: np.ndarray | None = None,
+    collect_spectrum: bool = False,
 ) -> tuple[float, SpectrumTrackingTrace]:
     """Select and track one HR candidate without using reference HR."""
 
     freq = np.asarray(freq_hz, dtype=float)
     amps = np.asarray(amplitude, dtype=float)
-    band = np.isfinite(freq) & np.isfinite(amps) & (freq >= 0.5) & (freq <= 4.0)
+    band = np.isfinite(freq) & np.isfinite(amps) & (freq >= NUMERICS.get().candidate_band_hz[0]) & (freq <= NUMERICS.get().candidate_band_hz[1])
     freq = freq[band]
     amps = amps[band]
     candidate_threshold, full_candidate_threshold = _candidate_thresholds(params)
@@ -162,7 +163,7 @@ def track_spectrum_candidates(
         hard_band = np.zeros(freq.shape, dtype=bool)
         if penalty_enabled and window_kind == "motion" and width_bpm > 0:
             for center in penalty_centers:
-                hard_band |= np.abs(freq_bpm - center) < max(0., width_bpm - params.visibility_edge_guard_bpm)
+                hard_band |= np.abs(freq_bpm - center) < width_bpm + params.visibility_edge_guard_bpm
         removed = {int(i) for i in raw_order if hard_band[i] and not protected[i]}
         # An existing owner matches against the unprotected exclusion partition.
         would_remove = {int(i) for i in raw_order if hard_band[i]}
@@ -190,9 +191,9 @@ def track_spectrum_candidates(
     protection_suppressed = False
     challenger_bpm = None
     if chosen is not None and previous is not None and penalty_enabled and protected[chosen]:
-        if any(abs(float(freq_bpm[chosen]) - center) <= _EDGE_GUARD_BPM for center in penalty_centers[:1]):
+        if any(abs(float(freq_bpm[chosen]) - center) <= getattr(params, "visibility_edge_guard_bpm", 1.0) for center in penalty_centers[:1]):
             challenger = _challenger(
-                freq_bpm, amps, raw_order, search_min, search_max, penalty_centers, width_bpm, chosen
+                freq_bpm, amps, raw_order, search_min, search_max, penalty_centers, width_bpm, chosen, params.visibility_edge_guard_bpm
             )
             if challenger is not None:
                 suppressed_target = (int(chosen), float(freq_bpm[chosen]))
@@ -243,6 +244,9 @@ def track_spectrum_candidates(
     top = all_order[:5]
     trace = SpectrumTrackingTrace(
         path=path,
+        spectrum_evidence=(dict(frequency_hz=freq.tolist(), raw_amplitude=amps.tolist(),
+            penalty_weights=weights.tolist(), penalized_amplitude=scores.tolist(),
+            selectable_bins=selectable.tolist()) if collect_spectrum else {}),
         removed_candidate_bins=tuple(sorted(removed)), visibility_owner=owner_trace,
         rise_lineage=rise_trace,
         window_kind=window_kind,
@@ -363,17 +367,17 @@ def _first_in_range(freq_bpm, order, low, high):
     return None
 
 
-def _inside_penalty(value, centers, width):
-    return any(abs(float(value) - center) < width + _EDGE_GUARD_BPM for center in centers)
+def _inside_penalty(value, centers, width, edge_guard=1.0):
+    return any(abs(float(value) - center) < width + edge_guard for center in centers)
 
 
-def _challenger(freq_bpm, amps, order, low, high, centers, width, current):
-    floor = float(amps[current]) * _CHALLENGER_MIN_AMP_RATIO
+def _challenger(freq_bpm, amps, order, low, high, centers, width, current, edge_guard=1.0):
+    floor = float(amps[current]) * NUMERICS.get().penalty_challenger_min_amp_ratio
     for idx in order:
         idx = int(idx)
         if idx == current or not (low < freq_bpm[idx] < high) or amps[idx] < floor:
             continue
-        if not _inside_penalty(freq_bpm[idx], centers, width):
+        if not _inside_penalty(freq_bpm[idx], centers, width, edge_guard):
             return idx
     return None
 
@@ -460,7 +464,7 @@ def _high_lock_labels(current, rank, source, centers, overlap):
         labels.append("late_rank")
     if overlap:
         labels.append("protected_wrong_track")
-    if any(abs(current - center) <= 8.0 for center in centers):
+    if any(abs(current - center) <= NUMERICS.get().high_lock_risk_near_motion_bpm for center in centers):
         labels.append("near_motion_peak")
     return tuple(labels)
 
@@ -543,6 +547,8 @@ def _advance_rise_lineage(freq_bpm, order, chosen, previous, limited, state, par
             legacy_distance = abs(freq_bpm[chosen] - previous) if chosen is not None else float('inf')
             if harmonic:
                 reason = 'motion_third_harmonic_guard'
+            elif chosen == lineage:
+                reason = 'confirmed_matches_legacy'
             elif target > previous + directional.limit_up_bpm and abs(target - previous) <= legacy_distance:
                 limited, reanchored, reason = float(target), True, 'confirmed_reanchor'
             else:

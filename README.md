@@ -1,57 +1,95 @@
-# PPG 心率批量实验
+# Physical4D 运动伪影补偿与心率复现
 
-本仓库以 Notebook 为入口比较运动伪影补偿与心率误差。冻结核心 `core_enhanced_v1` 提供可解释的算法骨架，方便后续接入 Udeco interface-quality；当前不通过复杂 rescue 补指标。
+Notebook 入口为 `notebooks/run_batch_adaptive_protocol.ipynb`，生成脚本为 `scripts/update_change6_notebook.py`。训练使用统一 reference-parity 求解器、样本级冻结分段/Tdelay、确定性300点网格和 SQLite 逐cell账本。正式基线 ACC+LMS；复杂恢复机制默认关闭。参考实现锁定 `wqwshn/outline-PPGtoHR` 的 `02d7e091219aeff78e82d53ae0069acf7bedb467`，非线性更新核保留本项目已确认行为。
 
-## 冻结核心与模块
+## 环境与输入
 
-| 层 | 职责 | 核心文件 |
-|---|---|---|
-| 原始检测 / 协议 | 100Hz ACC+Gyro detector保留全部runs，single_bout/multi_bout独立选择 | `segmentation.py` |
-| 1. Candidate spectrum | FFT或SSR产生未惩罚频谱/候选，记录实际estimator及fallback | `spectral_utils.py` |
-| 2. Candidate tracker | 共享soft penalty、continuity protection、directional tracking与第一次slew | `penalty_policy.py`, `enhanced_tracking.py` |
-| 3. Source selection | rest baseline、motion adaptive/QC回退、恢复期simple adaptive→reset-FFT handoff | `fusion.py` |
-| 4. Final dynamics | 按rest/motion/recovery限制拼接后的Final；状态跨phase延续 | `fusion.py` |
-
-上述文件位于 `src/ppg_hr/experimental/`；参数、reference registry和不可变preset快照集中在 `src/ppg_hr/params.py`。`cascade_solver.py` 组织完整求解，`run_batch_protocol.py` 管理batch、记录、断点、回放与图表。
-
-显式开启：raw-source detector、8秒/1秒observation、adaptive filtering、共享soft penalty、continuity protection、directional candidate tracker、simple handoff、phase dynamics。显式关闭：low/high-lock、rise-lineage、gap/rising rescue、complex shadow、复杂post-motion rescue及interface-quality在线介入。实验机制模块仍可单独研究，冻结入口拒绝打开它们。
-
-所有窗口记录start/center/end；phase、scope与handoff使用center。detector六轴四阶零相位带通（ACC .5–5Hz，Gyro .5–10Hz），分别计算magnitude；8/1秒STD(ddof=1)，前30秒baseline，阈值 `max(2.5*baseline_std, .05*max_window_score)`，任一路严格超过即motion。先桥接≤3窗内部false gap，再删除<5窗true run。
-
-恢复handoff等待5秒，adaptive与reset-FFT差值≤6bpm连续2个有效窗切换，最迟20秒切到有效reset-FFT；motion_only在恢复立即使用reset-FFT，motion_post10最迟在adaptive范围结束时切换。Final的up/down limit/step（bpm）：rest 1.5/1.5与3/1.5，motion 5.5/3.5与2/1.5，recovery 1.5/1.5与3.5/3。
-
-## 配置与搜索
-
-```python
-from ppg_hr.params import resolve_core_config, core_preset_metadata, ReferenceConfig
-params = resolve_core_config()  # 固定验收：100Hz、160ms、LMS步长0.01
-metadata = core_preset_metadata(params)
-reference_groups_order = ("ACC", "HF")
-reference = ReferenceConfig(reference_groups_order)
-# reference_sequence: accx,accy,accz,hf1,hf2；reference_order_key: ACC+HF
-```
-
-只配置ordered groups；sequence和canonical key由registry派生。支持ACC/HF/CF/UD：`("UD",)`为单组，`("HF","ACC")`顺序与ACC+HF不同。路径、mode、CSV/JSON、cache、legend、summary和replay统一使用canonical key。CSV物理采集字段UD2仍是第二路电压推导通道，不是旧reference模式名称。
-
-BO仅四维：Fs_Target `[25,50]`、memory_ms `[40,80,120,160,200]`、滤波器步长、Spec_Penalty_Width `[.1,.2,.3]`Hz。LMS/Volterra/RFF使用LMS_Mu_Base，KLMS使用klms_step_size；步长候选集中在params.py。Spec_Penalty_Weight=.2是保留比例，冻结；confidence共用、width为Hz半宽。HR窗8/1、tracker/handoff/dynamics及其他滤波器参数均冻结。memory只派生正延迟history上限，M/K仍由时延映射，K_max不因Fs自动物理化。prewarm_s=0是独立上下文，不控制HR窗。
-
-## 数据血缘与评价
-
-`ppg_acquired_raw → ppg_clean → ppg_algorithm_input`：采集值保留source网格，序号缺口NaN，毛刺不替换；clean承担missing/spike repair；algorithm input承担bandpass/log absorbance和目标域resample。raw Uh/Uc与标定生成独立UD calculation，一路形成adaptive reference的预处理副本，另一路与原始PPG、source时间、QC组成InterfaceQualityInput。quality算法尚未实现，没有adaptive output或reference HR依赖。
-
-参考HR仅用于完成预测后的评价与绘图，不平移sensor、不裁剪预测窗，不参与tracker/quality/handoff/fusion。零相位、全记录阈值与前视滤波意味着本实验不声称严格实时因果。新旧AAE比较需注明detector、评价对齐和预测覆盖范围变化。
-
-## 运行与验证
-
-严格输入为受试者目录中的 `{subject}_{motion}_{index}_sensor.csv`（Pydisplay）和标准 `{subject}_{motion}_{index}_HRdata.csv`，motion为write/gripper/run/rope；标定在父目录ck.mat。没有旧loader/replay兼容层，旧结果需重新运行，新输出保存schema、preset/version、完整参数、flags及fingerprint。
-
-主入口 [Notebook](notebooks/run_batch_adaptive_protocol.ipynb)，完整配置、固定验收、batch/resume/replay/summary/绘图步骤见 [notebooks/readme.md](notebooks/readme.md)。结果写入受试者父目录outputs，不提交生成物。
+使用 conda `PPG_sensor_env`，命令显式设置 `PYTHONPATH=src`。输入为 `{subject}_{motion}_{index}_sensor.csv` 与对应 `_HRdata.csv`，运动为 write/gripper/run/rope；标定位于受试者父目录 `ck.mat`。未配对文件记录原因；QC异常保留回退。Notebook用仓库相对路径或 `PPG_SUBJECT_DIR`，全部运行开关初始 False。
 
 ```powershell
-$env:PYTHONPATH="src"
+$env:PYTHONPATH='src'
 conda run -n PPG_sensor_env python -m pytest -q tests/
 conda run -n PPG_sensor_env ruff check src/ tests/
 conda run -n PPG_sensor_env python scripts/update_change6_notebook.py
 ```
 
-若直接调用环境python.exe，PATH须包含该环境根目录、Scripts与Library/bin以加载NumPy/SciPy DLL；pytest可指定 `--basetemp=outputs/pytest-temp`。Notebook与生成脚本同步更新；提交前清空输出/执行计数，所有训练、写图、回放和诊断开关恢复False。开发守则见 [AGENTS.md](AGENTS.md)。
+## 训练入口与固定配置
+
+```python
+from pathlib import Path
+from ppg_hr.params import reference_parity_params
+from ppg_hr.experimental.physical4d_run import run_physical4d
+
+roots = run_physical4d(
+    subjects=[Path('testdata/data/ts')], motions=['write', 'run'],
+    references=[('ACC',), ('ACC', 'HF')],
+    adaptive_filters=['lms', 'volterra'], scopes=['motion_post10'],
+    fixed_params=reference_parity_params(), output_parent=Path('outputs'))
+```
+
+subjects、motions、reference组合、filter、scope均支持单选或多选。外层组合各有独立run_root，每个样本各执行300点。根目录仅含五项，例如 `S01-S02__wr__AH__L__mp10`。运动编码w/g/r/p，reference A/H/C/U保留组顺序，filter L/V/R/K，scope mo/mr/mp10/gl。默认输出到共同数据父目录的outputs；不同父目录必须指定output_parent。同名目录配置身份不同会拒绝续写；不同policy可用不同输出父目录。
+
+首次预处理前写入并冻结 `config/fixed_hyperparameters.json`，完整保存预处理、detector、对齐、级联、全部滤波器、追踪/融合/恢复、评价及数值控制，包括关闭机制和未选滤波器。只剔除当前滤波器实际搜索的四维；网格与派生值保存在manifest及SQLite coordinates。`parameter_catalog.json`描述类型、单位、可选值、启用条件、参考/采用值与差异；`provenance.json`记录schema、实现身份、Git/参考提交和依赖版本。数值快照确定性hash进入manifest、cell、缓存、Excel和receipt。说明文字不进入数值hash。续跑与复现拒绝缺字段、未知字段、篡改、不支持schema和实现身份不符，不能用当前默认值填补。
+
+## 算法约定
+
+source-domain ACC/GYRO检测保持原阈值、bridge/min-run与bout选择。先计算一次分段，从首次检测运动前的片段生成完整8秒静息窗搜索Tdelay；无运动使用全程。默认[-5,5]秒、0.1秒步长，AAE、绝对时延、RMSE、候选顺序依次处理平局；少于2可比较窗回退0并记录原因。不同Fs复用同一分段和Tdelay。sensor/窗口/边界不移动，Tdelay后评价为 `HR_ref(t+Tdelay_s)`，posthoc后为 `HR_ref(t+Tdelay_s+posthoc_bias_s)`；reference绘图时间分别减去偏移。posthoc默认[-5,5]秒、1秒步长，是独立oracle诊断。
+
+300点固定顺序为Fs→memory→step→penalty半宽，编号p4d_000…299，最后一维最快。Fs=25/50/100Hz，memory=40/80/120/160/200ms，半宽=3/6/12/18bpm；`max_order=round(Fs*memory/1000)`，Hz半宽=bpm/60。
+
+| 滤波器 | 五点步长 |
+|---|---|
+| LMS | .006/.008/.010/.012/.016 |
+| Volterra | .002/.004/.008/.012/.016 |
+| RFF-LMS | .001/.002/.004/.006/.008 |
+| KLMS | .005/.010/.020/.050/.100 |
+
+每窗输入PPG对全部reference做direct correlation ±200ms lag搜索，按最大绝对相关全局排序，同分按组/通道配置顺序。最强reference决定shared delay和penalty reference：delay非负M=1，负值M=min(max(1,floor(abs(delay))),max_order)。所有通道共享M；ACC K=1，HF/CF/UD K=0；envelope为可选实验模式。固定smooth=5、penalty weight=.4、M_base=1、C_scale=1、K_max=16，观察窗8秒/hop1秒，prewarm0。
+
+LMS默认步长 `max(1e-6,mu_base-abs(corr)/100)`；非线性默认关闭相关缩放。Volterra M2=3、alpha_u=.1，保留归一化更新；RFF D100、seed42、自适应robust带宽、sigma_scale1、NLMS eps1e-9，保留与参考固定sigma=1的差异；KLMS sigma1、epsilon.1、归一化距离/更新、字典300、freeze_new_centers、eps1e-6，网格步长不采用参考.2。差异进入参数目录。
+
+`spectral_penalty_policy='soft_visible'` 默认保持候选可见并开启continuity protection；`suppressed_protected_continuous_visibility`实际接通候选排除和保护owner。owner匹配半宽3.5bpm、其后最多3次motion调用、边界保护1bpm；获取owner当窗仍选challenger，仅匹配owned target可越过排除，mismatch/band exit/expiry/recovery/EOF终止并记录。policy名称/版本/阈值进入固定身份，不参与网格，advanced visibility由policy派生，不开启其他rescue。
+
+rise lineage、low/high-lock、post-motion recovery/guard、dual-reset均可在同一框架显式启用，默认关闭。每cell重置全部状态，在线逻辑仅依赖sensor/频谱/历史，不读取参考HR。Final优先dual-reset、guard、简化融合，随后仅一次final dynamics。恢复期保留reset-FFT与简化handoff。旧legacy入口为历史兼容，新训练不使用BO或旧冻结preset。
+
+## 账本、输出与续跑
+
+```text
+<run_root>/
+  config/{fixed_hyperparameters,parameter_catalog,provenance}.json
+  manifest.json
+  run.sqlite
+  S01/
+    align/<sample>__tdelay.png
+    signal/<sample>__fft_signal.png
+    grid/<sample>__p4d.xlsx
+    summary/{sample_best,motion_summary}.xlsx
+    replay/<sample>__<coordinate_id>/
+  replay/batches/<selection_hash>/
+  experiments/
+  overall_summary.xlsx
+```
+
+SQLite含samples/coordinates/cell_metrics/attempt_events；cell主键(sample_id,coordinate_id)。每cell成功后即时事务写标量、完整参数审计和身份，技术失败仅记attempt/error，下次补缺；无有效窗记NULL/unscored。300点均已完成才sample_complete，重启优先跳完整样本。每次调用每个缺点尝试一次；最多保留当前样本当前Fs的准备缓存，跨Fs及样本清缓存/GC。
+
+Tdelay图含搜索、选定点、静息HR对齐前后、有效窗与fallback；搜索/静息曲线也入SQLite。信号图含原始PPG、reference、源IMU及基础FFT并标识处理状态。P4D始终300行，包括缺失/失败，保存四维、派生值、两个偏移、两组AAE/accuracy、有效窗、状态、身份和参数审计。best仅完整样本有限posthoc final AAE，平局coordinate_id；运动与总体汇总保留样本数、完成/失败/可评分数、均值和样本标准差。同个体所有运动共享库与汇总，无运动级重复目录。
+
+`repair_run_outputs(root)`补图与导出，不重跑网格；`rebuild_summaries(ledger)`可仅从只读SQLite重建汇总。
+
+## 严格复现与独立实验
+
+```python
+from ppg_hr.experimental.physical4d_replay import resolve_replay_spec, replay_sample, replay_batch
+spec = resolve_replay_spec(roots[0], 'ts_write_1', 'best_posthoc')
+print(spec.preview())
+receipt = replay_sample(spec)
+report = replay_batch(roots[0], motions=['write'], selection_callback=print)
+```
+
+ReplaySpec合并保存固定快照与样本自身坐标，核对cell完整审计，恢复冻结分段/Tdelay/bias及输入内容身份。可映射数据目录，但sensor、HR与标定内容必须相同。复现从样本起点保持追踪历史，不运行detector、Tdelay、posthoc或网格搜索；保存bias无效保持unscored。指标绝对容差1e-6、有效窗数严格一致。单样本生成双面板HR、完整windows.csv、metrics.json、receipt.json，scope指标与绘图裁剪独立。指定窗口仅收集该窗完整stage并保留此前历史。
+
+批量先冻结逐样本坐标清单，串行重算/立即保存receipt/释放内存；verified且身份及文件hash完整才cached_verified，失败与metric_mismatch继续后续样本。默认best跳过未完成或无有限best。汇总只统计verified/cached_verified，保留failed/skipped计数；训练数据库只读。
+
+跨reference实验固定源样本自身坐标/分段/Tdelay，默认保存bias，显式重搜时另记实验bias。独立配置身份和experiments目录，不覆盖训练或精确复现。Notebook第10–16节依次为单样本、窗口诊断、汇总、reference实验/诊断、逐样本reference批对比、批量严格复现。详细操作见 `notebooks/readme.md`。
+
+实现身份按算法及schema的AST计算，忽略参数默认值、参数目录说明、注释和格式；仅更改当前默认值不会阻止既有快照复现。字段/schema或实际计算代码改变仍会被一致性检查识别。参数类型依据声明校验，包含可空参数，恢复时不借用当前默认值。

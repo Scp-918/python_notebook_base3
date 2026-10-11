@@ -5,6 +5,7 @@
 """
 
 from __future__ import annotations
+from .numerical_config import NUMERICS
 
 import numpy as np
 
@@ -55,7 +56,7 @@ def noncausal_volterra_filter(
         return out
 
     mu1 = _safe_positive(mu1, mu_min)
-    mu2 = _safe_positive(float(alpha_u) * mu1, mu_min * max(float(alpha_u), 1e-6))
+    mu2 = _safe_positive(float(alpha_u) * mu1, mu_min * max(float(alpha_u), NUMERICS.get().volterra_alpha_floor))
     near_idx = _nearest_tap_indices(M, K, M2)
     q_count = int(len(near_idx) * (len(near_idx) + 1) / 2)
     if q_count:
@@ -68,7 +69,7 @@ def noncausal_volterra_filter(
     span = X.shape[1]
     w1 = np.zeros(span, dtype=float)
     w2 = np.zeros(q_count, dtype=float)
-    eps = 1e-9
+    eps = NUMERICS.get().volterra_nlms_eps
     weight_norm_linear_t: list[float] = []
     weight_norm_quadratic_t: list[float] = []
     max_abs_weight_t: list[float] = []
@@ -139,6 +140,6 @@ def _zscore(x: np.ndarray) -> np.ndarray:
     arr = np.asarray(x, dtype=float).copy()
     arr[~np.isfinite(arr)] = 0.0
     sd = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
-    if not np.isfinite(sd) or sd <= 1e-12:
+    if not np.isfinite(sd) or sd <= NUMERICS.get().input_zscore_std_eps:
         return arr - float(np.mean(arr))
     return (arr - float(np.mean(arr))) / sd

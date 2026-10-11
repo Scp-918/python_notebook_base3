@@ -5,6 +5,7 @@ alignment and cascade code while centralising Hamming/frequency-axis caches.
 """
 
 from __future__ import annotations
+from .numerical_config import NUMERICS
 
 from functools import lru_cache
 
@@ -88,7 +89,7 @@ def compute_power_spectrum(
     nfft_i = (
         int(nfft)
         if nfft is not None
-        else max(8192, 1 << int(np.ceil(np.log2(max(sig.size, 1)))))
+        else max(NUMERICS.get().fft_min_length, 1 << int(np.ceil(np.log2(max(sig.size, 1)))))
     )
     freq = cached_rfftfreq(float(fs), nfft_i)
     amp = np.abs(np.fft.rfft(sig, n=nfft_i))

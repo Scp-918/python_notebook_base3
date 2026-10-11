@@ -1,6 +1,7 @@
 """Shared soft spectral policy; continuity protection belongs to the tracker."""
 
 from __future__ import annotations
+from .numerical_config import NUMERICS
 
 from dataclasses import dataclass
 
@@ -71,9 +72,9 @@ class PenaltyPolicy:
         if peaks.size:
             main = float(peaks[int(np.argmax(amplitudes))])
             centers.append(main)
-            if np.any(np.abs(np.asarray(ppg_fft_peaks_hz) - 2 * main) <= max(width_hz, 1 / 60)):
+            if np.any(np.abs(np.asarray(ppg_fft_peaks_hz) - 2 * main) <= max(width_hz, NUMERICS.get().penalty_harmonic_min_half_width_hz)):
                 centers.append(2 * main)
-        retention = 1.0 - max(confidence, 0.9) * (1.0 - base_retention)
+        retention = 1.0 - max(confidence, NUMERICS.get().penalty_confidence_floor) * (1.0 - base_retention)
         return cls(tuple(centers), confidence, float(width_hz), float(retention))
 
     def build_weights(self, frequencies_hz: np.ndarray) -> np.ndarray:

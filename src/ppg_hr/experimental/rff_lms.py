@@ -6,6 +6,7 @@
 """
 
 from __future__ import annotations
+from .numerical_config import NUMERICS
 
 from functools import lru_cache
 
@@ -27,7 +28,7 @@ def get_rff_weights(D: int, span: int, sigma: float, rff_seed: int) -> tuple[np.
 
     D = max(1, int(D))
     span = max(1, int(span))
-    sigma = max(float(sigma), 1e-6)
+    sigma = max(float(sigma), NUMERICS.get().rff_min_sigma)
     rng = np.random.default_rng(int(rff_seed) % (2**32))
     W = rng.normal(loc=0.0, scale=1.0 / sigma, size=(D, span))
     b = rng.uniform(0.0, 2.0 * np.pi, size=D)
@@ -46,7 +47,7 @@ def noncausal_rff_lms_filter(
     sigma: float,
     rff_seed: int,
     sigma_scale: float | None = None,
-    min_sigma: float = 1e-6,
+    min_sigma: float | None = None,
     mu_min: float = 1e-5,
     update_mode: str = "nlms",
     nlms_eps: float = 1e-9,
@@ -80,7 +81,8 @@ def noncausal_rff_lms_filter(
     M = max(1, int(M))
     K = max(0, int(K))
     D = max(1, int(D))
-    sigma = max(float(sigma), float(min_sigma), 1e-12)
+    min_sigma = NUMERICS.get().rff_min_sigma if min_sigma is None else min_sigma
+    sigma = max(float(sigma), float(min_sigma), NUMERICS.get().klms_min_sigma)
     out = d_arr.copy()
     X, valid_indices = build_noncausal_tap_matrix(u_arr, M, K)
     if valid_indices.size == 0:
@@ -166,9 +168,11 @@ def noncausal_rff_lms_filter(
     return out
 
 
-def estimate_rff_sigma_base(X: np.ndarray, *, min_sigma: float = 1e-6, max_pairs: int = 2048) -> float:
+def estimate_rff_sigma_base(X: np.ndarray, *, min_sigma: float | None = None, max_pairs: int | None = None) -> float:
     """Estimate a robust tap-space distance scale for adaptive RFF sigma."""
 
+    min_sigma = NUMERICS.get().rff_min_sigma if min_sigma is None else min_sigma
+    max_pairs = NUMERICS.get().rff_max_distance_pairs if max_pairs is None else max_pairs
     mat = np.asarray(X, dtype=float)
     if mat.ndim != 2 or mat.shape[0] == 0:
         return float(min_sigma)
@@ -217,6 +221,6 @@ def _zscore(x: np.ndarray) -> np.ndarray:
     arr = np.asarray(x, dtype=float).copy()
     arr[~np.isfinite(arr)] = 0.0
     sd = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
-    if not np.isfinite(sd) or sd <= 1e-12:
+    if not np.isfinite(sd) or sd <= NUMERICS.get().input_zscore_std_eps:
         return arr - float(np.mean(arr))
     return (arr - float(np.mean(arr))) / sd

@@ -1,6 +1,7 @@
 """Independent and Final-informed trackers over shared raw FFT evidence."""
 
 from __future__ import annotations
+from .numerical_config import NUMERICS
 
 from collections import deque
 from dataclasses import dataclass
@@ -173,7 +174,7 @@ class DualResetTracker:
         self._previous_handoff_bpm: float | None = None
         self._previous_selected_candidate_bpm: float | None = None
         self._previous_amp_ratio = 0.0
-        self._held_history: deque[bool] = deque(maxlen=3)
+        self._held_history: deque[bool] = deque(maxlen=NUMERICS.get().dual_reset_raw_persistence_windows)
         self._qualification_hits: deque[bool] = deque(maxlen=self._qualification_windows)
         self._readiness_hits: deque[bool] = deque(maxlen=self._readiness_hits_required)
         self._readiness_state_age = 0
@@ -181,7 +182,7 @@ class DualResetTracker:
         self._target_ever_ready = False
         self._qualification_state_age = 0
         self._previous_qualified = False
-        self._raw_top_track: deque[float] = deque(maxlen=3)
+        self._raw_top_track: deque[float] = deque(maxlen=NUMERICS.get().dual_reset_raw_persistence_windows)
         self._prior_invalidation_track: deque[float] = deque(
             maxlen=max(3, self._prior_invalidation_hits_required)
         )
@@ -269,7 +270,7 @@ class DualResetTracker:
         else:
             self._raw_top_track.append(peaks[0][0])
             self._prior_invalidation_track.append(peaks[0][0])
-            raw_top_persistent = len(self._raw_top_track) == 3 and all(
+            raw_top_persistent = len(self._raw_top_track) == NUMERICS.get().dual_reset_raw_persistence_windows and all(
                 abs(current - previous) <= self._trajectory_tolerance_bpm
                 for previous, current in zip(
                     self._raw_top_track,

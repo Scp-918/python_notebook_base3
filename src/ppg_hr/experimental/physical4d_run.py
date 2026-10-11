@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import ast
 import gc
 from hashlib import sha256
 from itertools import product
@@ -12,9 +13,10 @@ import traceback
 from typing import Any, Callable
 import numpy as np
 
-from ppg_hr.params import ReferenceConfig, TargetScope, PreprocessingParams, reference_parity_params
+from ppg_hr.params import (ReferenceConfig, TargetScope, PreprocessingParams, reference_parity_params,
+                          DEFAULT_PREPROCESSING, DEFAULT_MOTION_DETECTOR, PHYSICAL4D_SETTINGS, DEFAULT_NUMERICS)
 from .physical4d import (build_fixed_config, canonical_json, coordinates, identity,
-                         load_snapshot, run_name, save_snapshot, trial_from_snapshot)
+                         load_snapshot, run_name, save_snapshot, trial_from_snapshot, effective_parameter_audit)
 from .sample_context import SampleContext, prepare_sample_context, save_sample_diagnostics
 from .cascade_solver import run_protocol_trial, clear_all_caches
 from .batch_pairing import discover_sample_pairs_with_unpaired
@@ -37,12 +39,46 @@ def json_safe(value: Any) -> Any:
 
 
 def implementation_identity() -> str:
-    """Hash numerical source contents rather than relying on mutable Git labels."""
+    """Hash algorithm/schema AST; saved defaults and catalog prose are not implementation changes."""
+    class NumericalSource(ast.NodeTransformer):
+        def __init__(self, parameters):
+            self.parameters = parameters
+
+        def visit(self, node):
+            if hasattr(node, 'body') and isinstance(node.body, list) and node.body:
+                first = node.body[0]
+                if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+                    node.body = node.body[1:]
+            return super().visit(node)
+
+        def visit_ClassDef(self, node):
+            dataclass = any(isinstance(d, ast.Name) and d.id == 'dataclass' or
+                isinstance(d, ast.Call) and isinstance(d.func, ast.Name) and d.func.id == 'dataclass'
+                for d in node.decorator_list)
+            if self.parameters and dataclass:
+                for field in node.body:
+                    if isinstance(field, ast.AnnAssign):
+                        field.value = None  # Saved configuration supplies all field values.
+            return self.generic_visit(node)
+
+        def visit_Assign(self, node):
+            if self.parameters and any(isinstance(t, ast.Name) and t.id in {
+                'PARAMETER_NOTES', '_CORE_V1_VALUES', 'CORE_FEATURE_FLAGS'} for t in node.targets):
+                return None
+            return self.generic_visit(node)
+
+        def visit_FunctionDef(self, node):
+            if self.parameters and node.name == 'reference_parity_params':
+                node.body = [ast.Pass()]  # Request defaults never override a replay snapshot.
+            return self.generic_visit(node)
+
     root = Path(__file__).resolve().parents[1]
     digest = sha256()
     for path in sorted(root.rglob('*.py')):
         digest.update(path.relative_to(root).as_posix().encode())
-        digest.update(path.read_bytes().replace(b'\r\n', b'\n'))
+        tree = ast.parse(path.read_bytes().decode('utf-8-sig'))
+        tree = NumericalSource(path.name == 'params.py').visit(tree)
+        digest.update(ast.dump(tree, include_attributes=False).encode('utf-8'))
     return digest.hexdigest()
 
 
@@ -69,6 +105,9 @@ class RunLedger:
         expected.pop('run_identity')
         if identity(expected) != self.manifest['run_identity']:
             raise ValueError('Run manifest identity mismatch')
+        if self.config['execution'] != dict(reference_groups_order=self.manifest['reference_groups_order'],
+                                            target_scope=self.manifest['target_scope']):
+            raise ValueError('Execution configuration differs from manifest')
         if readonly:
             self.connection = sqlite3.connect((self.root / 'run.sqlite').resolve().as_uri() + '?mode=ro', uri=True)
         else:
@@ -82,6 +121,7 @@ class RunLedger:
                subjects: list[str], motions: list[str]) -> RunLedger:
         ReferenceConfig(references)
         TargetScope(scope)
+        config = dict(config, execution=dict(reference_groups_order=list(references), target_scope=scope))
         digest = save_snapshot(root, config)
         grid = coordinates(config['trial']['adaptive_filter'])
         manifest = dict(schema_version=1, fixed_config_hash=digest,
@@ -167,7 +207,7 @@ class RunLedger:
 
     def record_cell(self, sample_id, coordinate, metrics) -> None:
         metrics = json_safe(metrics)
-        effective = trial_from_snapshot(self.config, coordinate).to_dict()
+        effective = effective_parameter_audit(self.config, coordinate)
         sample = self.connection.execute('SELECT input_json,context_json FROM samples WHERE sample_id=?', (sample_id,)).fetchone()
         cell_id = identity(dict(run=self.manifest['run_identity'], sample=sample_id,
             input=json.loads(sample[0]), context=json.loads(sample[1]), coordinate=coordinate))
@@ -227,7 +267,9 @@ def _multiple(value):
 
 def run_physical4d(subjects, motions=('write', 'gripper', 'run', 'rope'), *,
                    references=(('ACC',),), adaptive_filters=('lms',), scopes=('motion_post10',),
-                   fixed_params=None, output_parent=None, save_diagnostics=True) -> list[Path]:
+                   fixed_params=None, output_parent=None, save_diagnostics=True,
+                   preprocessing=DEFAULT_PREPROCESSING, motion_detector=DEFAULT_MOTION_DETECTOR,
+                   settings=PHYSICAL4D_SETTINGS, numerical=DEFAULT_NUMERICS) -> list[Path]:
     """Expand outer modes; prepare one sample at a time and enumerate every 300-cell grid."""
     subjects = sorted((Path(p).resolve() for p in _multiple(subjects)), key=lambda p: p.name)
     if not subjects or len({p.name for p in subjects}) != len(subjects):
@@ -238,6 +280,8 @@ def run_physical4d(subjects, motions=('write', 'gripper', 'run', 'rope'), *,
     if isinstance(references, tuple) and references and isinstance(references[0], str):
         references = [references]
     modes = list(product(references, _multiple(adaptive_filters), _multiple(scopes)))
+    if not modes or len({(tuple(refs), filt, scope) for refs, filt, scope in modes}) != len(modes):
+        raise ValueError('Select distinct nonempty outer combinations')
     parents = {p.parent for p in subjects}
     if output_parent is None:
         if len(parents) != 1:
@@ -251,7 +295,9 @@ def run_physical4d(subjects, motions=('write', 'gripper', 'run', 'rope'), *,
             if params.cascade_mode != 'reference_parity':
                 raise ValueError('Physical4D requires reference_parity configuration')
             root = Path(output_parent) / run_name([p.name for p in subjects], motions, refs, adaptive_filter, scope)
-            ledger = RunLedger.create(root, build_fixed_config(params), tuple(refs), scope,
+            config = build_fixed_config(params, preprocessing=preprocessing, motion_detector=motion_detector,
+                                        settings=settings, numerical=numerical, references=tuple(refs), target_scope=scope)
+            ledger = RunLedger.create(root, config, tuple(refs), scope,
                                       [p.name for p in subjects], motions)
             ledgers.append(ledger)
         for subject_dir in subjects:
@@ -286,7 +332,7 @@ def run_physical4d(subjects, motions=('write', 'gripper', 'run', 'rope'), *,
                         elif contexts:
                             context = next(iter(contexts.values()))
                         else:
-                            context = prepare_sample_context(dataset, params, input_id, ledger.config)
+                            context = prepare_sample_context(dataset, params, input_id, fixed_config=ledger.config)
                         contexts[context.preparation_identity] = context
                         ledger.add_sample(pair.sample_id, pair.subject, pair.motion_type, input_id, context.to_dict())
                         if save_diagnostics:
@@ -301,8 +347,10 @@ def run_physical4d(subjects, motions=('write', 'gripper', 'run', 'rope'), *,
                             trial = trial_from_snapshot(ledger.config, coordinate)
                             result = run_protocol_trial(dataset, tuple(ledger.manifest['reference_groups_order']),
                                 ledger.manifest['target_scope'], trial, collect_frame=False, collect_stages=False,
-                                sample_context=context, posthoc_mode='search')
+                                sample_context=context, posthoc_mode='search', numerical_config=ledger.config['numerical'])
                             try:
+                                if not result.success:
+                                    raise RuntimeError(result.reason)
                                 return result_metrics(result, ledger.config)
                             finally:
                                 del result

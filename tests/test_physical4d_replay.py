@@ -32,8 +32,11 @@ def test_each_sample_restores_own_coordinate_bias_and_verified_cache(tmp_path, m
                                     posthoc_mode='saved', saved_posthoc_bias_s=bias,
                                     collect_stages=False)
         ledger.record_cell(data.sample_stem, coordinate, result_metrics(result))
+        for other in ledger.manifest['coordinates']:
+            if other['coordinate_id'] != coordinate['coordinate_id']:
+                ledger.record_cell(data.sample_stem, other, dict(tdelay_aae_bpm=None, posthoc_aae_bpm=None))
+        assert ledger.sample_complete(data.sample_stem)
         clear_all_caches(data)
-        ledger.connection.execute('UPDATE samples SET sample_complete=1 WHERE sample_id=?', (data.sample_stem,))
     ledger.connection.commit()
     ledger.close()
     specs = [resolve_replay_spec(root, name) for name in data_by_id]
@@ -49,3 +52,14 @@ def test_each_sample_restores_own_coordinate_bias_and_verified_cache(tmp_path, m
     assert batch.status.tolist() == ['cached_verified', 'verified']
     assert replay_batch(root, dataset_loader=loader).status.tolist() == ['cached_verified', 'cached_verified']
     assert np.isfinite(batch.posthoc_aae_bpm).all()
+    # Missing files require recomputation; a failed sample must not stop its successor.
+    (specs[0].output_dir / 'metrics.json').unlink()
+    def broken_loader(spec):
+        if spec.sample_id == specs[0].sample_id:
+            raise RuntimeError('interrupted input load')
+        return loader(spec)
+    assert replay_batch(root, dataset_loader=broken_loader, use_cache=False).status.tolist() == ['failed', 'verified']
+    assert replay_batch(root, dataset_loader=loader).status.tolist() == ['verified', 'cached_verified']
+    from dataclasses import replace
+    mismatched = replace(specs[0], expected_metrics=dict(specs[0].expected_metrics, n_valid=999))
+    assert replay_sample(mismatched, dataset_loader=loader, use_cache=False)['status'] == 'metric_mismatch'

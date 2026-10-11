@@ -103,7 +103,7 @@ def test_notebook_has_single_subject_and_tracker_switches_and_all_code_compiles(
 
     assert "SUBJECT_DIR" in first
     assert "INPUT_DIR" not in first and "TESTDATA_DIR" not in first
-    assert "CORE_PARAMS = resolve_core_config()" in first
+    assert "TRAIN_PARAMS = reference_parity_params(" in first
     assert "ENABLE_LOW_LOCK_RECOVERY = True" not in first
     assert all(motion.value in first for motion in MotionType)
     assert "multi_tiaosheng" not in "\n".join(str(cell.source) for cell in code_cells)

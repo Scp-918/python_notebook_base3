@@ -1,6 +1,7 @@
 """Quantized Gaussian-kernel LMS filter for protocol windows."""
 
 from __future__ import annotations
+from .numerical_config import NUMERICS
 
 import numpy as np
 
@@ -54,7 +55,7 @@ def noncausal_klms_filter(
     step_size = float(step_size)
     if not np.isfinite(step_size):
         step_size = 0.0
-    sigma = max(float(sigma), 1e-12)
+    sigma = max(float(sigma), NUMERICS.get().klms_min_sigma)
     epsilon = float(epsilon)
     if not np.isfinite(epsilon):
         epsilon = 0.0
@@ -158,6 +159,6 @@ def _zscore(x: np.ndarray) -> np.ndarray:
     arr = np.asarray(x, dtype=float).copy()
     arr[~np.isfinite(arr)] = 0.0
     sd = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
-    if not np.isfinite(sd) or sd <= 1e-12:
+    if not np.isfinite(sd) or sd <= NUMERICS.get().input_zscore_std_eps:
         return arr - float(np.mean(arr))
     return (arr - float(np.mean(arr))) / sd
