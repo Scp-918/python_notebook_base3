@@ -243,6 +243,7 @@ def run_protocol_trial(
             target_scope=scope.value,
             baseline_estimator=arrays["baseline_estimator"],
             motion_runs=base.segment_info.motion_runs,
+            raw_candidates=arrays.get("raw_candidates"),
         )
         # Only evaluate reference after every candidate and final prediction is fixed.
         ref_time = np.asarray(dataset.ref_time_s, dtype=float)
@@ -778,6 +779,7 @@ def _run_windows(
     baseline_tracking_state = SpectrumTrackingState()
     adaptive_tracking_state = SpectrumTrackingState()
     reset_fft_tracking_state = SpectrumTrackingState()
+    raw_candidates = []
     last_phase = "rest"
     prev_reset_fft: float | None = None
     for row_idx, window_idx in enumerate(norm_cache.window_idx):
@@ -814,6 +816,14 @@ def _run_windows(
             path="baseline",
         )
         baseline_hr = float(baseline_post["hr_bpm"])
+        if params.enable_dual_reset:
+            from .mechanism_types import RawFftCandidateFrame
+            freq, amp = baseline_spectrum
+            from scipy.signal import find_peaks
+            peaks, _ = find_peaks(amp)
+            peaks = peaks[amp[peaks] > np.max(amp) * params.full_candidate_peak_threshold_ratio] if amp.size else peaks
+            raw_candidates.append(RawFftCandidateFrame(freq, amp, peaks,
+                                  peaks[np.argsort(-amp[peaks], kind="stable")]))
         prev_baseline = baseline_hr if np.isfinite(baseline_hr) else prev_baseline
         reset_fft_post = dict(baseline_post)
         reset_fft_hr = baseline_hr
@@ -821,6 +831,9 @@ def _run_windows(
             if last_phase != "recovery":
                 prev_reset_fft = None
                 reset_fft_tracking_state = SpectrumTrackingState()
+                if params.enable_post_motion_recovery:
+                    prev_adaptive = None
+                    adaptive_tracking_state = SpectrumTrackingState()
             reset_fft_post = _extract_hr_result(
                 norm["ppg_green"],
                 fs,
@@ -962,6 +975,10 @@ def _run_windows(
         qc_status_out,
     )
     adaptive_out = adaptive_arr.astype(float).tolist()
+    from .visibility import close_owner
+    finalization = close_owner(adaptive_tracking_state.visibility_owner, "eof")
+    if collect_frame and rows and finalization['owner_before_exists']:
+        rows[-1]['visibility_eof_json'] = json.dumps(finalization)
     if collect_frame and rows:
         for row, value, status in zip(rows, adaptive_out, qc_status_out, strict=False):
             row["adaptive_hr_bpm"] = float(value)
@@ -969,6 +986,7 @@ def _run_windows(
                 row["qc_status"] = "interpolated"
 
     metric_arrays: MetricArrays = {
+        **({"raw_candidates": raw_candidates} if params.enable_dual_reset else {}),
         "window_idx": np.asarray(window_idx_out, dtype=int),
         "time_s": np.asarray(time_out, dtype=float),
         "segment_label": np.asarray(labels_out, dtype=object),

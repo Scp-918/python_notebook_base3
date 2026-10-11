@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import numpy as np
 from scipy.signal import find_peaks
 
 from .penalty_policy import PenaltyPolicy
+from .visibility import ShadowOwner, advance_owner
 
 __all__ = ["SpectrumTrackingState", "SpectrumTrackingTrace", "track_spectrum_candidates"]
 
@@ -38,6 +39,11 @@ class SpectrumTrackingState:
     high_lock_candidate_bpm: float | None = None
     high_lock_count: int = 0
     high_lock_cooldown: int = 0
+    visibility_owner: ShadowOwner = field(default_factory=ShadowOwner)
+    invocation: int = 0
+    rise_candidate_bpm: float | None = None
+    rise_count: int = 0
+    rise_age: int = 0
 
 
 @dataclass(frozen=True)
@@ -79,6 +85,9 @@ class SpectrumTrackingTrace:
     high_lock_reason: str = "none"
     high_lock_labels: tuple[str, ...] = ()
     high_lock_triggered: bool = False
+    removed_candidate_bins: tuple[int, ...] = ()
+    visibility_owner: dict[str, Any] = field(default_factory=dict)
+    rise_lineage: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -146,6 +155,22 @@ def track_spectrum_candidates(
         weights[protected] = 1.0
     scores = amps * weights
     selectable = raw_order
+    full_policy = params.spectral_penalty_policy == "suppressed_protected_continuous_visibility"
+    removed = set()
+    owner_trace = {}
+    if full_policy:
+        hard_band = np.zeros(freq.shape, dtype=bool)
+        if penalty_enabled and window_kind == "motion" and width_bpm > 0:
+            for center in penalty_centers:
+                hard_band |= np.abs(freq_bpm - center) < max(0., width_bpm - params.visibility_edge_guard_bpm)
+        removed = {int(i) for i in raw_order if hard_band[i] and not protected[i]}
+        # An existing owner matches against the unprotected exclusion partition.
+        would_remove = {int(i) for i in raw_order if hard_band[i]}
+        owner_trace = advance_owner(state.visibility_owner, state.invocation, window_kind,
+            raw_order, freq_bpm[raw_order], would_remove, params)
+        released = owner_trace['released_bin']
+        removed.discard(released)
+        selectable = np.asarray([i for i in raw_order if i not in removed], dtype=int)
     scored_order = selectable[np.argsort(-scores[selectable], kind="stable")]
     all_order = raw_order[np.argsort(-scores[raw_order], kind="stable")]
 
@@ -170,10 +195,16 @@ def track_spectrum_candidates(
                 freq_bpm, amps, raw_order, search_min, search_max, penalty_centers, width_bpm, chosen
             )
             if challenger is not None:
+                suppressed_target = (int(chosen), float(freq_bpm[chosen]))
                 chosen = challenger
                 protection_suppressed = True
                 challenger_bpm = float(freq_bpm[chosen])
                 source = "protection_suppressed"
+                if full_policy and not owner_trace.get('owner_before_exists') and not owner_trace.get('owner_after_exists'):
+                    owner_trace = advance_owner(state.visibility_owner, state.invocation, window_kind,
+                        raw_order, freq_bpm[raw_order], would_remove, params,
+                        suppressed_target=suppressed_target)
+    state.invocation += 1
 
     raw_bpm = float(freq_bpm[all_order[0]]) if all_order.size else float("nan")
     tracked = float(freq_bpm[chosen]) if chosen is not None else (previous if previous is not None else raw_bpm)
@@ -184,6 +215,10 @@ def track_spectrum_candidates(
         ranks = np.flatnonzero(all_order == chosen)
         selected_rank = int(ranks[0]) + 1 if ranks.size else 0
     limited = _directional_slew(previous, tracked, params, directional)
+    rise_trace = {}
+    if params.enable_rise_lineage and path == "adaptive":
+        limited, rise_trace = _advance_rise_lineage(freq_bpm, raw_order, chosen, previous,
+            limited, state, params, directional, window_kind, penalty_centers)
 
     low_requested = bool(getattr(params, "enable_low_lock_recovery", True))
     low_effective = low_requested and path == "adaptive" and str(adaptive_filter).lower() == "lms"
@@ -204,6 +239,8 @@ def track_spectrum_candidates(
     top = all_order[:5]
     trace = SpectrumTrackingTrace(
         path=path,
+        removed_candidate_bins=tuple(sorted(removed)), visibility_owner=owner_trace,
+        rise_lineage=rise_trace,
         window_kind=window_kind,
         candidate_peaks_bpm=tuple(float(v) for v in freq_bpm[top]),
         candidate_peak_amplitudes=tuple(float(v) for v in scores[top]),
@@ -466,3 +503,45 @@ def _apply_high_lock(freq, amps, order, current, params, state, kind, enabled, l
         state.high_lock_mode = "reacquiring"
         return max(challenger, current - float(getattr(params, "high_lock_down_step_bpm", 20))), True
     return current, False
+
+
+def _advance_rise_lineage(freq_bpm, order, chosen, previous, limited, state, params, directional, kind, centers):
+    """Bounded 3-window rising lineage, adapted from reference legacy_v1."""
+    reason, reanchored = 'inactive', False
+    if kind != 'motion' or previous is None:
+        state.rise_candidate_bpm, state.rise_count, state.rise_age = None, 0, 0
+        return limited, dict(reason='motion_ended', reanchored=False)
+    lineage = None
+    if state.rise_candidate_bpm is not None and len(order):
+        nearest = min(order, key=lambda i: abs(freq_bpm[i] - state.rise_candidate_bpm))
+        resolution = float(np.min(np.diff(freq_bpm))) if len(freq_bpm) > 1 else 0.
+        tolerance = max(directional.step_up_bpm, 2 * resolution)
+        if (abs(freq_bpm[nearest] - state.rise_candidate_bpm) <= tolerance
+                and freq_bpm[nearest] >= state.rise_candidate_bpm - params.rise_lineage_max_downward_drift_bpm
+                and state.rise_age < params.rise_lineage_max_age_windows):
+            lineage = int(nearest)
+            state.rise_candidate_bpm = float(freq_bpm[nearest])
+            state.rise_count += 1
+            state.rise_age += 1
+        else:
+            state.rise_candidate_bpm, state.rise_count, state.rise_age = None, 0, 0
+            return limited, dict(reason='lineage_expired', reanchored=False)
+    if state.rise_candidate_bpm is None and chosen is not None:
+        candidate = float(freq_bpm[chosen])
+        if directional.limit_up_bpm < candidate - previous <= directional.range_up_bpm:
+            state.rise_candidate_bpm, state.rise_count, state.rise_age = candidate, 1, 1
+            lineage = chosen
+    if lineage is not None:
+        reason = 'lineage_pending'
+        target = state.rise_candidate_bpm
+        if state.rise_count >= params.rise_lineage_confirm_windows:
+            harmonic = bool(centers and abs(target - params.rise_lineage_harmonic_multiple * centers[0]) <= params.Spec_Penalty_Width * 60)
+            legacy_distance = abs(freq_bpm[chosen] - previous) if chosen is not None else float('inf')
+            if harmonic:
+                reason = 'motion_third_harmonic_guard'
+            elif target > previous + directional.limit_up_bpm and abs(target - previous) <= legacy_distance:
+                limited, reanchored, reason = float(target), True, 'confirmed_reanchor'
+            else:
+                reason = 'legacy_candidate_closer_or_gap_closed'
+    return limited, dict(reason=reason, reanchored=reanchored, candidate_bpm=state.rise_candidate_bpm,
+                         count=state.rise_count, age=state.rise_age)

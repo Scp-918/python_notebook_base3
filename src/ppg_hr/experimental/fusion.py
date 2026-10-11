@@ -63,6 +63,7 @@ def fuse_final_hr(
     target_scope: str = "motion_recovery",
     motion_runs: tuple[tuple[float, float], ...] | None = None,
     baseline_estimator: np.ndarray | None = None,
+    raw_candidates: list | None = None,
 ) -> FinalFusionResult:
     """Choose valid sources and perform one simple, episode-latched recovery handoff."""
     time = np.asarray(time_s, dtype=float)
@@ -186,7 +187,86 @@ def fuse_final_hr(
             if np.isfinite(value):
                 targets[i], sources[i] = value, source
                 break
-    final = apply_phase_dynamics(
+    # All optional writers resolve source targets before the single dynamics pass.
+    if params.enable_post_motion_guard or params.enable_post_motion_protection:
+        from .post_motion_guard import post_motion_switch_policy
+        for start, end in runs:
+            next_starts = [a for a, _ in runs if a > end]
+            stop = min(next_starts, default=float('inf'))
+            indices = np.flatnonzero((time >= start) & (time < stop))
+            use_adaptive, guard_reasons, guard_events = post_motion_switch_policy(
+                time[indices], adaptive[indices], reset[indices], motion_start_s=start,
+                motion_end_s=end, params=params)
+            for local, idx in enumerate(indices):
+                if labels[idx] != "recovery" or qc[idx] != "ok":
+                    continue
+                candidate = adaptive[idx] if use_adaptive[local] else reset[idx]
+                if np.isfinite(candidate):
+                    targets[idx] = candidate
+                    sources[idx] = "post_motion_guard_adaptive" if use_adaptive[local] else "post_motion_guard_reset"
+                    reasons[idx] = str(guard_reasons[local]) or "guard_wait"
+            events.extend(dict(event, mechanism="post_motion_guard") for event in guard_events)
+    if params.enable_dual_reset:
+        if raw_candidates is None or len(raw_candidates) != n:
+            raise ValueError("Dual reset requires raw sensor spectrum evidence")
+        from .dual_reset import DualResetTracker, DualResetInput
+        from .mechanism_types import DirectionalTrackingParams
+        tracking = DirectionalTrackingParams(params.recovery_tracking_range_up_bpm,
+            params.recovery_tracking_range_down_bpm, params.recovery_tracking_slew_limit_up_bpm,
+            params.recovery_tracking_slew_step_up_bpm, params.recovery_tracking_slew_limit_down_bpm,
+            params.recovery_tracking_slew_step_down_bpm)
+        tracker = None
+        previous_final = []
+        dual_final = np.full(n, np.nan)
+        previous_value = None
+        last_episode = None
+        for idx in range(n):
+            if labels[idx] == "recovery" and qc[idx] == "ok":
+                prior = [end for _, end in runs if end <= time[idx]]
+                episode = prior[-1] if prior else motion_end_s
+                if tracker is None or episode != last_episode:
+                    tracker = DualResetTracker(tracking=tracking, mechanism=params.dual_reset_mechanism,
+                        prior_half_life_s=params.dual_reset_prior_half_life_s,
+                        hits_required=params.dual_reset_confirm_windows,
+                        qualification_windows=params.dual_reset_qualification_windows,
+                        trajectory_tolerance_bpm=params.dual_reset_trajectory_tolerance_bpm,
+                        min_amp_ratio=params.dual_reset_min_amp_ratio,
+                        max_held_previous=params.dual_reset_max_held_previous,
+                        readiness_tolerance_bpm=params.dual_reset_gap_bpm,
+                        readiness_hits_required=params.dual_reset_readiness_hits,
+                        controlled_reanchor=params.dual_reset_controlled_reanchor,
+                        reanchor_prior_guard_bpm=params.dual_reset_reanchor_prior_guard_bpm,
+                        reanchor_min_gap_bpm=params.dual_reset_reanchor_min_gap_bpm,
+                        prior_invalidation_enabled=params.dual_reset_prior_invalidation_enable,
+                        prior_invalidation_hits_required=params.dual_reset_prior_invalidation_hits,
+                        prior_invalidation_min_gap_bpm=params.dual_reset_prior_invalidation_gap_bpm,
+                        prior_invalidation_min_raw_decline_bpm=params.dual_reset_prior_invalidation_raw_decline_bpm,
+                        prior_invalidation_min_prior_decline_bpm_per_window=params.dual_reset_prior_invalidation_prior_decline_bpm)
+                    last_episode = episode
+                evidence = raw_candidates[idx]
+                if evidence.top():
+                    decision = tracker.step(DualResetInput(float(time[idx]), evidence, True, tuple(previous_final[-3:])))
+                    if decision.candidate_qualification.qualified and decision.switch_target_readiness.ready:
+                        targets[idx] = decision.handoff_bpm
+                        sources[idx], reasons[idx] = "dual_reset", decision.switch_target_readiness.reason
+                    events.append(dict(window_idx=idx, mechanism="dual_reset", qualification=decision.candidate_qualification.__dict__,
+                        readiness=decision.switch_target_readiness.__dict__, independent=decision.independent_trace,
+                        handoff=decision.handoff_trace))
+            if sources[idx] != 'dropped':
+                value = targets[idx]
+                if np.isfinite(value):
+                    if previous_value is not None:
+                        delta = value - previous_value
+                        direction = 'up' if delta >= 0 else 'down'
+                        limit = getattr(params, f'final_{labels[idx]}_{direction}_limit_bpm')
+                        step = getattr(params, f'final_{labels[idx]}_{direction}_step_bpm')
+                        if abs(delta) > limit:
+                            value = previous_value + np.sign(delta) * step
+                    previous_value = float(value)
+                dual_final[idx] = previous_value if previous_value is not None else np.nan
+                if previous_value is not None:
+                    previous_final.append(previous_value)
+    final = dual_final if params.enable_dual_reset else apply_phase_dynamics(
         targets, labels, params, drop_mask=sources == "dropped"
     )
     return FinalFusionResult(

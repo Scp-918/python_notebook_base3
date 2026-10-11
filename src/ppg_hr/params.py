@@ -385,14 +385,35 @@ class ProtocolTrialParams:
     visibility_edge_guard_bpm: float = 1.0
     enable_rise_lineage: bool = False
     enable_post_motion_recovery: bool = False
+    enable_post_motion_guard: bool = False
     enable_dual_reset: bool = False
     rise_lineage_confirm_windows: int = 3
     rise_lineage_min_gap_bpm: float = 12.0
     rise_lineage_step_bpm: float = 5.0
     dual_reset_confirm_windows: int = 3
     dual_reset_gap_bpm: float = 6.0
+    dual_reset_mechanism: str = "trend_persistence"
+    dual_reset_prior_half_life_s: float = 10.0
+    dual_reset_qualification_windows: int = 4
+    dual_reset_trajectory_tolerance_bpm: float = 6.0
+    dual_reset_min_amp_ratio: float = 0.25
+    dual_reset_max_held_previous: int = 0
+    dual_reset_readiness_hits: int = 2
+    dual_reset_controlled_reanchor: bool = True
+    dual_reset_reanchor_prior_guard_bpm: float = 45.0
+    dual_reset_reanchor_min_gap_bpm: float = 25.0
+    dual_reset_prior_invalidation_enable: bool = False
+    dual_reset_prior_invalidation_hits: int = 3
+    dual_reset_prior_invalidation_gap_bpm: float = 40.0
+    dual_reset_prior_invalidation_raw_decline_bpm: float = 0.5
+    dual_reset_prior_invalidation_prior_decline_bpm: float = 0.5
+    rise_lineage_max_age_windows: int = 6
+    rise_lineage_max_downward_drift_bpm: float = 1.0
+    rise_lineage_harmonic_multiple: float = 3.0
 
     def __post_init__(self) -> None:
+        if self.spectral_penalty_policy not in {"soft_visible", "suppressed_protected_continuous_visibility"}:
+            raise ValueError("Unknown spectral penalty policy")
         if self.hr_window_s != 8.0 or self.hr_step_s != 1.0:
             raise ValueError("HR observation is frozen at 8 s / 1 s")
         if self.evaluation_window_s != 8.0 or self.evaluation_step_s != 1.0:
