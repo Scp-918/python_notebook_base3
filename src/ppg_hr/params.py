@@ -45,6 +45,45 @@ DEFAULT_MOTION_DETECTOR = MotionDetectorParams()
 DEFAULT_MOTION_POLICY = "single_bout"
 
 
+@dataclass(frozen=True)
+class Physical4DSettings:
+    """Fixed grid and strict alignment/replay settings, in physical units."""
+
+    sampling_rates: tuple[int, ...] = (25, 50, 100)
+    memories_ms: tuple[int, ...] = (40, 80, 120, 160, 200)
+    penalty_widths_bpm: tuple[int, ...] = (3, 6, 12, 18)
+    lms_steps: tuple[float, ...] = (0.006, 0.008, 0.010, 0.012, 0.016)
+    volterra_steps: tuple[float, ...] = (0.002, 0.004, 0.008, 0.012, 0.016)
+    rff_lms_steps: tuple[float, ...] = (0.001, 0.002, 0.004, 0.006, 0.008)
+    klms_steps: tuple[float, ...] = (0.005, 0.010, 0.020, 0.050, 0.100)
+    tdelay_range_s: tuple[float, float] = (-5.0, 5.0)
+    tdelay_step_s: float = 0.1
+    alignment_min_windows: int = 2
+    accuracy_threshold_bpm: float = 5.0
+    replay_metric_atol: float = 1e-6
+    alignment_tie_rule: str = "aae_abs_delay_rmse_candidate_order"
+    alignment_fallback: str = "zero_delay_continue"
+
+
+@dataclass(frozen=True)
+class PreprocessingParams:
+    """Source-domain numerical controls; shared by all coordinates."""
+
+    fs_origin: int = 100
+    filter_order: int = 4
+    ppg_band_hz: tuple[float, float] = (0.5, 5.0)
+    thermal_band_hz: tuple[float, float] = (0.1, 5.0)
+    imu_band_hz: tuple[float, float] = (0.5, 10.0)
+    cutoff_nyquist_fraction: float = 0.45
+    outlier_window_s: float = 1.0
+    missing_repair: str = "linear_interpolation_edge_hold"
+    ud_mode: str = "hf_minus_cf"
+
+
+PHYSICAL4D_SETTINGS = Physical4DSettings()
+DEFAULT_PREPROCESSING = PreprocessingParams()
+
+
 class MotionType(str, Enum):
     """Canonical motion types accepted by the subject-directory protocol."""
 
