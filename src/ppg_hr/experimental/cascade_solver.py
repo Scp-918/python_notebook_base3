@@ -479,6 +479,8 @@ def _attach_time_bias_after_metrics(
         mode=str(getattr(params, "Time_Bias_After_Mode", "posthoc_oracle_alignment")),
     )
     bias = float(result.time_bias_after_s)
+    if params.cascade_mode == "reference_parity" and result.status != "ok":
+        bias = float("nan")
     ref_after = np.interp(
         time_s + tdelay_s + bias,
         np.asarray(dataset.ref_time_s, dtype=float),
@@ -640,6 +642,7 @@ def _sensor_base_cache_key(dataset: ProtocolDataset, params: ProtocolTrialParams
         params.ppg_input_transform, params.log_absorbance_baseline_mode,
         params.log_absorbance_baseline_window_s, params.log_absorbance_eps,
         params.log_absorbance_ratio_clip,
+        getattr(getattr(dataset, "_sample_context", None), "preparation_identity", None),
     )
 
 
@@ -792,6 +795,10 @@ def _run_windows(
         adaptive_start_s = fft_start_s - float(getattr(params, "prewarm_s", 0.0))
         adaptive_source_start_s = float(adaptive_source_start_idx) / float(fs)
         label = str(norm_cache.segment_label[row_idx])
+        visibility_terminal = {}
+        if label != "motion" and adaptive_tracking_state.visibility_owner.active:
+            from .visibility import close_owner
+            visibility_terminal = close_owner(adaptive_tracking_state.visibility_owner, "motion_ended")
         norm = {name: values[row_idx] for name, values in norm_cache.norm_by_channel.items()}
         adaptive_norm = {name: values[row_idx] for name, values in norm_cache.adaptive_norm_by_channel.items()}
         qc_stats = _window_qc_stats(ds, start_idx, int(norm_cache.win_len))
@@ -962,6 +969,7 @@ def _run_windows(
                     ),
                     "penalty_ref_channel": penalty_ref_channel,
                     "adaptive_stages_json": stages_json,
+                    "visibility_terminal_json": json.dumps(visibility_terminal),
                     "qc_status": qc_status,
                     "qc_reason": qc_reason,
                     **qc_stats,
@@ -975,6 +983,10 @@ def _run_windows(
         qc_status_out,
     )
     adaptive_out = adaptive_arr.astype(float).tolist()
+    if params.cascade_mode == "reference_parity":
+        from ..preprocess.utils import smoothdata_movmedian
+        baseline_out = smoothdata_movmedian(np.asarray(baseline_out), params.smooth_win_len).tolist()
+        adaptive_out = smoothdata_movmedian(np.asarray(adaptive_out), params.smooth_win_len).tolist()
     from .visibility import close_owner
     finalization = close_owner(adaptive_tracking_state.visibility_owner, "eof")
     if collect_frame and rows and finalization['owner_before_exists']:
@@ -984,6 +996,8 @@ def _run_windows(
             row["adaptive_hr_bpm"] = float(value)
             if status == "interpolate_pending":
                 row["qc_status"] = "interpolated"
+        for row, value in zip(rows, baseline_out, strict=True):
+            row["baseline_hr_bpm"] = float(value)
 
     metric_arrays: MetricArrays = {
         **({"raw_candidates": raw_candidates} if params.enable_dual_reset else {}),

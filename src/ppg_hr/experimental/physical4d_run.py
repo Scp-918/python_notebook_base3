@@ -88,6 +88,8 @@ class RunLedger:
             fixed_config_path='config/fixed_hyperparameters.json',
             implementation_identity=implementation_identity(), reference_groups_order=references,
             target_scope=scope, subjects=sorted(subjects), motions=sorted(motions),
+            spectral_penalty_policy=config['trial']['spectral_penalty_policy'],
+            effective_mechanisms=config['effective_mechanisms'],
             coordinates=grid, grid_hash=identity(grid), best_policy='finite_posthoc_final_aae_coordinate_id')
         manifest = json.loads(canonical_json(manifest))
         manifest['run_identity'] = identity(manifest)
@@ -169,7 +171,7 @@ class RunLedger:
         sample = self.connection.execute('SELECT input_json,context_json FROM samples WHERE sample_id=?', (sample_id,)).fetchone()
         cell_id = identity(dict(run=self.manifest['run_identity'], sample=sample_id,
             input=json.loads(sample[0]), context=json.loads(sample[1]), coordinate=coordinate))
-        scored = metrics.get('posthoc_aae_bpm') is not None
+        scored = metrics.get('tdelay_aae_bpm') is not None
         args = (sample_id, coordinate['coordinate_id'], 'completed' if scored else 'unscored',
             metrics.get('tdelay_aae_bpm'), metrics.get('tdelay_accuracy_pct'), metrics.get('posthoc_aae_bpm'),
             metrics.get('posthoc_accuracy_pct'), metrics.get('posthoc_bias_s'), metrics.get('n_valid', 0),
@@ -201,16 +203,22 @@ def execute_sample_cells(ledger: RunLedger, sample_id: str, runner: Callable,
     gc.collect()
 
 
-def result_metrics(result) -> dict[str, Any]:
+def result_metrics(result, config=None) -> dict[str, Any]:
     if not result.success:
         raise RuntimeError(result.reason)
     arrays = result.metric_arrays
     mask = arrays['filtered_mask']
     valid = mask & np.isfinite(arrays['final_abs_err_bpm'])
-    return json_safe(dict(tdelay_aae_bpm=result.final_aae_bpm, tdelay_accuracy_pct=result.final_acc_pct,
-        posthoc_aae_bpm=result.posthoc_final_aae_bpm, posthoc_accuracy_pct=result.posthoc_final_acc_pct,
+    from ppg_hr.params import PHYSICAL4D_SETTINGS
+    threshold = config['evaluation']['accuracy_threshold_bpm'] if config else PHYSICAL4D_SETTINGS.accuracy_threshold_bpm
+    after_errors = arrays.get('final_abs_err_after_bpm', np.full(len(mask), np.nan))[mask]
+    after_errors = after_errors[np.isfinite(after_errors)]
+    return json_safe(dict(tdelay_aae_bpm=result.final_aae_bpm,
+        tdelay_accuracy_pct=float(np.mean(arrays['final_abs_err_bpm'][valid] <= threshold) * 100) if valid.any() else None,
+        posthoc_aae_bpm=result.posthoc_final_aae_bpm,
+        posthoc_accuracy_pct=float(np.mean(after_errors <= threshold) * 100) if after_errors.size else None,
         n_valid=int(valid.sum()), posthoc_n_valid=result.posthoc_n_valid_windows,
-        posthoc_bias_s=result.time_bias_after.time_bias_after_s if result.time_bias_after else None))
+        posthoc_bias_s=result.time_bias_after.time_bias_after_s if result.time_bias_after and result.time_bias_after.status == 'ok' else None))
 
 
 def _multiple(value):
@@ -268,6 +276,7 @@ def run_physical4d(subjects, motions=('write', 'gripper', 'run', 'rope'), *,
                     dataset = load_and_preprocess_protocol(pair.sensor_csv, pair.ref_csv,
                         fs_origin=ledgers[0].config['preprocessing']['fs_origin'],
                         preprocessing=PreprocessingParams(**ledgers[0].config['preprocessing']))
+                    dataset.sample_stem = pair.sample_id
                     contexts = {}
                     for ledger in needed:
                         params = trial_from_snapshot(ledger.config, ledger.manifest['coordinates'][0])
@@ -294,7 +303,7 @@ def run_physical4d(subjects, motions=('write', 'gripper', 'run', 'rope'), *,
                                 ledger.manifest['target_scope'], trial, collect_frame=False, collect_stages=False,
                                 sample_context=context, posthoc_mode='search')
                             try:
-                                return result_metrics(result)
+                                return result_metrics(result, ledger.config)
                             finally:
                                 del result
                         execute_sample_cells(ledger, pair.sample_id, run_cell)
@@ -313,9 +322,45 @@ def run_physical4d(subjects, motions=('write', 'gripper', 'run', 'rope'), *,
                     gc.collect()
         from .physical4d_export import rebuild_summaries
         for ledger in ledgers:
+            for sample in ledger.connection.execute('SELECT sample_id FROM samples ORDER BY sample_id'):
+                from .physical4d_export import export_sample_grid
+                export_sample_grid(ledger, sample[0])
             rebuild_summaries(ledger)
         return [ledger.root for ledger in ledgers]
     finally:
         for ledger in ledgers:
             ledger.close()
+
+
+def repair_run_outputs(root: Path, *, diagnostics: bool = True) -> None:
+    """Recreate absent plots and complete grids without detector, alignment or solver calls."""
+    from .physical4d_export import export_sample_grid, rebuild_summaries
+    ledger = RunLedger(root, readonly=True)
+    try:
+        for sample in ledger.connection.execute('SELECT * FROM samples ORDER BY sample_id'):
+            export_sample_grid(ledger, sample['sample_id'])
+            subject = sample['subject']
+            missing = any(not (ledger.root / subject / group / (sample['sample_id'] + suffix)).is_file()
+                for group, suffix in [('align','__tdelay.png'), ('signal','__fft_signal.png')])
+            if diagnostics and missing:
+                inputs = json.loads(sample['input_json'])
+                for expected in inputs.values():
+                    actual = file_identity(Path(expected['path']))
+                    if actual['sha256'] != expected['sha256']:
+                        raise ValueError('Input changed while regenerating diagnostics')
+                prep = PreprocessingParams(**ledger.config['preprocessing'])
+                dataset = load_and_preprocess_protocol(inputs['sensor']['path'], inputs['reference']['path'],
+                    fs_origin=prep.fs_origin, preprocessing=prep,
+                    ud_calculation_mode=prep.ud_calculation_mode, ud_smoothing_window_s=prep.ud_smoothing_window_s)
+                dataset.sample_stem = sample['sample_id']
+                try:
+                    context = SampleContext.from_dict(json.loads(sample['context_json']))
+                    save_sample_diagnostics(ledger.root, subject, dataset, context,
+                                            tuple(ledger.manifest['reference_groups_order']))
+                finally:
+                    del dataset
+                    gc.collect()
+        rebuild_summaries(ledger)
+    finally:
+        ledger.close()
 

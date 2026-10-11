@@ -204,6 +204,10 @@ def track_spectrum_candidates(
                     owner_trace = advance_owner(state.visibility_owner, state.invocation, window_kind,
                         raw_order, freq_bpm[raw_order], would_remove, params,
                         suppressed_target=suppressed_target)
+                    weights = policy.build_weights(freq)
+                    scores = amps * weights
+                    protected[:] = False
+                    removed = would_remove.copy()
     state.invocation += 1
 
     raw_bpm = float(freq_bpm[all_order[0]]) if all_order.size else float("nan")

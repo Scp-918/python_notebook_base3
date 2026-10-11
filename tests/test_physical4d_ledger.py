@@ -23,4 +23,9 @@ def test_three_hundred_transactional_cells_and_missing_only_resume(tmp_path):
     assert len(calls) == 301
     assert len(ledger.connection.execute('select * from attempt_events').fetchall()) == 1
     assert len(coordinates('lms')) == 300
+    from ppg_hr.experimental.physical4d_export import export_sample_grid, rebuild_summaries
+    import pandas as pd
+    path = export_sample_grid(ledger, 'S01_run_1')
+    assert len(pd.read_excel(path)) == 300
+    assert rebuild_summaries(ledger).coordinate_id.tolist() == ['p4d_000']
     ledger.close()

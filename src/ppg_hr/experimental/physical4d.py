@@ -55,7 +55,9 @@ def build_fixed_config(params: ProtocolTrialParams, *, preprocessing=DEFAULT_PRE
                              'lms_steps', 'volterra_steps', 'rff_lms_steps', 'klms_steps'}}
     return json.loads(canonical_json(dict(schema_version=SCHEMA_VERSION, trial=trial,
         preprocessing=asdict(preprocessing), motion_detector=asdict(motion_detector),
-        evaluation=settings)))
+        evaluation=settings, effective_mechanisms={
+            **{key: value for key, value in trial.items() if key.startswith('enable_')},
+            'advanced_visibility': params.spectral_penalty_policy == 'suppressed_protected_continuous_visibility'})))
 
 
 def validate_fixed_config(config: dict[str, Any]) -> None:
@@ -79,6 +81,10 @@ def validate_fixed_config(config: dict[str, Any]) -> None:
             elif not isinstance(actual, type(template)):
                 raise ValueError(f'Invalid configuration type: {path}')
     check(config, expected, 'fixed')
+    effective = {**{k: v for k, v in config['trial'].items() if k.startswith('enable_')},
+        'advanced_visibility': config['trial']['spectral_penalty_policy'] == 'suppressed_protected_continuous_visibility'}
+    if config['effective_mechanisms'] != effective:
+        raise ValueError('Contradictory effective mechanism configuration')
     canonical_json(config)
 
 

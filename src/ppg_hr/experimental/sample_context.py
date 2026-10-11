@@ -41,6 +41,10 @@ class SampleContext:
             segment[key] = np.asarray(segment[key])
         for key in ('motion_runs', 'detected_runs'):
             segment[key] = tuple(tuple(run) for run in segment[key])
+        for key in ('motion_start_s', 'motion_end_s', 'motion_threshold', 'acc_threshold',
+                    'gyro_threshold', 'acc_baseline_std', 'gyro_baseline_std'):
+            if segment[key] is None:
+                segment[key] = float('nan')
         v['segmentation'] = SegmentInfo(**segment)
         for key in ('rest_time_s', 'rest_hr_bpm'):
             v[key] = np.asarray(v[key], dtype=float)
@@ -115,6 +119,8 @@ def save_sample_diagnostics(root: Path, subject: str, dataset, context: SampleCo
         ax.plot(context.rest_time_s, context.rest_hr_bpm, label=f'PPG HR ({len(context.rest_time_s)} windows)')
         ax.plot(dataset.ref_time_s - offset, dataset.ref_hr_bpm, label=f'reference offset={offset:g}s')
         ax.set(xlabel='Sensor time (s)', ylabel='HR (bpm)')
+        if len(context.rest_time_s):
+            ax.set_xlim(0, context.rest_time_s[-1] + 4)
         ax.legend()
     fig.tight_layout()
     fig.savefig(base / 'align' / (context.sample_id + '__tdelay.png'))
