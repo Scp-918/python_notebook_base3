@@ -4,3 +4,6 @@ __pycache__/
 .pytest_tmp/
 outputs/
 
+# 本机 Git worktree：统一放在 D:\python_notebook_base\.worktrees，不同步目录内容。
+/.worktrees/
+

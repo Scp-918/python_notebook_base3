@@ -46,7 +46,7 @@ def test_notebook_has_layered_protocol_configuration() -> None:
     assert "OUTPUT_ROOT = SUBJECT_DIR.parent / \"outputs\"" in first
     assert "RUN_OUTPUT_DIR = build_subject_output_dir(" in first
     assert 'UD_CALCULATION_MODE = "smoothed"' in first
-    assert "UD_SMOOTHING_WINDOW_S = 0.1" in first
+    assert "UD_SMOOTHING_WINDOW_S = 0.05" in first
     for name in (
         "FS_ORIGIN",
         "TW_F",

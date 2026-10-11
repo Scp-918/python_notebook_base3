@@ -306,7 +306,7 @@ from ppg_hr.experimental.segmentation import detect_activity_segments
 from ppg_hr.preprocess.calibration import load_subject_calibration
 
 # 唯一数据输入。不要把本机绝对路径提交到仓库。
-SUBJECT_DIR = Path(os.environ.get("PPG_SUBJECT_DIR", PROJECT_ROOT / "subject_data")).resolve()
+SUBJECT_DIR = Path(os.environ.get("PPG_SUBJECT_DIR", PROJECT_ROOT / "subject_data/lzj")).resolve()
 SUBJECT_NAME = SUBJECT_DIR.name
 OUTPUT_ROOT = SUBJECT_DIR.parent / "outputs"
 MOTION_TYPES = tuple(item.value for item in MotionType)
@@ -329,7 +329,7 @@ NUM_REPEATS = 1
 RANDOM_STATE = 42
 TW_F = 0.0
 UD_CALCULATION_MODE = "smoothed"  # raw=原始 Uh/Uc 直接计算；smoothed=四路电压分别平滑后计算，默认为模式2。
-UD_SMOOTHING_WINDOW_S = 0.1  # 模式2中心移动中位数窗口(秒)；100 Hz 下 0.1 秒约为 10 点，可调。
+UD_SMOOTHING_WINDOW_S = 0.05  # 模式2中心移动中位数窗口(秒)；100 Hz 下 0.1 秒约为 10 点，可调。
 TRAIN_HR_POSTPROCESS_METHOD = "fft"  # 可选 fft/ssr，并进入运行目录名
 
 # 总开关：legacy 完全使用旧追踪；enhanced 再由下面六个布尔开关逐项控制。
@@ -369,7 +369,7 @@ TW = 8
 NORMALIZATION_MODE = "minmax"
 QC_POLICY = "fallback_baseline"
 DELAY_ESTIMATION_MODE = "envelope"  # 可选 envelope/direct
-ALIGNMENT_TW = 8.0
+ALIGNMENT_TW = 12.0
 ALIGNMENT_STEP_S = 1.0
 
 REST_HR_BAND_BPM = (40.0, 180.0)
@@ -986,6 +986,23 @@ else:
 # 输出：RUN_OUTPUT_DIR 下的 QC、图表、Stage-6 记录、history 和模式 checkpoint。
 # 是否写文件：是，仅在 RUN_ALL_TRAIN=True 时。
 # 耗时风险：高；真实数据会对每个运动/模式执行完整 Optuna 优化。
+TARGET_SCOPES = [TargetScope.MOTION_POST10.value]
+CASCADE_SCHEMES = [
+    CascadeScheme.ACC.value,
+    CascadeScheme.HF2.value,
+    CascadeScheme.UD2.value,
+    CascadeScheme.ACC_HF2.value,
+    CascadeScheme.HF2_CF2.value,
+    CascadeScheme.ACC_UD2.value,
+]
+ADAPTIVE_FILTERS = ["lms"]
+OBJECTIVE_MODE = "posthoc_aae"
+DATA_SPLIT_MODE = "all_train"
+MAX_ITERATIONS = 200
+NUM_REPEATS = 1
+RANDOM_STATE = 42
+TW_F = 0.0
+
 result_all_train = None
 if RUN_ALL_TRAIN:
     result_all_train = run_training_cell(
@@ -1000,30 +1017,61 @@ else:
     print("RUN_ALL_TRAIN=False，未创建 Optuna study。")
 ''',
     )
+    cells.append(nbformat.v4.new_code_cell(r'''
+TARGET_SCOPES = [TargetScope.MOTION_POST10.value]
+CASCADE_SCHEMES = [
+    CascadeScheme.ACC.value,
+    CascadeScheme.HF2.value,
+    CascadeScheme.UD2.value,
+    CascadeScheme.ACC_HF2.value,
+    CascadeScheme.HF2_CF2.value,
+    CascadeScheme.ACC_UD2.value,
+]
+ADAPTIVE_FILTERS = ["volterra"]
+OBJECTIVE_MODE = "posthoc_aae"
+DATA_SPLIT_MODE = "all_train"
+MAX_ITERATIONS = 200
+NUM_REPEATS = 1
+RANDOM_STATE = 42
+TW_F = 0.0
+
+result_all_train = None
+if RUN_ALL_TRAIN:
+    result_all_train = run_training_cell(
+        max_iterations=MAX_ITERATIONS,
+        target_scopes=TARGET_SCOPES,
+        cascade_schemes=CASCADE_SCHEMES,
+        adaptive_filters=ADAPTIVE_FILTERS,
+    )
+    RESULTS_ROOT = result_all_train.output_root
+    print("训练结果：", RESULTS_ROOT)
+else:
+    print("RUN_ALL_TRAIN=False，未创建 Optuna study。")
+'''.strip() + "\n"))
     cells += section(
         8,
         "当前配置的模式连通性检查",
         "模式数量按已发现运动数 × scope × scheme × filter 动态计算，不再使用旧的 84 模式。",
         r'''
-# 用途：用极小 trial 数检查当前 motion/scope/scheme/filter 组合能否完整连通。
-# 输入：CONNECTIVITY_MAX_ITERATIONS 和当前实验组合。
-# 输出：与正式训练共用模式级目录和配置指纹；建议使用独立 scheme 子集测试。
-# 是否写文件：是，仅在 RUN_CONNECTIVITY_CHECK=True 时。
-# 耗时风险：中到高；即使每模式 1 trial，也会处理所有已选模式和全部数据。
-motion_count = len({pair.motion_type for pair in discovery.pairs}) if discovery is not None else 0
-configured_mode_count = motion_count * len(TARGET_SCOPES) * len(CASCADE_SCHEMES) * len(ADAPTIVE_FILTERS)
-print("当前配置模式数：", configured_mode_count)
-result_connectivity = None
-if RUN_CONNECTIVITY_CHECK:
-    result_connectivity = run_training_cell(
-        max_iterations=CONNECTIVITY_MAX_ITERATIONS,
-        target_scopes=TARGET_SCOPES,
-        cascade_schemes=CASCADE_SCHEMES,
-        adaptive_filters=ADAPTIVE_FILTERS,
-    )
-    RESULTS_ROOT = result_connectivity.output_root
-else:
-    print("RUN_CONNECTIVITY_CHECK=False，跳过连通性检查。")
+# # 用途：用极小 trial 数检查当前 motion/scope/scheme/filter 组合能否完整连通。
+# # 输入：CONNECTIVITY_MAX_ITERATIONS 和当前实验组合。
+# # 输出：与正式训练共用模式级目录和配置指纹；建议使用独立 scheme 子集测试。
+# # 是否写文件：是，仅在 RUN_CONNECTIVITY_CHECK=True 时。
+# # 耗时风险：中到高；即使每模式 1 trial，也会处理所有已选模式和全部数据。
+# motion_count = len({pair.motion_type for pair in discovery.pairs}) if discovery is not None else 0
+# configured_mode_count = motion_count * len(TARGET_SCOPES) * len(CASCADE_SCHEMES) * len(ADAPTIVE_FILTERS)
+# print("当前配置模式数：", configured_mode_count)
+# result_connectivity = None
+# if RUN_CONNECTIVITY_CHECK:
+#     result_connectivity = run_training_cell(
+#         max_iterations=CONNECTIVITY_MAX_ITERATIONS,
+#         target_scopes=TARGET_SCOPES,
+#         cascade_schemes=CASCADE_SCHEMES,
+#         adaptive_filters=ADAPTIVE_FILTERS,
+#     )
+#     RESULTS_ROOT = result_connectivity.output_root
+# else:
+#     print("RUN_CONNECTIVITY_CHECK=False，跳过连通性检查。")
 ''',
     )
     cells += section(
@@ -1338,7 +1386,7 @@ else:
 # 耗时风险：中到高；每个样本回放一次滤波流程，但不训练、不搜索超参数。
 BATCH_TARGET_SCOPE = TargetScope.MOTION_POST10.value  # 目标段；默认运动段至运动结束后 10 秒，仅控制评价范围。
 BATCH_TARGET_CASCADE_SCHEME = CascadeScheme.ACC.value  # 每次只回放一个 scheme；可改为其余五种 change6 scheme。
-BATCH_TARGET_ADAPTIVE_FILTER = "lms"  # 选择已训练滤波器；应与 Stage-6 最优记录完全匹配。
+BATCH_TARGET_ADAPTIVE_FILTER = "volterra"  # 选择已训练滤波器；应与 Stage-6 最优记录完全匹配。
 BATCH_TARGET_DATA_SPLIT_MODE = "all_train"  # 选择记录中的 mode；默认同 motion 全 index 联合训练。
 BATCH_TARGET_TW_F = TW_F  # 匹配最优记录的前置收敛上下文；None 表示不按 TW_F 筛选。
 BATCH_TARGET_OUTPUT_DIR = Path(RESULTS_ROOT) / "batch_target_hr_curves"  # 输出基目录；后端会追加模式签名。

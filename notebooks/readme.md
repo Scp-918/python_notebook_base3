@@ -17,7 +17,7 @@ motion = write | gripper | run | rope
 - 数据拆分：`all_train`，同一 motion 的所有 index 共同构成一次 objective。
 - 范围与目标：`motion_post10`、对齐后的 `posthoc_aae`。
 - PPG 输入：`log_absorbance`。
-- 自适应滤波：只启用 LMS；Volterra、RFF-LMS、KLMS 仍可显式选择。
+- 初始自适应滤波配置只启用 LMS；第 7 节之后的附加训练单元切换为 Volterra，并受 `RUN_ALL_TRAIN` 控制。只运行所需的训练单元；RFF-LMS、KLMS 仍可显式选择。第 16 节当前选择 Volterra，回放时应与实际最优记录的滤波器配置匹配。
 - 搜索预算：每个 motion/scope/scheme/filter 模式 200 trials、1 repeat。
 - scheme：`ACC`、`HF2`、`UD2`、`ACC+HF2`、`HF2+CF2`、`ACC+UD2`。
 - motion 顺序：`write`、`gripper`、`run`、`rope`。
@@ -25,7 +25,7 @@ motion = write | gripper | run | rope
 UD1/UD2 支持两种固定公式输入模式：`raw` 直接使用原始 `Uh2/Uc2`、`Uh3/Uc3`；
 默认 `smoothed` 先对这四路原始电压分别执行中心移动中位数，再代入标定公式。
 Notebook 第一个代码单元通过 `UD_CALCULATION_MODE` 和
-`UD_SMOOTHING_WINDOW_S` 配置，默认窗口为 `0.1 s`。两种模式都保留近零分母
+`UD_SMOOTHING_WINDOW_S` 配置，当前实验窗口为 `0.05 s`（后端默认仍为 `0.1 s`）。两种模式都保留近零分母
 QC/插值，并且计算后的 UD1/UD2 都不经过 0.1–5 Hz 带通；仅在 `UD2`、
 `ACC+UD2` 级联中按 `normalization_mode` 对每个 `TW_F+TW` 窗口直接归一化。
 HF2、CF2 等通道的既有带通处理保持不变。
