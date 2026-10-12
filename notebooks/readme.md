@@ -8,7 +8,7 @@
 
 叶目录只含五项，例如S01-S02__wr__AH__L__mp10，其他配置写入manifest/config。同名root固定配置不一致会拒绝续写。不同policy可放不同OUTPUT_PARENT。配对按subject_motion_index_sensor/HRdata.csv，ck.mat位于受试者父目录；未配对记原因，QC异常按保存策略回退。
 
-TRAIN_PARAMS显式列出主路径固定值、policy和默认关闭的所有复杂机制；TRAIN_PREPROCESSING、TRAIN_DETECTOR、TRAIN_ALIGNMENT、TRAIN_NUMERICAL包含全部其他参数。用dataclasses.replace显式修改，实际调用单元再次赋值对象并展示生效配置。第5节完整参数表及parameter_catalog.json说明单位、可选项、启用条件、参考/采用值及差异。不要修改固定Physical4D网格候选轴。
+TRAIN_PARAMS显式列出主路径固定值、policy和默认关闭的所有复杂机制；TRAIN_PREPROCESSING、TRAIN_DETECTOR、TRAIN_ALIGNMENT、TRAIN_NUMERICAL包含全部其他参数。用dataclasses.replace显式修改，实际调用单元再次赋值对象并展示生效配置。完整固定超参数目录见项目根目录README.md；第5节按需查看当前生效配置，每次运行的parameter_catalog.json也记录单位、可选项、启用条件、参考/采用值及差异。不要修改固定Physical4D网格候选轴。
 
 第1节配对，第2节预处理，第3节静息对齐，第4节原始信号/FFT，第5节配置，第6节300点查看，第7节训练，第8节只读SQLite状态，第9节补导出。预览单独开关，仅预览不进入训练账本。训练首次预处理前冻结config/fixed_hyperparameters.json及hash，展开未选滤波器/关闭机制参数；不允许用当前默认值填已有快照缺字段。
 

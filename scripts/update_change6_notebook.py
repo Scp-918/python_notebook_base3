@@ -13,15 +13,13 @@ sys.path.insert(0, str(ROOT / 'src'))
 
 def build_notebook():
     """Return deterministic, cleared cells; disabled execution requires no input files."""
-    from ppg_hr.params import reference_parity_params
-    from ppg_hr.experimental.physical4d import build_fixed_config, parameter_catalog
     cells = []
     def section(number, title, explanation, code):
         cells.append(nbformat.v4.new_markdown_cell(f'## {number}. {title}\n\n{explanation}', id=f'p4d-{number}-md'))
         cells.append(nbformat.v4.new_code_cell(textwrap.dedent(code).strip(), id=f'p4d-{number}-code'))
     section(0, '完整配置与执行开关', '''正式基线是 ACC + LMS。每样本冻结 source-domain motion segmentation 和 Tdelay_s；300 点只搜索 Fs、memory、步长及 penalty 半宽。所有 RUN 开关默认 False，无数据、无训练结果也可顺序执行。
 
-固定配置真源为 config/fixed_hyperparameters.json；坐标、样本状态及 posthoc_bias_s 以 SQLite 为准。复现不使用当前训练配置补字段。参数说明、单位、可选项、启用条件与参考差异见第5节及 parameter_catalog.json。soft_visible 默认开启 continuity protection；suppressed_protected_continuous_visibility 是可运行的完整可选策略，policy 不进入网格，但进入配置 hash 和结果 identity。复杂 rescue 默认关闭，选择完整 policy 仅启用其 advanced visibility。
+固定配置真源为 config/fixed_hyperparameters.json；坐标、样本状态及 posthoc_bias_s 以 SQLite 为准。复现不使用当前训练配置补字段。完整固定超参数目录（说明、单位、可选项、启用条件与参考差异）见项目根目录 README.md；每次运行另存 parameter_catalog.json。soft_visible 默认开启 continuity protection；suppressed_protected_continuous_visibility 是可运行的完整可选策略，policy 不进入网格，但进入配置 hash 和结果 identity。复杂 rescue 默认关闭，选择完整 policy 仅启用其 advanced visibility。
 
 训练输入支持多 subjects、多 motions，以及多个有序 reference 组合、filter、scope。每个外层组合独立根目录，每样本完整300点。不同数据父目录必须明确指定 OUTPUT_PARENT。同名目录配置不同会拒绝续写。''', '''
         import os
@@ -211,20 +209,7 @@ def build_notebook():
             save_sample_diagnostics(RESULTS_ROOT / "preview", PREVIEW_PAIR.subject, PREVIEW_DATASET,
                 PREVIEW_CONTEXT, REFERENCE_COMBINATIONS[0])
         ''')
-    catalog = parameter_catalog(build_fixed_config(reference_parity_params()))
-    rows = ['| 固定参数 | 类型/单位 | 默认采用值 | 可选项 | 启用条件 | 说明/参考差异 |',
-            '|---|---|---|---|---|---|']
-    for path, note in catalog.items():
-        value = str(note['adopted_value'])
-        explanation = note['description'] + ('；' + note['difference_reason'] if note['difference_reason'] else '')
-        rows.append('| ' + ' | '.join(str(x).replace('|','/').replace('\n',' ') for x in (
-            path, note['type']+'/'+note['unit'], value, note['options'] or '按类型显式配置',
-            note['enabled_when'], explanation)) + ' |')
-    section(5, '完整固定超参数目录', '''首单元可用 dataclasses.replace 修改固定对象；调用单元再次赋值实际配置。首次预处理前展开并冻结全部字段，包括未选滤波器和关闭机制参数。下表仅作为阅读默认值；实际运行值以保存的 fixed_hyperparameters.json 为准，rff_seed 默认42。
-
-LMS使用 max(1e-6, mu_base−abs(corr)/100)；其他滤波器默认不做 correlation 缩放。Volterra保留归一化线性/二阶更新；RFF保留robust带宽与NLMS（参考为固定sigma=1）；KLMS保留归一化距离、字典上限300及freeze_new_centers。
-
-''' + '\n'.join(rows), '''
+    section(5, '固定配置查看', '''完整固定超参数目录已移至项目根目录 README.md，包含默认值、单位、可选项、启用条件与参考差异。当前训练的实际固定配置可在开启 RUN_CONFIG_DISPLAY 后查看；每次运行以保存的 config/fixed_hyperparameters.json 为准。''', '''
         if RUN_CONFIG_DISPLAY:
             DISPLAY_FIXED_CONFIG = build_fixed_config(TRAIN_PARAMS, preprocessing=TRAIN_PREPROCESSING,
                 motion_detector=TRAIN_DETECTOR, settings=TRAIN_ALIGNMENT, numerical=TRAIN_NUMERICAL,

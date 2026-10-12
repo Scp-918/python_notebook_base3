@@ -50,7 +50,16 @@ def test_fixed_parameters_have_catalog_and_policy_explanation():
     notebook = nbformat.read(NOTEBOOK_PATH,as_version=4)
     markdown = "\n".join(c.source for c in notebook.cells if c.cell_type == "markdown")
     for text in ("fixed_hyperparameters.json", "suppressed_protected_continuous_visibility",
-                 "soft_visible", "Tdelay_s", "posthoc_bias_s", "1e-6", "rff_seed", "启用条件"):
+                 "soft_visible", "Tdelay_s", "posthoc_bias_s", "1e-6", "README.md"):
         assert text in markdown
+    assert "## 5. 固定配置查看" in markdown
+    assert "| 固定参数 |" not in markdown
+    project_readme = Path("README.md").read_text(encoding="utf-8")
+    assert "## 完整固定超参数目录" in project_readme
+    from ppg_hr.params import reference_parity_params
+    from ppg_hr.experimental.physical4d import build_fixed_config, parameter_catalog
+    catalog = parameter_catalog(build_fixed_config(reference_parity_params()))
+    assert all(f"| {name} |" in project_readme for name in catalog)
+    assert "rff_seed" in project_readme and "启用条件" in project_readme
     readme = Path("notebooks/readme.md").read_text(encoding="utf-8")
     assert "motion_post10" in readme and "SQLite" in readme and "reset-FFT" in readme
